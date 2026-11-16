@@ -8,6 +8,7 @@
 // Registers: r3 = the result; the recompiled code leaves only volatile ones (r6, r8-r11, vector registers) otherwise.
 // LO_NATIVE_FRUSTUM_BOX=0 keeps the recompiled code; 2 runs both and compares (first 20 differences, a count every 2^20).
 #include <stdafx.h>
+#include <cpu/guest_frustum_box.h>
 #include <kernel/memory.h>
 #include <os/logger.h>
 #include <arm_neon.h>
@@ -94,18 +95,15 @@ namespace
     }
 }
 
-PPC_FUNC(sub_823BDA78)
+bool RunGuestFrustumBox(PPCContext& ctx, uint8_t* base)
 {
     const int mode = NativeFrustumBoxMode();
-    if (mode == 0)
-    {
-        __imp__sub_823BDA78(ctx, base);
-        return;
-    }
+    if (mode == 0) return false;
     if (mode == 2)
     {
         Check(ctx, base);
-        return;
+        return true;
     }
     ctx.r3.u64 = Intersects(ctx, base);
+    return true;
 }

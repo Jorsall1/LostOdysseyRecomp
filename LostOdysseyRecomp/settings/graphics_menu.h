@@ -135,7 +135,7 @@ inline bool FsrOn(const Config& config)
 // for weak hardware, Original keeps their retail state.
 #if LO_PLATFORM_SWITCH
 // The Switch's presets with FSR on (it scales the scene rows to the screen), at the console's rate: 30 FPS on
-// Switch 1, 60 on Switch 2 (1080 rows docked, 720 handheld):
+// Switch 1, 60 on Switch 2 (1440 rows docked, 1080 handheld):
 //   Quality      a fixed scene at the Automatic height, every effect;
 //   Balanced     dynamic resolution 360 rows to the Automatic height, depth of field at 50%, no bloom (the default,
 //                Config's own values);

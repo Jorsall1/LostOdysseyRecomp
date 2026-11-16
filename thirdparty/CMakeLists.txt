@@ -60,16 +60,42 @@ if(LO_BUILD_GPU)
         target_link_libraries(plume PUBLIC SDL3::SDL3)
     endif()
     if(LO_TARGET_PLATFORM STREQUAL "switch" AND LO_TARGET_SWITCH2)
-        # tools/patches/plume-switch.patch: VK_NN_vi_surface on the libnx
-        # NWindow. OunceVK exports the Vulkan entry points (and
-        # vkCreateViSurfaceNN) directly, so the Switch 2 build links plain
-        # -lvulkan and needs no ICD bootstrap.
+        # tools/patches/plume-switch2.patch: VK_NN_vi_surface on the libnx
+        # NWindow, with OunceVK as the statically linked driver.
+        #
+        # OunceVK's vk* entry points collide with volk's function-pointer
+        # variables of the same name (see cmake/LoSwitch.cmake), so the driver is
+        # linked through a symbol-renamed copy: cmake/PrefixOunceVK.cmake turns
+        # the 249 entry points libouncevk.a exports into ouncevk_vk*, and plume
+        # initialises volk from ouncevk_vkGetInstanceProcAddr. The archive is
+        # then pulled out of the library by that reference, with no ICD loader
+        # to bootstrap and no Mesa NVK symbols in the image.
         target_compile_definitions(plume PUBLIC __SWITCH__ VK_USE_PLATFORM_VI_NN)
         if(NOT LO_SWITCH_CHECK_ONLY)
-            if(NOT EXISTS "${LO_SWITCH_NVK_LIBRARY}")
-                message(FATAL_ERROR "OunceVK for Switch 2 not found: ${LO_SWITCH_NVK_LIBRARY} (set LO_SWITCH_NVK_LIBRARY)")
+            if(NOT EXISTS "${LO_SWITCH_OUNCEVK_ARCHIVE}")
+                message(FATAL_ERROR "OunceVK for Switch 2 not found: ${LO_SWITCH_OUNCEVK_ARCHIVE} (set LO_SWITCH_OUNCEVK_ARCHIVE)")
             endif()
-            target_link_libraries(plume PUBLIC vulkan nx)
+            add_custom_command(
+                OUTPUT "${LO_SWITCH_OUNCEVK_PREFIXED}"
+                COMMAND "${CMAKE_COMMAND}"
+                        "-DNM=${LO_SWITCH_NM}"
+                        "-DOBJCOPY=${LO_SWITCH_OBJCOPY}"
+                        "-DINPUT=${LO_SWITCH_OUNCEVK_ARCHIVE}"
+                        "-DOUTPUT=${LO_SWITCH_OUNCEVK_PREFIXED}"
+                        "-DSYMS=${LO_SWITCH_OUNCEVK_PREFIXED_SYMS}"
+                        "-DPREFIX=${LO_SWITCH_OUNCEVK_PREFIX}"
+                        -P "${CMAKE_SOURCE_DIR}/cmake/PrefixOunceVK.cmake"
+                DEPENDS "${LO_SWITCH_OUNCEVK_ARCHIVE}" "${CMAKE_SOURCE_DIR}/cmake/PrefixOunceVK.cmake"
+                COMMENT "Prefixing OunceVK Vulkan entry points with '${LO_SWITCH_OUNCEVK_PREFIX}'"
+                VERBATIM)
+            add_custom_target(lo_ouncevk_prefixed DEPENDS "${LO_SWITCH_OUNCEVK_PREFIXED}")
+            add_dependencies(plume lo_ouncevk_prefixed)
+            target_link_libraries(plume PUBLIC
+                "${LO_SWITCH_OUNCEVK_PREFIXED}" ${LO_SWITCH_NVK_EXTRA_LIBS} nx)
+            # switch.specs links with --gc-sections; the driver's entry points are
+            # only reached through vkGet*ProcAddr at run time, so they need to be
+            # named as GC roots in the final link (see cmake/LoSwitch.cmake).
+            target_link_options(plume PUBLIC ${LO_SWITCH_OUNCEVK_LINK_OPTIONS})
         endif()
     elseif(LO_TARGET_PLATFORM STREQUAL "switch")
         # tools/patches/plume-switch.patch: VK_NN_vi_surface on the libnx

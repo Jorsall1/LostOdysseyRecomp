@@ -1,0 +1,134 @@
+LostOdysseyRecomp -> Nintendo Switch 2 (libounce + OunceVK) - resumed build result
+==============================================================================
+
+RESULT: SUCCESS. LostOdysseyRecomp.elf links and LostOdysseyRecomp.nro is packaged.
+
+Command (resumed from the existing build/ directory, -j3 to stay under 8 GB):
+
+    source /opt/devkitpro/switch2vars.sh && cmake --build build -j3
+
+Exit status 0. A second invocation ("cmake --build build -j3") also exits 0 and
+reports every target built, i.e. the tree is up to date.
+
+ARTIFACTS
+
+    build/LostOdysseyRecomp/LostOdysseyRecomp.elf     457,173,424 bytes
+    build/LostOdysseyRecomp/LostOdysseyRecomp.nro      76,833,201 bytes
+    build/LostOdysseyRecomp/LostOdysseyRecomp.nacp         16,384 bytes
+
+Post-build steps ran: "Packaging LostOdysseyRecomp.nro" (nacptool + elf2nro) and
+the source-version stamp.
+
+MEMORY
+
+The 554 objects already present when the build was resumed were reused, so only
+the remaining ~340 TUs were compiled. Peak observed use was ~3.5 GB of 7.7 GB; the
+heaviest single unit, gpu/renderer.cpp, holds ~2.9 GB RSS by itself for ~20
+minutes, which is why -j3 is the right width here. No OOM.
+
+ERRORS FOUND AND FIXED
+
+1. gpu/lsfg_frame_gen.cpp: lsfg-vk-backend/lsfgvk.hpp not found.
+
+   thirdparty/CMakeLists.txt creates the lo_lsfg target (and publishes its
+   include directories) only for Switch 1 ("... AND NOT LO_TARGET_SWITCH2"), but
+   the file's backend body was gated on LO_PLATFORM_SWITCH && LO_GPU_PLUME, both
+   true on Switch 2. gpu::lsfg already has a stub implementation in the file's
+   #else branch (Enabled()/Present()/Reset()/BeforeAcquire() no-ops, video.cpp
+   then presents normally), so the gate was narrowed:
+
+       #if LO_PLATFORM_SWITCH && defined(LO_GPU_PLUME) && !LO_PLATFORM_SWITCH2
+
+   with a comment pointing at the CMake condition. LSFG is therefore cleanly
+   stubbed on Switch 2: no headers, no link of lo_lsfg, LO_FRAMEGEN=1 is a no-op,
+   and Switch 1 still builds the real backend. No CMake change was needed for
+   this because thirdparty/CMakeLists.txt already excludes the target; a
+   CMake-provided LO_ENABLE_LSFG define would have invalidated the compile
+   command of every runtime object and forced a full rebuild for no behaviour
+   change.
+
+2. gpu/renderer.cpp and gpu/video.cpp: plume::Deko3DSetEarlyFragmentTests /
+   plume::Deko3DSetSwapChainSize are not members of plume.
+
+   These deko3d-only entry points were called under LO_PLATFORM_SWITCH guards
+   (with runtime IsDeko3d() checks), but Switch 2 builds no plume-deko3d
+   (LostOdysseyRecomp/CMakeLists.txt links lo_plume_deko3d only "... AND NOT
+   LO_TARGET_SWITCH2"), so the declarations do not exist. The calls are now
+   wrapped in the guard the rest of these files already use for deko3d-only
+   code, #if defined(LO_SWITCH_DEKO3D):
+
+     - renderer.cpp: the early-depth / early-fragment-test scope (the whole
+       EarlyFragmentScope block; its members are used only inside it).
+     - video.cpp (swapchain creation): the LO_SWITCH_OUTPUT_HEIGHT
+       Deko3DSetSwapChainSize call.
+     - video.cpp (PreparePresentation): the same call in the per-frame path.
+
+   On Switch 2 LO_SWITCH_DEKO3D is not defined, so these blocks vanish and the
+   Vulkan/OunceVK path is unaffected. On Switch 1 the code is unchanged.
+
+3. Link: multiple definition of `sub_823BDA78(PPCContext&, unsigned char*)'.
+
+   Two runtime TUs define the same PPC override:
+     - cpu/guest_frustum_box.cpp (commit 4dc21837, Switch: native NEON
+       FConvexVolume::IntersectBox, LO_NATIVE_FRUSTUM_BOX=0/1/2),
+     - gpu/hor_plus.cpp (commit c41a1ee6, the #342 Culling slider margin hook
+       around the InitViews frustum test).
+   The recompiled library exports a weak alias (ppc_recomp.12.cpp) that either
+   file is meant to override, so two strong definitions collide. This is a
+   pre-existing conflict on the Switch path, not a Switch 2 artifact. Neither
+   feature was dropped; they are now composed:
+
+     - cpu/guest_frustum_box.h (new): declares
+         bool RunGuestFrustumBox(PPCContext&, uint8_t*);
+       true when it produced r3, false when the caller should run the recompiled
+       code. Follows the cpu/ convention of a small companion header
+       (render_fence.h, poll_wait.h, guest_thread.h).
+     - cpu/guest_frustum_box.cpp: its PPC_FUNC(sub_823BDA78) became that
+       function (mode 0 -> false, mode 2 -> Check + true, mode 1 -> native
+       Intersects + true). The private Intersects/Check helpers are unchanged.
+     - gpu/hor_plus.cpp: remains the single strong sub_823BDA78 hook. Its two
+       direct __imp__sub_823BDA78 calls now go through a local RunFrustumBox()
+       that tries RunGuestFrustumBox() first and falls back to __imp__.
+
+   Effect: every call, with or without the culling margin, runs whichever
+   implementation LO_NATIVE_FRUSTUM_BOX selects (native by default), the
+   margin-adjusted extent included, and LO_NATIVE_FRUSTUM_BOX=2 still compares
+   native against the recompiled original.
+
+WARNINGS
+
+Three warnings, all pre-existing and unrelated to these changes:
+kernel/xdm.h:189/192/196, "multi-character character constant"
+(OBJECT_SIGNATURE). No other diagnostics in the resumed build.
+
+FILES CHANGED IN THIS SESSION
+
+    M LostOdysseyRecomp/gpu/lsfg_frame_gen.cpp   (Switch 2 -> stub path)
+    M LostOdysseyRecomp/gpu/renderer.cpp         (deko3d guard)
+    M LostOdysseyRecomp/gpu/video.cpp            (2x deko3d guard)
+    M LostOdysseyRecomp/cpu/guest_frustum_box.cpp (native dispatch exported)
+    M LostOdysseyRecomp/gpu/hor_plus.cpp         (single hook, composes native)
+    A LostOdysseyRecomp/cpu/guest_frustum_box.h
+    A build_result.txt
+
+The other modified files in `git status` (LostOdysseyRecomp/CMakeLists.txt,
+settings/*, gpu/dynamic_resolution.h, gpu/render_resolution.h, tools/patches/*,
+tools/switch/build-switch.sh, PLAN.md, output.txt, summary.txt) were already
+present before this session and are untouched here. Nothing was committed.
+
+NOTES / LIMITATIONS
+
+- Not run on hardware: this verifies compilation, link and NRO packaging only.
+  Booting the NRO on kaiHEN, the OunceVK swapchain and frame rate behaviour are
+  untested here.
+- output.txt in the repo root is stale: it records the earlier configure failure
+  "No recompiled sources in LostOdysseyRecompLib/ppc". That directory now holds
+  251 files (ppc_recomp.0..N.cpp, ppc_func_mapping.cpp, headers) and the build
+  proceeds normally.
+- LSFG (LO_FRAMEGEN) is not available in the Switch 2 build; the
+  lsfg-vk backend would need its own port to libounce/OunceVK first.
+- Frame-rate / resolution behaviour from the earlier settings work is compiled
+  in (Switch 2 allows 30 or 60 FPS, 1440-row docked / 1080-row handheld
+  automatic scene height, supersampled down to the 1920x1080 output) but has
+  not been observed at runtime. See audit_report.txt, which also records a
+  pre-flight blocker: OunceVK's entry points are not linked into the image.

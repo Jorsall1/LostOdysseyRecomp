@@ -6,6 +6,7 @@
 #include "gpu/frame_plan.h"
 #include "gpu/aspect_layout.h"
 #include "settings/config.h"
+#include "cpu/guest_frustum_box.h"
 #include "cpu/ppc_context.h"
 #include "kernel/memory.h"
 
@@ -216,6 +217,17 @@ PPC_FUNC(sub_823BC220)
     initViewsMargin = previous;
 }
 
+namespace
+{
+// The test itself is whichever implementation cpu/guest_frustum_box.cpp
+// selects (native, or the recompiled code), so the margin and the native path
+// both apply to every call.
+void RunFrustumBox(PPCContext& ctx, uint8_t* base)
+{
+    if (!RunGuestFrustumBox(ctx, base)) __imp__sub_823BDA78(ctx, base);
+}
+}
+
 // FConvexVolume::IntersectBox(r3 volume, r4 origin, r5 extent). At 823BC980
 // InitViews tests each primitive's bounds (scene info +40 origin, +52 extent)
 // against the view's ViewFrustum at view+0x190. Seated characters reach past
@@ -229,7 +241,7 @@ PPC_FUNC(sub_823BDA78)
     if (uint32_t(ctx.lr) != 0x823BC984 || margin == 0.0f || !ValidRange(extent, 12) ||
         !IsMainPerspectiveView(ctx.r3.u32 - 0x190))
     {
-        __imp__sub_823BDA78(ctx, base);
+        RunFrustumBox(ctx, base);
         return;
     }
     // The test is a leaf without a stack frame, so the adjusted extent can sit
@@ -239,7 +251,7 @@ PPC_FUNC(sub_823BDA78)
         StoreFloat(adjusted + axis * 4, std::max(std::abs(LoadFloat(extent + axis * 4)) + margin, 0.0f));
     StoreWord(adjusted + 12, 0);
     ctx.r5.u64 = adjusted;
-    __imp__sub_823BDA78(ctx, base);
+    RunFrustumBox(ctx, base);
 }
 
 // Keep the game HUD at 16:9 in the physical scene target.  The flush copies

@@ -1,0 +1,52 @@
+diff --git a/plume_vulkan.cpp b/plume_vulkan.cpp
+index f0d7a13..7935ed6 100644
+--- a/plume_vulkan.cpp
++++ b/plume_vulkan.cpp
+@@ -26,14 +26,26 @@
+ #include <unordered_map>
+ 
+ #if defined(__SWITCH__)
+-// Mesa NVK is linked statically (no Vulkan loader on Horizon): resolve the
+-// entry points through its ICD interface. Same as UnleashedRecomp-NX.
++// The driver is linked statically (no Vulkan loader on Horizon), so volk takes
++// its entry point from the driver itself.
+ #include <switch.h>
++#if defined(__SWITCH2__)
++// OunceVK is the driver: it exports the Vulkan entry points, with no ICD
++// trampoline to negotiate with. It is linked through a symbol-renamed copy of
++// libouncevk.a (cmake/PrefixOunceVK.cmake), because volk already defines
++// vkGetInstanceProcAddr and every other vk* name as its own dispatch pointer.
++extern "C" {
++    VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL ouncevk_vkGetInstanceProcAddr(VkInstance instance, const char *pName);
++}
++#else
++// Mesa NVK is an ICD: resolve the entry points through its ICD interface. Same
++// as UnleashedRecomp-NX.
+ extern "C" {
+     VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vk_icdGetInstanceProcAddr(VkInstance instance, const char *pName);
+     VKAPI_ATTR VkResult VKAPI_CALL vk_icdNegotiateLoaderICDInterfaceVersion(uint32_t *pSupportedVersion);
+ }
+ #endif
++#endif
+ 
+ #if DLSS_ENABLED
+ #   include "render/plume_dlss.h"
+@@ -5974,6 +5986,10 @@ namespace plume {
+ #   if defined(__SWITCH__)
+         VkResult res = VK_SUCCESS;
+         if (volkGetInstanceVersion() == 0) {
++#       if defined(__SWITCH2__)
++            // OunceVK's prefixed loader entry point (cmake/PrefixOunceVK.cmake).
++            volkInitializeCustom(&ouncevk_vkGetInstanceProcAddr);
++#       else
+             uint32_t icdVersion = 7;
+             vk_icdNegotiateLoaderICDInterfaceVersion(&icdVersion);
+             PFN_vkGetInstanceProcAddr getInstanceProcAddr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(
+@@ -5982,6 +5998,7 @@ namespace plume {
+                 getInstanceProcAddr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(&vk_icdGetInstanceProcAddr);
+             }
+             volkInitializeCustom(getInstanceProcAddr);
++#       endif
+         }
+ #   else
+         VkResult res = volkGetInstanceVersion() != 0 ? VK_SUCCESS : volkInitialize();

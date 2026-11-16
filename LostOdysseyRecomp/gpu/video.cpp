@@ -271,10 +271,13 @@ static bool RetryWithSystemVulkanDriver(const char* stage)
 // Mesa (statically linked NVK) only reports its own errors to a debug-utils
 // messenger; without one, a lost GPU leaves no reason anywhere. The
 // extension is not enabled on the instance, so the messenger is created
-// through Mesa's common entry point directly.
+// through Mesa's common entry point directly. OunceVK (Switch 2) exports none
+// of Mesa's internals and takes the standard entry point instead.
+#if !LO_PLATFORM_SWITCH2
 extern "C" VKAPI_ATTR VkResult VKAPI_CALL vk_common_CreateDebugUtilsMessengerEXT(VkInstance instance,
     const VkDebugUtilsMessengerCreateInfoEXT* createInfo, const VkAllocationCallbacks* allocator,
     VkDebugUtilsMessengerEXT* messenger);
+#endif
 
 static VKAPI_ATTR VkBool32 VKAPI_CALL SwitchDriverMessage(VkDebugUtilsMessageSeverityFlagBitsEXT severity,
     VkDebugUtilsMessageTypeFlagsEXT types, const VkDebugUtilsMessengerCallbackDataEXT* data, void*)
@@ -307,7 +310,14 @@ static void ListenToSwitchDriver(VkInstance instance)
     info.messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT;
     info.messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT;
     info.pfnUserCallback = SwitchDriverMessage;
+#if LO_PLATFORM_SWITCH2
+    const auto createMessenger = reinterpret_cast<PFN_vkCreateDebugUtilsMessengerEXT>(
+        vkGetInstanceProcAddr(instance, "vkCreateDebugUtilsMessengerEXT"));
+    const VkResult result = createMessenger ? createMessenger(instance, &info, nullptr, &messenger)
+                                            : VK_ERROR_EXTENSION_NOT_PRESENT;
+#else
     const VkResult result = vk_common_CreateDebugUtilsMessengerEXT(instance, &info, nullptr, &messenger);
+#endif
     LOG_INFO("video: driver error messages {} (result {})", result == VK_SUCCESS ? "go to stderr.log" : "unavailable", int(result));
 }
 #endif
@@ -2994,7 +3004,9 @@ namespace gpu::video
             if (const char* output = getenv("LO_SWITCH_OUTPUT_HEIGHT"); output && IsDeko3d())
             {
                 g_switchOutputHeight = uint32_t(atoi(output));
+#if defined(LO_SWITCH_DEKO3D)
                 if (g_switchOutputHeight) plume::Deko3DSetSwapChainSize(g_switchOutputHeight * 16 / 9, g_switchOutputHeight);
+#endif
             }
 #endif
             g_swapChain = g_queue->createSwapChain(SwapChainDescription());
@@ -4359,7 +4371,9 @@ namespace gpu::video
         // swapchain is 1280x720, and it returns to the smaller size with the first game frame (one resize each way).
         if (g_switchOutputHeight) {
             const uint32_t outputHeight = debug_menu::IsOverlayVisible() || settings::IsOpen() ? 720 : g_switchOutputHeight;
+#if defined(LO_SWITCH_DEKO3D)
             plume::Deko3DSetSwapChainSize(outputHeight * 16 / 9, outputHeight);
+#endif
         }
 #endif
 #if (defined(_WIN32) && (defined(LO_ENABLE_STREAMLINE_FG) || defined(LO_ENABLE_D3D12_FG) || defined(LO_ENABLE_VULKAN_FSR_FG))) || (defined(__APPLE__) && defined(LO_ENABLE_METALFX_FG))

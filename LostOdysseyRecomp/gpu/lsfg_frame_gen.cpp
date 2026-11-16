@@ -7,7 +7,9 @@
 #include "lsfg_frame_gen.h"
 #include "video.h"
 
-#if LO_PLATFORM_SWITCH && defined(LO_GPU_PLUME)
+// thirdparty/CMakeLists.txt builds lo_lsfg (lsfg-vk) for Switch 1 only, so
+// Switch 2 takes the stub path below like every other target.
+#if LO_PLATFORM_SWITCH && defined(LO_GPU_PLUME) && !LO_PLATFORM_SWITCH2
 
 #include <os/logger.h>
 #include <plume_vulkan.h>

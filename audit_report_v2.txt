@@ -1,0 +1,265 @@
+LostOdysseyRecomp - Switch 2 (libounce + OunceVK) pre-flight audit, revision 2
+============================================================================
+
+Date: 2026-11-16 14:57
+Supersedes audit_report.txt (v1). Blocker A from v1 is fixed; this report
+records what was changed, the rebuild, and the symbol evidence.
+Binary audited: build/LostOdysseyRecomp/LostOdysseyRecomp.elf
+                467,650,664 bytes, 14:55
+                .nro 85,963,185 bytes (was 76,833,201: +9.13 MB, the driver is
+                now actually in the image)
+
+VERDICT: the OunceVK link collision is resolved and verified statically. The
+image now contains the real driver (249 entry points, all GLOBAL FUNC), volk is
+initialised from ouncevk_vkGetInstanceProcAddr, nm -u is 0, and nothing from the
+Switch 1 Mesa ICD path, deko3d or LSFG is linked. Not yet run on hardware; the
+remaining risks are listed in section 7.
+
+
+1. BLOCKER A - WHAT WAS BROKEN
+------------------------------
+v1 found that libouncevk.a's vulkan.o was never pulled out of the archive. volk
+(thirdparty/plume/contrib/volk) defines every Vulkan entry point as a global
+function-pointer variable:
+
+    PFN_vkGetInstanceProcAddr vkGetInstanceProcAddr;      // volk.c:2517
+    PFN_vkCreateInstance vkCreateInstance;                // and 616 more
+
+Those definitions satisfy every vk* reference, so the linker had nothing to
+extract from libouncevk.a. plume's
+
+    __asm__("vkGetInstanceProcAddr")
+
+alias resolved to volk's own 8-byte variable, and volkInitializeCustom() would
+have stored the address of that BSS slot as the driver entry point: volk then
+branches to BSS and faults during Vulkan initialisation.
+
+
+2. THE FIX AS IMPLEMENTED
+-------------------------
+2.1 Symbol-renamed driver archive (build-time)
+
+    cmake/PrefixOunceVK.cmake   (new; run with `cmake -P`)
+    cmake/LoSwitch.cmake        (Switch 2 block)
+    thirdparty/CMakeLists.txt   (Switch 2 plume link)
+
+PrefixOunceVK.cmake runs
+
+    aarch64-none-elf-nm --defined-only --extern-only libouncevk.a
+
+keeps the defined/exported `^vk[A-Z]` symbols, writes an
+`objcopy --redefine-syms` list, and produces
+
+    build/libouncevk_prefixed.a      (23,237,414 bytes)
+    build/libouncevk_prefixed.syms
+
+Renaming all 249 of them means objcopy rewrites the symbol table and the
+relocations together, so the driver's internal references stay consistent, while
+everything it still needs from libounce and libc is untouched because those
+names are not in the list. Measured on the generated archive:
+
+    defined prefixed vk* symbols            249
+    leftover unprefixed defined vk*           0
+    undefined references that got prefixed    0   (libounce/_Unwind refs intact)
+    undefined symbol count, original vs new   3177 == 3177
+
+thirdparty/CMakeLists.txt links the prefixed archive plus the libraries the
+libvulkan.a INPUT() stub used to add:
+
+    target_link_libraries(plume PUBLIC "${LO_SWITCH_OUNCEVK_PREFIXED}"
+                                       ${LO_SWITCH_NVK_EXTRA_LIBS} nx)   # stdc++;m
+
+The final link line now reads
+
+    ... ../thirdparty/plume/libplume.a ... ../libouncevk_prefixed.a -lstdc++ -lm -lnx -lnx -lm
+
+with 0 occurrences of `-lvulkan` and no `-Wl,--whole-archive`.
+
+2.2 volk entry point (source + patch)
+
+thirdparty/plume/plume_vulkan.cpp, __SWITCH2__:
+
+    extern "C" {
+        VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
+            ouncevk_vkGetInstanceProcAddr(VkInstance instance, const char *pName);
+    }
+    ...
+    if (volkGetInstanceVersion() == 0) {
+        volkInitializeCustom(&ouncevk_vkGetInstanceProcAddr);
+    }
+
+The asm() alias is gone, so nothing can silently resolve back to volk's
+variable. tools/patches/plume-switch2.patch was updated to match; verification:
+
+    copy of the patched file -> patch -R -p1 -> patch -p1 -> diff
+    == identical, "PATCH ROUNDTRIP OK".
+
+2.3 Second link fix: --gc-sections was deleting the driver's entry points
+
+/opt/devkitpro/libounce/switch.specs line 2 injects `--gc-sections` into every
+link. A statically linked Vulkan driver is reached only through
+vkGetInstanceProcAddr/vkGetDeviceProcAddr at run time, so nothing in the image
+refers to its entry points and the linker removed them. The first build after
+the rename showed only 5 of 249 prefixed entry points in the ELF
+(vkCreateInstance, vkDestroyInstance, vkEnumerateInstanceLayerProperties,
+vkEnumerateDeviceLayerProperties, vkGetInstanceProcAddr) and
+ouncevk_vkCreateViSurfaceNN was absent. Every device-level lookup would have
+returned a hole at run time.
+
+Fix: cmake/LoSwitch.cmake reads the same symbol list from the archive at
+configure time and turns it into 249 GC roots
+
+    -Wl,-u,ouncevk_vkAcquireNextImage2KHR
+    ... (249 total, matching the archive exactly)
+
+propagated to the final link through `target_link_options(plume PUBLIC ...)`.
+The archive is added to CMAKE_CONFIGURE_DEPENDS so a devkitPro driver update
+reconfigures and regenerates the list. Configure output:
+
+    -- LostOdysseyRecomp: OunceVK /opt/devkitpro/portlibs/switch2/lib/libouncevk.a
+       (entry points prefixed 'ouncevk_' -> build/libouncevk_prefixed.a, 249 kept with -u)
+    [ 13%] Prefixing OunceVK Vulkan entry points with 'ouncevk_'
+    -- PrefixOunceVK: 249 entry points prefixed with 'ouncevk_' -> build/libouncevk_prefixed.a
+
+
+3. BUILD (steps 4 of the request)
+---------------------------------
+    source /opt/devkitpro/switch2vars.sh && cmake --build build -j3
+
+Result: success, BUILD_EXIT=0, "Packaging LostOdysseyRecomp.nro",
+"[100%] Built target LostOdysseyRecomp". No compiler warnings in the final
+build (the plume_vulkan.o compile is the only recompiled object and it is clean
+apart from the pre-existing VK_USE_PLATFORM_VI_NN redefinition notice).
+
+    LostOdysseyRecomp.elf    467,650,664 bytes  14:55
+    LostOdysseyRecomp.nro     85,963,185 bytes  14:55
+    LostOdysseyRecomp.nacp        16,384 bytes
+
+
+4. SYMBOL AUDIT (step 5 of the request)
+---------------------------------------
+4.1 Undefined symbols - PASS
+
+    aarch64-none-elf-nm -u build/LostOdysseyRecomp/LostOdysseyRecomp.elf | wc -l  ->  0
+
+4.2 OunceVK entry points - PASS
+
+    prefixed entry points in the ELF: 249 of 249 from the archive
+
+    readelf -sW:
+    222868: 0000000002f6acc0  176 FUNC GLOBAL DEFAULT 1 ouncevk_vkCreateInstance
+    247172: 0000000002f6f9e0  116 FUNC GLOBAL DEFAULT 1 ouncevk_vkCreateViSurfaceNN
+    149622: 0000000002f6ad80  260 FUNC GLOBAL DEFAULT 1 ouncevk_vkGetInstanceProcAddr
+
+All three are real code, not pointer slots, and GLOBAL DEFAULT. The one and only
+unprefixed vk* function symbol left in the image is volk's own
+`t vkGetInstanceProcAddrStub`; the 710 `B` vk* symbols are volk's dispatch
+pointers, which is the intended design (volk fills them from the driver).
+
+Dispatch chain spot-checked in the disassembly: the retained stubs are
+trampolines that call vk_icdGetInstanceProcAddr and branch to the returned
+pointer, e.g.
+
+    ouncevk_vkCreateViSurfaceNN:
+        ... bl 2f9f2c0 <vk_icdGetInstanceProcAddr>
+        ... mov x16, x4 ; br x16
+
+and the concrete implementations are present:
+    nvk_queue_submit, vk_tramp_QueueSubmit, vk_common_QueueSubmit,
+    nvk_CreateDevice, nvk_AllocateMemory, nvk_CreateImage, nvk_CmdDraw,
+    wsi_CreateViSurfaceNN, vk_icdGetInstanceProcAddr
+    (409 nvk_* driver internals, 268 vk_common_*, 80 wsi_*)
+
+4.3 libouncevk identity in the ELF - PASS
+
+    'src/nouveau/vulkan/nvk_buffer.c'   1
+    '%s (NVK %s)'                       1   (driver version banner)
+    'nvk_queue_submit'                  1
+    ouncevk_* symbols in nm             10   (profile/observer/debug-sync internals)
+
+4.4 Mesa / ICD / deko3d - PASS, with a correction to v1
+
+v1 reported 0 matches for `vk_icd`, `nvk` and `mesa_`. That was accurate for the
+old image, which contained no driver at all. Now that OunceVK is linked, those
+names appear because they are OunceVK's own NVK-derived internals, all LOCAL
+inside the driver object (archives are linked with --exclude-libs,ALL):
+
+    t vk_icdGetInstanceProcAddr
+    t vk_icdGetPhysicalDeviceProcAddr
+    t vk_icdNegotiateLoaderICDInterfaceVersion
+    d vk_icd_version
+    t _mesa_* (129 matches), t nvk_* (576 matches)
+
+There is no GLOBAL export of any of them, no `-lvulkan` on the link line, no ICD
+negotiation compiled in (plume's `#else` NVK branch is not built under
+__SWITCH2__), and no Switch 1 portlibs path is used. So: no Mesa NVK ICD
+trampoline from the Switch 1 build, only the driver's internal, unreachable
+compatibility symbols.
+
+deko3d: 0 matches for libdeko3d/uam/dk::; the only "Deko3D" names are the
+runtime's always-false host switches (IsDeko3d, debug_options::Deko3d*).
+LSFG: compiled out on Switch 2 (stub path), 0 lsfg symbols.
+
+
+5. HEAP CHECK (step 3 of the request) - NO CAP
+----------------------------------------------
+LostOdysseyRecomp/os/switch/switch_runtime.cpp:
+
+    u32 __nx_applet_type = AppletType_Application;
+    size_t __nx_heap_size = 0;          // 0 = dynamic, full pool
+
+Verified against the implementation in /opt/devkitpro/libounce/lib/libounce.a
+(__libnx_initheap, disassembled):
+
+    __nx_heap_size != 0  -> svcSetHeapSize(exactly that size)
+    __nx_heap_size == 0  -> heap = svcGetInfo(InfoType_TotalMemorySize, 6)
+                                  - svcGetInfo(InfoType_UsedMemorySize, 7)
+                                  - 2 MiB, rounded down to 2 MiB,
+                            floored at 512 MiB, then svcSetHeapSize.
+    envHasHeapOverride() -> the loader's env.txt-style override wins if present.
+
+So the Switch 2 application pool is not capped by us: zero takes everything the
+process owns (the ~9 GB application region under title takeover), and guest
+memory, NVK allocations, staging buffers and the 1440p scene targets are all
+carved from that heap. The only consumer of the bounds in this tree is the
+diagnostic log (`heap in use ... (arena X of Y MiB)`), which reports the real
+sizes. A code comment now documents that this must only ever be lowered, never
+raised as a "budget".
+
+
+6. FILES CHANGED IN THIS SESSION
+--------------------------------
+    cmake/PrefixOunceVK.cmake                     new: nm -> redefine list -> objcopy
+    cmake/LoSwitch.cmake                          OunceVK archive/prefix/paths, tool
+                                                  detection, 249-linker-GC-root list,
+                                                  CMake reconfigure dependency
+    thirdparty/CMakeLists.txt                     generate + link libouncevk_prefixed.a,
+                                                  -u flags, stdc++/m instead of -lvulkan
+    thirdparty/plume/plume_vulkan.cpp             __SWITCH2__ uses
+                                                  ouncevk_vkGetInstanceProcAddr
+    tools/patches/plume-switch2.patch             kept in sync (reverse/forward verified)
+    tools/patches/README.md                       patch description updated
+    LostOdysseyRecomp/os/switch/switch_runtime.cpp  comment on the dynamic heap
+
+
+7. REMAINING RISKS (unchanged from v1 unless noted)
+---------------------------------------------------
+1. No hardware run. Everything above is static evidence; the first boot is still
+   the real test. Expect the log to reach "vulkan:" device creation. If it
+   aborts before that with a data abort, the remaining suspicion is the
+   dispatch path, not the link.
+2. Launch by title takeover (hold R on a game), not from the album: the guest
+   address space needs svcMapProcessMemory/CodeMemory (0x74/0x75/0x77/0x78) to
+   be hinted by the loader, otherwise Allocate() fails before the GPU starts.
+3. The 1440-row docked default renders a 2560x1440 scene (1.78x the pixels of
+   1080p) and scales it to the 1920x1080 surface; watch the frame budget and
+   step dynamic resolution down if needed.
+4. Swap chain: plume uses surfaceCapabilities.currentExtent and clamps to
+   minImageExtent..maxImageExtent otherwise, so 1080p/1440p can never exceed
+   maxImageExtent. Watch for per-frame recreation if nwindowGetDimensions ever
+   falls back to its 1280x720 default.
+5. libvulkan.a is an INPUT() stub; if devkitPro changes the driver (new entry
+   points), the CMAKE_CONFIGURE_DEPENDS entry forces a reconfigure so the -u
+   list and the prefix list stay in step with it.
+6. The .nro grew by 9.13 MB because the driver is now really included; that is
+   expected, not duplication (no unprefixed driver entry points remain).

@@ -15,13 +15,21 @@ namespace gpu::dynamic_resolution
     // 540 -> 960, 504 -> 896, ...).
     inline constexpr uint32_t Rung = 36;
     inline constexpr uint32_t Lowest = 360;
+    // The tallest fixed rung (settings::SwitchSceneHeights): 1080 on Switch 1, 1440 on Switch 2. Dynamic heights run
+    // from Lowest to one row below it, the same bound as resolution::MaxDynamicHeight.
+#ifdef __SWITCH2__
+    inline constexpr uint32_t Highest = 1440;
+#else
+    inline constexpr uint32_t Highest = 1080;
+#endif
     // Heights resolution::ResolveInternalSize accepts besides its fixed modes.
     inline constexpr bool IsDynamicHeight(uint32_t height)
     {
-        return height >= Lowest && height < 1080 && height % 9 == 0;
+        return height >= Lowest && height < Highest && height % 9 == 0;
     }
-    // The base heights it works from (the Switch's Maximum resolution rows, 360 to 720, and 1080).
-    inline constexpr bool Supports(uint32_t base) { return base >= Lowest && base <= 1080 && base % 9 == 0; }
+    // The base heights it works from (the Switch's Maximum resolution rows, 360 to 720, and 1080, plus 1440 on
+    // Switch 2).
+    inline constexpr bool Supports(uint32_t base) { return base >= Lowest && base <= Highest && base % 9 == 0; }
     // The default minimum: 80% of the base height (540 -> 432, 720 -> 576).
     inline constexpr uint32_t DefaultMinimum(uint32_t base) { return std::max(Lowest, base * 4 / 5); }
     // The lowest height it steps down to: whole steps below the base that stay at or above the minimum (and 360).

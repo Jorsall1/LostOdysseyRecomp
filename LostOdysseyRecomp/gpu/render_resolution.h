@@ -41,6 +41,13 @@ inline constexpr uint32_t TargetGuestHeight(TargetRole role, uint32_t height) {
 // taller ones keep its width and grow taller, so that area keeps its pixels.
 // A minimized/uninitialized output uses the native size, never a zero allocation.
 inline constexpr uint32_t MaxTallHeight = 4320; // bounds portrait rasters
+// The tallest stepped (dynamic resolution) scene height, one rung below the 1440 mode: the Switch 2 renders 1440
+// rows docked and steps down from it, so 1080 to 1431 rows are scene heights there too.
+#ifdef __SWITCH2__
+inline constexpr uint32_t MaxDynamicHeight = 1440;
+#else
+inline constexpr uint32_t MaxDynamicHeight = 1080;
+#endif
 inline constexpr Size ResolveInternalSize(uint32_t mode, uint32_t outputWidth, uint32_t outputHeight) {
     const bool hasOutput = outputWidth && outputHeight;
     const bool tall = hasOutput && uint64_t(outputWidth) * 9 < uint64_t(outputHeight) * 16;
@@ -59,8 +66,8 @@ inline constexpr Size ResolveInternalSize(uint32_t mode, uint32_t outputWidth, u
     // 540: below the Xbox 360 native 720p, for the Switch (LO_SWITCH_RENDER_HEIGHT).
     case 540: case 720: case 1080: case 1440: case 2160: return forMode(mode);
     default:
-        // A dynamic resolution height (gpu/dynamic_resolution.h): 360 to 1071 rows, a multiple of 9.
-        if (mode >= 360 && mode < 1080 && mode % 9 == 0) return forMode(mode);
+        // A dynamic resolution height (gpu/dynamic_resolution.h): 360 rows to MaxDynamicHeight - 1, a multiple of 9.
+        if (mode >= 360 && mode < MaxDynamicHeight && mode % 9 == 0) return forMode(mode);
         if (!hasOutput) return {};
         // Follow the output, capping the 16:9 area at 2160 rows.
         if (tall) return forWidth((std::clamp)(outputWidth, 1u, 3840u));

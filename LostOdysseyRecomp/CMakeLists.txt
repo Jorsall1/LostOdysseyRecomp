@@ -621,15 +621,20 @@ if(NOT ANDROID)
     target_link_libraries(LoAndroidTouchInputTest PRIVATE fmt::fmt SDL3::SDL3-static xxHash::xxhash)
 endif()
 
-add_executable(LoShaderTool
-    ${CMAKE_SOURCE_DIR}/tools/xenos_shader_tool/main.cpp
-    ${LO_RUNTIME_ROOT}/gpu/shader/xenos_translator.cpp
-    ${LO_RUNTIME_ROOT}/gpu/shader/dxc_compiler.cpp)
+# A host tool: it loads DXC's dxcompiler library the way a PC runtime does
+# (dlfcn / LoadLibrary), which the consoles have neither of. They build the
+# prebuilt shader pack instead, so it stays out of their default build.
+if(NOT LO_TARGET_PLATFORM STREQUAL "switch")
+    add_executable(LoShaderTool
+        ${CMAKE_SOURCE_DIR}/tools/xenos_shader_tool/main.cpp
+        ${LO_RUNTIME_ROOT}/gpu/shader/xenos_translator.cpp
+        ${LO_RUNTIME_ROOT}/gpu/shader/dxc_compiler.cpp)
     target_include_directories(LoShaderTool PRIVATE ${LO_RUNTIME_ROOT}
         ${CMAKE_SOURCE_DIR}/tools/XenosRecomp/thirdparty/dxc-bin/inc)
-target_compile_features(LoShaderTool PRIVATE cxx_std_20)
-target_compile_definitions(LoShaderTool PRIVATE NOMINMAX)
-target_link_libraries(LoShaderTool PRIVATE fmt::fmt)
+    target_compile_features(LoShaderTool PRIVATE cxx_std_20)
+    target_compile_definitions(LoShaderTool PRIVATE NOMINMAX)
+    target_link_libraries(LoShaderTool PRIVATE fmt::fmt)
+endif()
 
 # Translates and compiles HLSL with DXC, without a GPU or game assets. On macOS
 # it loads the bundled libdxcompiler.dylib the way the runtime does.

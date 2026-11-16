@@ -82,17 +82,18 @@ inline constexpr uint32_t ScalingMetalFx = 2;
 inline constexpr int InternalResolutionNative = 1;
 // The Switch's Minimum and Maximum resolution rows: scene heights in rows. Each is a multiple of 36, dynamic
 // resolution's step, so every one is a 16:9 width and a rung down from 540 and 720 (no 480: 853.3 columns).
-// Switch 2 adds the 1080-row rung: its docked output is 1920x1080.
+// Switch 2 adds the 1080- and 1440-row rungs: its docked output is 1920x1080 (a 1440-row scene supersamples
+// it), and its handheld screen is 1080p.
 #ifdef __SWITCH2__
-inline constexpr uint32_t SwitchSceneHeights[] = {360, 432, 504, 540, 576, 648, 720, 1080};
+inline constexpr uint32_t SwitchSceneHeights[] = {360, 432, 504, 540, 576, 648, 720, 1080, 1440};
 #else
 inline constexpr uint32_t SwitchSceneHeights[] = {360, 432, 504, 540, 576, 648, 720};
 #endif
 // Automatic maximum: 540 rows in both modes (720 docked is not yet tested with deko3d; the Maximum resolution
-// row offers it). The release env.txt sets no height, so these rows decide it. Switch 2 renders its 1920x1080
-// docked output: 1080 rows docked, and 720 on the 1080p handheld screen.
+// row offers it). The release env.txt sets no height, so these rows decide it. Switch 2 renders 1440 rows docked
+// (supersampled down to its 1920x1080 output) and 1080 rows on its 1080p handheld screen.
 #ifdef __SWITCH2__
-inline constexpr uint32_t SwitchAutomaticHeight(bool docked) { return docked ? 1080 : 720; }
+inline constexpr uint32_t SwitchAutomaticHeight(bool docked) { return docked ? 1440 : 1080; }
 #else
 inline constexpr uint32_t SwitchAutomaticHeight(bool docked) { return docked ? 540 : 540; }
 #endif

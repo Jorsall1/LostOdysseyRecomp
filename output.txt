@@ -1,0 +1,21 @@
+-- The C compiler identification is GNU 16.1.0
+-- The CXX compiler identification is GNU 16.1.0
+-- Detected multilib folder: pic
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Check for working C compiler: /opt/devkitpro/devkitA64/bin/aarch64-none-elf-gcc - skipped
+-- Detecting C compile features
+-- Detecting C compile features - done
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /opt/devkitpro/devkitA64/bin/aarch64-none-elf-g++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- LostOdysseyRecomp target: switch-aarch64
+-- LostOdysseyRecomp: Nintendo Switch 2 (libounce, OunceVK)
+-- LostOdysseyRecomp: OunceVK /opt/devkitpro/portlibs/switch2/lib/libvulkan.a
+CMake Error at LostOdysseyRecompLib/CMakeLists.txt:8 (message):
+  No recompiled sources in LostOdysseyRecompLib/ppc; run XenonRecomp first
+
+
+-- Configuring incomplete, errors occurred!

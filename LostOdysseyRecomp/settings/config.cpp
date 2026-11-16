@@ -51,11 +51,16 @@ uint32_t RenderHeightOverride()
 {
 #if LO_PLATFORM_SWITCH
     // LO_SWITCH_RENDER_HEIGHT=540 or 720, or any height dynamic resolution renders at (360 to 1071 rows, a multiple
-    // of 9: 360, 450, 504, ...), for measuring how a scene's cost follows its pixels.
+    // of 9: 360, 450, 504, ...), for measuring how a scene's cost follows its pixels. Switch 2 also takes 1080 and
+    // 1440, its fixed rungs.
     static const uint32_t height = [] {
         const char *text = std::getenv("LO_SWITCH_RENDER_HEIGHT");
         const uint32_t rows = text && *text ? uint32_t(std::strtoul(text, nullptr, 10)) : 0;
-        return rows == 540 || rows == 720 || gpu::dynamic_resolution::IsDynamicHeight(rows) ? rows : 0u;
+        if (gpu::dynamic_resolution::IsDynamicHeight(rows)) return rows;
+#ifdef __SWITCH2__
+        if (rows == 1080 || rows == 1440) return rows;
+#endif
+        return rows == 540 || rows == 720 ? rows : 0u;
     }();
     return height;
 #else
@@ -198,8 +203,8 @@ Config Validate(Config value)
     // The scene renders at Graphics → Maximum resolution for the current mode:
     // automatically 960x540 in both modes (the GPU-bound console gains about a
     // third in battle; 720p docked is a choice, not yet tested with deko3d); the
-    // final pass scales to the 720p output (bilinear, or FSR 1). Switch 2 renders
-    // its 1920x1080 docked output instead (1080 rows; 720 handheld).
+    // final pass scales to the 720p output (bilinear, or FSR 1). Switch 2 renders 1440 rows docked (supersampled
+    // down to its 1920x1080 output) and 1080 rows on its 1080p handheld screen.
     // gpu/video.cpp re-applies this when the console is docked or undocked.
     // LO_SWITCH_RENDER_HEIGHT (env.txt, RenderHeightOverride) wins over the menu.
     for (uint32_t *heights : {value.maximumHeight, value.minimumHeight})

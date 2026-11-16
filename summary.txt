@@ -1,0 +1,105 @@
+LostOdysseyRecomp -> Switch 2 (libounce + OunceVK)
+Steps 4 and 5 of PLAN.md - summary
+==========================================================
+
+C++ EDITS MADE
+
+LostOdysseyRecomp/os/platform.h
+- New LO_PLATFORM_SWITCH2 (0/1) derived from __SWITCH2__, alongside the existing
+  LO_PLATFORM_SWITCH, which stays 1 so all shared Switch plumbing is untouched.
+
+LostOdysseyRecomp/settings/config.h
+- SwitchSceneHeights gains the 1080 row on Switch 2:
+  {360, 432, 504, 540, 576, 648, 720, 1080}; Switch 1 keeps the same seven rungs.
+- SwitchAutomaticHeight() returns docked ? 1080 : 720 on Switch 2 (was 540/540), so
+  Validate's existing SwitchMaximumHeight() -> internalResolution path renders
+  1920x1080 docked and 720p handheld. No hardcoded extent: the output size still
+  comes from the window/swapchain.
+- Config::frameRate defaults to 60 on Switch 2, 30 elsewhere.
+
+LostOdysseyRecomp/settings/config.cpp
+- In Validate's Switch block the 30 FPS pin is now #if LO_PLATFORM_SWITCH2: values
+  above gpu::frame_rate::kGuestRefreshHz (60) clamp to 60, so 30 and 60 are allowed,
+  while Switch 1 still forces kDefault (30).
+- LO_FPS is unaffected: it is read at runtime in command_processor, after validation.
+- Budget behaviour: frame_plan.cpp:139 derives its GPU budget from config.frameRate,
+  so 60 FPS gets 16.7 ms instead of 33.3 ms and dynamic resolution steps down toward
+  its 360-row floor. No change needed there.
+
+LostOdysseyRecomp/settings/graphics_menu.h
+- ApplyPreset sets frameRate 60 on Switch 2 (30 on Switch 1); preset comments updated.
+  PresetOf still matches, since it re-applies the preset and compares whole configs.
+
+LostOdysseyRecomp/settings/menu.cpp
+- One stale comment fixed ("pinned at 30" -> "30, or 30/60 on Switch 2").
+
+CHECKS RUN
+
+1. Header value assertions (both -D__SWITCH__ and -D__SWITCH__ -D__SWITCH2__,
+   devkitA64 g++ -fsyntax-only):
+     Switch 2 -> automatic height 1080 docked / 720 handheld, 8 height rungs,
+                 Config{}.frameRate == 60.
+     Switch 1 -> 540/540, 7 rungs, 30 FPS.
+   Both variants compile clean.
+
+2. os/switch/* against libounce:
+   Every os/switch/*.cpp, every os/switch/*.c, and
+   kernel/guest_address_space_switch.cpp compiled with -fsyntax-only against
+   /opt/devkitpro/libounce/include + portlibs/switch2/include. All clean; the only
+   diagnostic was env_file.cpp needing LO_SWITCH_DATA_ROOT, which CMake supplies
+   (not a source issue). sys/iosupport.h resolves from the devkitA64 sysroot, and
+   __nx_applet_type / __nx_heap_size / __nx_exception_stack / __nx_win_exit are weak
+   (V) in libounce.a, so the runtime's strong definitions still win.
+   No source change was needed there.
+
+3. thirdparty/SDL-switch against libounce:
+   Every libnx symbol its Switch backends use exists in libounce's headers (only
+   hidMouseRead was "missing", and it appears solely in a comment). Its CMake keys
+   off NINTENDO_SWITCH, which libounce sets. Configured and built it standalone with
+   aarch64-none-elf-cmake (switch video/audio/joystick backends enabled, exit 0,
+   libSDL3.a linked) - it compiles cleanly, so the plan's "most likely ABI risk" is
+   clear at compile time.
+
+4. Living plumbing confirmed unchanged: LO_SWITCH_DATA_ROOT, LO_SWITCH_DXC_IDENTITY,
+   the os/switch/* glob with SKIP_PRECOMPILE_HEADERS, --wrap=rename, --wrap=getenv,
+   and -lnx (nx).
+
+BLOCKERS / LIMITATIONS
+
+1. plume's Switch patch will not link on Switch 2.
+   tools/patches/plume-switch.patch (applied by tools/switch/build-switch.sh, not
+   present in the working tree) bootstraps volk through vk_icdGetInstanceProcAddr /
+   vk_icdNegotiateLoaderICDInterfaceVersion. OunceVK exports vkCreateInstance,
+   vkCreateViSurfaceNN and vkGetInstanceProcAddr and no vk_icd* symbols, so a Switch 2
+   build needs a __SWITCH2__ variant that calls
+   volkInitializeCustom(&vkGetInstanceProcAddr) instead. This is patch/tooling work,
+   not a header difference: vulkan_vi.h in portlibs/switch2 already declares
+   VkViSurfaceCreateInfoNN and vkCreateViSurfaceNN, exactly as the Switch path
+   expects. The patch chain was not edited because it cannot be validated here.
+
+2. The runtime itself still cannot be compiled through CMake in this checkout
+   (LostOdysseyRecompLib/ppc is empty), so the settings edits were verified by
+   header-level compilation, not by building LostOdysseyRecomp.
+
+3. settings/menu.cpp's Switch Preset/RenderResolution help text still says
+   "540p, 30 FPS". It is a static Tr() string, so Switch 2 wording needs new
+   translated strings in translations*.h; left as a follow-up rather than
+   half-translating it.
+
+4. os/switch/nvk_switch_stubs.c is still compiled on Switch 2. It is harmless (all
+   definitions are __attribute__((weak)), so no clash with libounce/OunceVK), but it
+   exists only to fill Mesa NVK's Linux-winsys holes and could be dropped there.
+
+FILES CHANGED (git status, nothing committed)
+ M LostOdysseyRecomp/CMakeLists.txt      (Steps 1-3)
+ M cmake/LoPlatform.cmake                (Steps 1-3)
+ M cmake/LoSwitch.cmake                  (Steps 1-3)
+ M thirdparty/CMakeLists.txt             (Steps 1-3)
+ M LostOdysseyRecomp/os/platform.h       (Step 4)
+ M LostOdysseyRecomp/settings/config.h   (Step 4)
+ M LostOdysseyRecomp/settings/config.cpp (Step 4)
+ M LostOdysseyRecomp/settings/graphics_menu.h (Step 4)
+ M LostOdysseyRecomp/settings/menu.cpp   (Step 4, comment only)
+?? cmake/toolchains/switch2-libounce.cmake (Step 1)
+?? PLAN.md
+?? output.txt

@@ -30,6 +30,10 @@ extern "C"
     // A full application (title takeover) gets all the memory and every
     // syscall the 4 GiB guest window needs. __nx_heap_size 0: libnx gives the
     // newlib heap everything that is left; guest memory is carved out of it.
+    // Zero means "no cap": libnx sizes the heap from svcGetInfo as
+    // TotalMemorySize - UsedMemorySize - 2 MiB (rounded down to 2 MiB, floor
+    // 512 MiB), so on Switch 2 the pool is the whole application memory region.
+    // Only set this to a number to shrink the heap, never to grow it.
     u32 __nx_applet_type = AppletType_Application;
     size_t __nx_heap_size = 0;
 

@@ -1,0 +1,309 @@
+LostOdysseyRecomp - Switch 2 (libounce + OunceVK) pre-flight safety audit
+=======================================================================
+
+Date: 2026-11-16
+Binary audited: build/LostOdysseyRecomp/LostOdysseyRecomp.elf
+                (14:25, 457,173,488 bytes; .nro 76,833,201 bytes)
+
+VERDICT: NOT READY TO TRANSFER.
+Two independent boot risks were found, one of them a hard failure that the
+symbol audit in step 3 was supposed to rule out:
+
+  A. BLOCKER - OunceVK is not in the image. The Vulkan entry points in the
+     ELF are volk's 8-byte function-pointer slots, not OunceVK functions.
+     libouncevk.a's vulkan.o was never pulled out of the archive.
+
+  B. RISK - kernel/guest_address_space_switch.cpp needs four privileged
+     process-memory syscalls to be hinted by the loader. If the Switch 2
+     loader does not hint them, the runtime fails at memory allocation before
+     the GPU is ever touched.
+
+Resolution, swap chain extent handling and SD card paths all check out (see
+sections 1, 4.2 and 4.3). Details and fixes below.
+
+
+1. RESOLUTION UPDATE (step 1)
+-----------------------------
+Requested: Switch 2 includes 1440 in SwitchSceneHeights; automatic height is
+1440 docked / 1080 handheld.
+
+State found: most of this was already in the working tree from the earlier
+settings work (settings/config.h, uncommitted):
+
+    #ifdef __SWITCH2__
+    inline constexpr uint32_t SwitchSceneHeights[] =
+        {360, 432, 504, 540, 576, 648, 720, 1080, 1440};
+    ...
+    SwitchAutomaticHeight(bool docked) { return docked ? 1440 : 1080; }
+    #else
+    ... {360, ..., 720};  SwitchAutomaticHeight -> 540 / 540
+    #endif
+
+Switch 1 is untouched (seven rungs, 540/540).
+
+One leftover 1080 cap was found and fixed in this session:
+gpu/dynamic_resolution.h, IsDynamicHeight() tested `height < 1080`, which
+contradicted resolution::MaxDynamicHeight (1440 on Switch 2, render_resolution.h)
+and would have rejected LO_SWITCH_RENDER_HEIGHT values from 1080 to 1439 on
+Switch 2. It now shares one bound with Supports():
+
+    #ifdef __SWITCH2__ Highest = 1440; #else Highest = 1080; #endif
+    IsDynamicHeight(h) -> h >= 360 && h < Highest && h % 9 == 0
+    Supports(base)     -> base >= 360 && base <= Highest && base % 9 == 0
+
+Limits checked end to end for 1440:
+  - settings/config.cpp RenderHeightOverride(): Switch 2 accepts 1080 and 1440
+    (plus every dynamic height), Switch 1 does not.
+  - settings/config.cpp Validate(): maximumHeight/minimumHeight rows are
+    validated against SwitchSceneHeights, then internalResolution is set from
+    RenderHeightOverride() or SwitchMaximumHeight(value, Docked()).
+  - settings/graphics_menu.h: SwitchHeightChoiceCount/At/SelectMaximumHeight
+    are table-driven, so the 1440 row and the 1440 minimum appear without
+    further edits. ApplyPreset() leaves both modes Automatic (hence 1440/1080)
+    and sets frameRate 60 on Switch 2.
+  - gpu/render_resolution.h ResolveInternalSize(1440, 1920, 1080) returns
+    2560x1440 (16:9 area kept at 1440 rows), downscaled by the present pass to
+    the 1920x1080 swap chain image. MaxDynamicHeight is 1440 there.
+  - No path clamps the scene height to 1080 on Switch 2 any more.
+
+Note: a 2560x1440 scene target is 1.78x the pixels of 1920x1080, so the
+automatic docked height costs ~78% more GPU work and scene-target memory than
+1080 rows. That is the requested behaviour, but watch the frame budget
+(Graphics -> Dynamic resolution steps down from 1440 in 36-row rungs).
+
+
+2. BUILD (step 2)
+-----------------
+    source /opt/devkitpro/switch2vars.sh && cmake --build build -j3
+
+Result: success, exit 0. A second run is a no-op and also exits 0.
+Post-build steps ran (nacptool, elf2nro, source-version stamp).
+
+    LostOdysseyRecomp.elf    457,173,488 bytes  14:25
+    LostOdysseyRecomp.nro     76,833,201 bytes  14:25
+    LostOdysseyRecomp.nacp        16,384 bytes  14:25
+
+Peak memory ~3.5 GB of 7.7 GB. Only warnings: 3 pre-existing -Wmultichar in
+kernel/xdm.h (OBJECT_SIGNATURE).
+
+
+3. SYMBOL AUDIT (step 3)
+------------------------
+3.1 Undefined symbols - PASS
+
+    aarch64-none-elf-nm -u .../LostOdysseyRecomp.elf | wc -l   ->  0
+
+No unresolved symbols of any kind.
+
+3.2 Mesa NVK / ICD leftovers - PASS
+
+    vk_icd*                        0
+    vk_icdGetInstanceProcAddr      0
+    nvk / MESA / mesa_             0
+    "libnvk"/"vk_icd"/"libdeko3d" in .rodata   0
+  No Mesa NVK or ICD bootstrap is linked, as intended for OunceVK.
+
+3.3 deko3d leftovers - PASS (host-side code only)
+
+  9 symbols match "deko|Deko3D": debug_options::Deko3d{D,E}Active/Set/Saved/
+  Running/ForcedBy, gpu::video::IsDeko3d(), g_deko3d. These are the runtime's
+  own compile-time-disabled switches (always false without LO_SWITCH_DEKO3D),
+  not libdeko3d/uam/dk:: code. No deko3d, uam, or SPIRV-Cross backend is in
+  the image.
+
+3.4 OunceVK entry points - FAIL (BLOCKER)
+
+The three symbols exist in the ELF, so `nm -u` is satisfied, but they are not
+OunceVK's functions:
+
+    nm:  00000000069b1b30 B vkCreateInstance                     <- 8-byte OBJECT
+         00000000069b0b68 B vkCreateViSurfaceNN                 <- 8-byte OBJECT
+         00000000069b1a30 B vkEnumerateInstanceExtensionProperties
+         00000000069b1a28 B vkEnumerateInstanceLayerProperties
+         00000000069b19b0 b vkGetInstanceProcAddr               <- 8-byte OBJECT, LOCAL
+         0000000002e12aa0 t vkGetInstanceProcAddrStub          <- volk's stub
+
+    readelf -sW:
+    97781: 00000000069b19b0  8 OBJECT LOCAL  DEFAULT 24 vkGetInstanceProcAddr
+    200335: 00000000069b1b30 8 OBJECT GLOBAL HIDDEN 24 vkCreateInstance
+    170169: 00000000069b0b68 8 OBJECT GLOBAL HIDDEN 24 vkCreateViSurfaceNN
+
+  All 617 vk* symbols in the image are BSS slots (volk function-pointer
+  variables). There is exactly one FUNC vk* symbol, vkGetInstanceProcAddrStub,
+  and it is volk's own. Zero symbols contain "ouncevk_", and the driver's
+  internal ident strings (.text.ouncevk_profile_read,
+  ouncevk_debug_sync_flags, ouncevk_pipeline_observer, ...) that are present
+  in /opt/devkitpro/portlibs/switch2/lib/libouncevk.a (23,233,430 bytes) do
+  not appear in the ELF. libouncevk.a's vulkan.o was never extracted.
+
+Why it happens:
+  thirdparty/plume/contrib/volk/volk.c defines the Vulkan entry points as
+  global pointer variables ("PFN_vkGetInstanceProcAddr vkGetInstanceProcAddr;"
+  and volkGen-generated globals for every vk*). Those definitions satisfy
+  every reference to vkCreateInstance / vkCreateViSurfaceNN / etc., so the
+  static linker has no undefined vk* symbol left and never pulls vulkan.o out
+  of libvulkan.a. plume_vulkan.cpp's Switch 2 path relies on an asm-labelled
+  alias:
+
+      extern "C" PFN_vkVoidFunction VKAPI_CALL
+          ouncevkGetInstanceProcAddr(VkInstance, const char*) __asm__("vkGetInstanceProcAddr");
+      volkInitializeCustom(ouncevkGetInstanceProcAddr);
+
+  which therefore resolves to volk's own variable, not to OunceVK. The string
+  "ouncevkGetInstanceProcAddr" in the ELF comes only from debug info; there is
+  no such function symbol in the image.
+
+Runtime consequence:
+  volkInitializeCustom() stores the address of that 8-byte BSS slot as the
+  "driver" vkGetInstanceProcAddr, then volkGenLoadLoader() immediately calls
+  through it (vkGetInstanceProcAddrStub -> branch to BSS). That executes data
+  as code: an undefined-instruction/data-abort crash during Vulkan
+  initialisation, before the window, swap chain or any game frame exists. Even
+  if it survived that, vkCreateInstance and vkCreateViSurfaceNN are data
+  slots, so surface creation has no implementation.
+
+The link line has no --whole-archive and no --start-group (checked
+build/LostOdysseyRecomp/CMakeFiles/LostOdysseyRecomp.dir/link.txt: only one
+-lvulkan, which is the INPUT(-louncevk -lstdc++ -lm) script).
+
+Recommended fix (not applied; it changes the link layout and vendored plume):
+  1. Produce a symbol-renamed copy of libouncevk.a at build time with
+     objcopy --redefine-syms, renaming its exported vk* entry points
+     (vkGetInstanceProcAddr, vkCreateInstance, vkCreateViSurfaceNN,
+     vkEnumerateInstanceExtensionProperties, ...) to e.g. ouncevk_*. Internal
+     driver references stay consistent, and its undefined references to
+     libounce (gsvOpen and friends) stay unprefixed, so nothing else breaks.
+  2. Link that renamed archive instead of -lvulkan, so its members are pulled
+     by the renamed references.
+  3. Point plume's __SWITCH2__ alias at the renamed gipa
+     (ouncevk_vkGetInstanceProcAddr) and keep volk as the dispatcher for all
+     other entry points; volk then fills its slots from the real driver.
+  4. Re-run this audit and require: nm showing T (FUNC) vkCreateInstance /
+     vkCreateViSurfaceNN, a non-object vkGetInstanceProcAddr reference into the
+     driver, and libouncevk ident strings present in the ELF.
+  Alternative: bypass volk on Switch 2 entirely (call the linked entry points
+  directly, as libounce's examples/vulkan-clear does with -lvulkan).
+
+Do not deploy the current .nro expecting video; the crash happens before any
+frame is presented.
+
+
+4. CODE AUDIT (step 4)
+----------------------
+4.1 kernel/guest_address_space_switch.cpp - needs loader-granted syscalls (RISK)
+
+  Design: the 4 GiB guest window is one virtmemFindAslr reservation
+  (kSize = 0x100000000, guard 2 MiB). Each committed 2 MiB chunk is heap memory
+  turned into code memory with svcMapProcessCodeMemory and mapped into the
+  window with svcMapProcessMemory; the A/C/E physical aliases (0xA0000000,
+  0xC0000000, 0xE0000000, E shifted by one page) are further mappings of the
+  same source. Guest null page (0x0-0xFFF) stays unmapped by design.
+
+  Findings:
+  - All required entry points exist in libounce (checked
+    /opt/devkitpro/libounce/lib/libounce.a): svcMapProcessMemory,
+    svcMapProcessCodeMemory, envIsSyscallHinted, envGetOwnProcessHandle,
+    virtmemFindCodeMemory - all T. The four syscall IDs used (0x74, 0x75,
+    0x77, 0x78) are the libnx/Horizon ones and are what libounce's headers
+    document.
+  - ProcessMemorySyscallsAvailable() gates everything on
+    envIsSyscallHinted() for those four. The hint set comes from the loader
+    (hbloader on Switch 1; kaiHEN/Ounce on Switch 2). If the Switch 2 loader
+    does not advertise them, Allocate() records ReserveAny / 0xFFFFFFFF and
+    returns nullptr: the runtime exits at startup with a memory failure and
+    the GPU is never initialised. This cannot be verified statically - it is a
+    launch-path concern (title takeover, not album/applet), and it is the
+    second thing to watch on first boot.
+  - OwnProcessHandle() falls back to the send-pseudo-handle-to-self trick when
+    envGetOwnProcessHandle() is invalid, which covers loaders that do not pass
+    a real handle. Good for kaiHEN variance.
+  - MapChunk() retries a failed code-memory mapping 16 times in a fresh ASLR
+    slice; a 2 MiB chunk is memaligned and zeroed before mapping; failures are
+    recorded with view/address/size and logged to stderr. Robust.
+  - EnsureBacked() waits up to 2 s for a page lent to an IPC request
+    (MemAttr_IsIpcMapped, i.e. an SD read landing in guest memory) instead of
+    remapping over it. Correct and important here, since all disc data comes
+    from sdmc:.
+  - Commit() rejects anything at or past 0xC0000000 (aliases follow A), keeps
+    per-chunk commitment state under a mutex, and uses release/acquire atomics
+    for the lock-free fast path in EnsureBacked(). No races found.
+  - Page granularity is 4 KiB throughout and every mapping length is a
+    multiple of it (kChunk = 2 MiB, first chunk starts at 0x1000). Page
+    alignment of destination addresses holds (s_base + offset).
+  - No file-system or SD access in this file; nothing to audit for paths.
+
+4.2 Swap chain extent clamping (thirdparty/plume) - PASS, with one watch item
+
+  VulkanSwapChain::resize() (plume_vulkan.cpp:2985-3020):
+    - getWindowSize() on __SWITCH__ uses nwindowGetDimensions(); it does not
+      use any hardcoded 1080p/1440p size.
+    - vkGetPhysicalDeviceSurfaceCapabilitiesKHR is queried every resize.
+    - If surfaceCapabilities.currentExtent.width != UINT32_MAX (the normal VI
+      case) that extent is used verbatim; otherwise the requested size is
+      std::clamp()ed to minImageExtent..maxImageExtent.
+    - A zero resulting extent aborts the resize and keeps the old views.
+  So the swap chain can never exceed maxImageExtent: currentExtent is valid by
+  definition, and the free-form path is clamped.
+
+  1440p does not reach the surface at all: the swap chain is sized from the
+  window (1920x1080 docked and handheld on Switch 2), while 2560x1440 is an
+  offscreen scene target scaled by the presentation pass. No 1440/2160 extent
+  is ever requested from OunceVK. The deko3d-only LO_SWITCH_OUTPUT_HEIGHT
+  shrink path is compiled out on Switch 2 (LO_SWITCH_DEKO3D guard added in the
+  previous step), so nothing resizes the surface behind plume's back.
+
+  Watch item: needsResize() compares nwindowGetDimensions() with the created
+  extent, and getWindowSize() falls back to 1280x720 if the call fails. If
+  that fallback ever triggers while currentExtent is 1920x1080, needsResize()
+  returns true every frame and the swap chain is recreated per frame (severe
+  stutter, no crash). Not expected on Switch 2, but it is the first thing to
+  look for if the log shows repeated swap chain recreation.
+
+4.3 SD card file paths - PASS
+
+  LO_SWITCH_DATA_ROOT = "/switch/LostOdysseyRecomp" (cmake/LoSwitch.cmake:97),
+  passed to os::user_paths::Initialize() from main.cpp; "sdmc:" is prepended
+  where raw devoptab calls are used (switch_runtime.cpp:629, env_file.cpp:112).
+
+  Every write lands inside sdmc:/switch/LostOdysseyRecomp/:
+    env.txt                      <root>/env.txt
+    settings                     <root>/config/settings.ini      (ConfigDir)
+    saves                        <root>/save                      (SaveDir)
+    logs (session)               <root>/state/logs/runtime-*.log  (StateDir)
+    crash / hang / exit / stderr <root>/*.log
+    shaders, portable pack       <root>/shaders                   (video.cpp:482)
+    game data                    <root>/game
+    cache, mods, profile         <root>/cache, <root>/mods, <root>/profile
+    profiling (.gcda)            <root>/pgo
+  No absolute NAND paths are written. The only absolute paths outside the
+  folder are reads in the debug server's "get"/"ls" helpers
+  (os/switch/debug_server_core.h:49 mentions /atmosphere/... for crash
+  reports), and those are read-only and client-driven.
+  LO_SAVE_DIR / LO_PROFILE_DIR can override the save/profile location from
+  env.txt; unset, everything stays under the app folder.
+
+
+5. FIRST BOOT EXPECTATIONS / CHECKLIST
+--------------------------------------
+1. Launch by title takeover (hold R on a game), not from the album: the
+   process-memory syscalls (section 4.1) must be hinted by the loader.
+2. Expect the current binary to crash in Vulkan initialisation (section 3.4)
+   unless the OunceVK link is fixed first. If a log is written, look for the
+   "vulkan:" lines; a crash before "vulkan: device" with a data abort is this
+   problem.
+3. If it gets further: <root>/state/logs/runtime-*.log records the render
+   height actually used. At the 1440 automatic height the scene is 2560x1440
+   downscaled to 1920x1080; the log and the debug overlay should agree.
+4. Watch for per-frame swap chain recreation (section 4.2 watch item).
+
+
+6. FILES CHANGED IN THIS SESSION
+--------------------------------
+    M LostOdysseyRecomp/gpu/dynamic_resolution.h   IsDynamicHeight 1080 -> Highest (1440 on Switch 2)
+    A audit_report.txt                              this report
+Previously changed (unchanged here): settings/config.h (1440 rung,
+1440/1080 automatic), settings/config.cpp, settings/graphics_menu.h,
+gpu/render_resolution.h, plus the build fixes recorded in build_result.txt
+(lsfg stub, deko3d guards, single sub_823BDA78 hook).
+
+Nothing was committed.
