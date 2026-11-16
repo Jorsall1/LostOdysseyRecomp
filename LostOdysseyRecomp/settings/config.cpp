@@ -198,7 +198,8 @@ Config Validate(Config value)
     // The scene renders at Graphics → Maximum resolution for the current mode:
     // automatically 960x540 in both modes (the GPU-bound console gains about a
     // third in battle; 720p docked is a choice, not yet tested with deko3d); the
-    // final pass scales to the 720p output (bilinear, or FSR 1).
+    // final pass scales to the 720p output (bilinear, or FSR 1). Switch 2 renders
+    // its 1920x1080 docked output instead (1080 rows; 720 handheld).
     // gpu/video.cpp re-applies this when the console is docked or undocked.
     // LO_SWITCH_RENDER_HEIGHT (env.txt, RenderHeightOverride) wins over the menu.
     for (uint32_t *heights : {value.maximumHeight, value.minimumHeight})
@@ -222,11 +223,18 @@ Config Validate(Config value)
     // The guest's display gamma ramp already darkens the blacks like the Xbox 360;
     // expanding 16-235 on top of it crushes everything below 32/255 to black.
     value.expandRgbRange = false;
-    // 30 FPS, the game's own rate and every preset's. The screen has no VRR and the console does not hold 30 in
-    // the heavy areas, so 60 would pace unevenly and halve dynamic resolution's GPU budget (frame_plan.cpp);
-    // 90/120 cannot be shown at 60 Hz. The menu hides the row; a PC settings.ini's 60/90/120 becomes 30.
-    // LO_FPS (env.txt) stays the diagnostic override.
+    // The menu hides the frame rate row; presets and a saved settings.ini set it, and LO_FPS (env.txt) stays the
+    // diagnostic override. The screen has no VRR and is 60 Hz, so 90/120 are never shown.
+#if LO_PLATFORM_SWITCH2
+    // 30 or 60 (the default): the Switch 2 holds 60, and the frame plan's GPU budget follows the rate
+    // (frame_plan.cpp). A PC settings.ini's 90/120 becomes 60, as 60/90/120 become 30 on Switch 1 below.
+    if (value.frameRate > gpu::frame_rate::kGuestRefreshHz) value.frameRate = gpu::frame_rate::kGuestRefreshHz;
+#else
+    // 30 FPS, the game's own rate and every preset's: the console does not hold 30 in the heavy areas, so 60 would
+    // pace unevenly and halve dynamic resolution's GPU budget (frame_plan.cpp). A PC settings.ini's 60/90/120
+    // becomes 30.
     value.frameRate = gpu::frame_rate::kDefault;
+#endif
 #endif
 #if LO_PLATFORM_MACOS
     // Metal always keeps display sync; the menu offers only ProMotion there.

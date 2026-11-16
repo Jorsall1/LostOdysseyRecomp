@@ -59,7 +59,19 @@ if(LO_BUILD_GPU)
         target_compile_definitions(plume PUBLIC PLUME_SDL_VULKAN_ENABLED)
         target_link_libraries(plume PUBLIC SDL3::SDL3)
     endif()
-    if(LO_TARGET_PLATFORM STREQUAL "switch")
+    if(LO_TARGET_PLATFORM STREQUAL "switch" AND LO_TARGET_SWITCH2)
+        # tools/patches/plume-switch.patch: VK_NN_vi_surface on the libnx
+        # NWindow. OunceVK exports the Vulkan entry points (and
+        # vkCreateViSurfaceNN) directly, so the Switch 2 build links plain
+        # -lvulkan and needs no ICD bootstrap.
+        target_compile_definitions(plume PUBLIC __SWITCH__ VK_USE_PLATFORM_VI_NN)
+        if(NOT LO_SWITCH_CHECK_ONLY)
+            if(NOT EXISTS "${LO_SWITCH_NVK_LIBRARY}")
+                message(FATAL_ERROR "OunceVK for Switch 2 not found: ${LO_SWITCH_NVK_LIBRARY} (set LO_SWITCH_NVK_LIBRARY)")
+            endif()
+            target_link_libraries(plume PUBLIC vulkan nx)
+        endif()
+    elseif(LO_TARGET_PLATFORM STREQUAL "switch")
         # tools/patches/plume-switch.patch: VK_NN_vi_surface on the libnx
         # NWindow, entry points from the statically linked Mesa NVK ICD.
         target_compile_definitions(plume PUBLIC __SWITCH__ VK_USE_PLATFORM_VI_NN)
@@ -76,7 +88,7 @@ if(LO_BUILD_GPU)
                 nx)
         endif()
     endif()
-    if(LO_TARGET_PLATFORM STREQUAL "switch")
+    if(LO_TARGET_PLATFORM STREQUAL "switch" AND NOT LO_TARGET_SWITCH2)
         # Optional Lossless Scaling frame generation (LO_FRAMEGEN=1, the user's
         # own Lossless.dll): lsfg-vk's backend as vendored by NetherSX2_nx
         # (GPL-3.0-or-later; see thirdparty/lsfg-vk/README.md).
@@ -95,7 +107,7 @@ if(LO_BUILD_GPU)
         target_compile_features(lo_lsfg PUBLIC cxx_std_20)
         target_link_libraries(lo_lsfg PUBLIC plume)
     endif()
-    if(LO_TARGET_PLATFORM STREQUAL "switch")
+    if(LO_TARGET_PLATFORM STREQUAL "switch" AND NOT LO_TARGET_SWITCH2)
         # deko3d back end (LO_SWITCH_BACKEND=deko3d, docs/SWITCH.md): plume's deko3d back end from sa2-nx/banjo-nx
         # (plume-deko3d/, MIT) with uam, devkitPro's deko3d shader compiler (uam/: zlib, Mesa's files MIT,
         # SwitchWakerHD's patches MPL-2.0), and SPIRV-Cross to turn the Vulkan SPIR-V into uam's GLSL. deko3d itself

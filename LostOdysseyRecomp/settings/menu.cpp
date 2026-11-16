@@ -1330,7 +1330,7 @@ bool GraphicsRowHidden(int r)
     // The console owns the display and output size, and settings::Validate pins the Xbox 360 image (retail shadow
     // maps, no host AA, AO, filtering, HDR or PC upscalers). The rows that do something here, and the Switch's own:
     // the scene height (Render / Maximum, Dynamic and Minimum resolution) and FSR 1 with its sharpness.
-    // Frame rate is pinned at 30 (Validate). Scene fades Off skips the crossfade's full-screen quad.
+    // Frame rate is pinned at 30, or 30/60 on Switch 2 (Validate). Scene fades Off skips the crossfade's full-screen quad.
     switch (GraphicsRow(r))
     {
     case GraphicsRow::Preset: case GraphicsRow::RenderResolution: case GraphicsRow::DynamicResolution:

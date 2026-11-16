@@ -182,12 +182,17 @@ elseif(LO_TARGET_PLATFORM STREQUAL "switch")
     # os/switch/env_file.cpp: names the LO_* switches read before env.txt was applied (stderr.log).
     target_link_options(LostOdysseyRecomp PRIVATE "-Wl,--wrap=getenv")
     # thirdparty/plume-deko3d: LO_DEKO3D_PRESENT_THREAD hands deko3d's buffer-queue calls to a worker.
-    target_link_options(LostOdysseyRecomp PRIVATE "-Wl,--wrap=nwindowQueueBuffer,--wrap=nwindowDequeueBuffer")
+    # Switch 2 (libounce/OunceVK) has no deko3d back end, so neither is built there.
+    if(NOT LO_TARGET_SWITCH2)
+        target_link_options(LostOdysseyRecomp PRIVATE "-Wl,--wrap=nwindowQueueBuffer,--wrap=nwindowDequeueBuffer")
+    endif()
     # Profile-guided build (cmake/LoSwitchPgo.cmake): the runtime is half of what it gains.
     lo_switch_pgo_target(LostOdysseyRecomp)
-    lo_switch_pgo_target(lo_plume_deko3d)
+    if(TARGET lo_plume_deko3d)
+        lo_switch_pgo_target(lo_plume_deko3d)
+    endif()
     # LO_SWITCH_LTO_GPU (cmake/LoSwitch.cmake). Fat objects: the plume archive keeps a symbol index made by plain ar.
-    if(LO_SWITCH_LTO_GPU AND NOT LO_SWITCH_LTO)
+    if(LO_SWITCH_LTO_GPU AND NOT LO_SWITCH_LTO AND NOT LO_TARGET_SWITCH2)
         set_property(SOURCE ${LO_RUNTIME_ROOT}/gpu/renderer.cpp ${LO_RUNTIME_ROOT}/gpu/command_processor.cpp
             APPEND PROPERTY COMPILE_OPTIONS -flto -ffat-lto-objects)
         target_compile_options(lo_plume_deko3d PRIVATE -flto -ffat-lto-objects)
@@ -326,7 +331,7 @@ if(LO_BUILD_GPU)
     target_include_directories(LostOdysseyRecomp PRIVATE
         ${CMAKE_SOURCE_DIR}/thirdparty/plume)
     target_compile_definitions(LostOdysseyRecomp PRIVATE LO_GPU_PLUME=1)
-    if(TARGET lo_plume_deko3d)
+    if(TARGET lo_plume_deko3d AND NOT LO_TARGET_SWITCH2)
         target_link_libraries(LostOdysseyRecomp PRIVATE lo_plume_deko3d)
         target_compile_definitions(LostOdysseyRecomp PRIVATE LO_SWITCH_DEKO3D=1)
     endif()

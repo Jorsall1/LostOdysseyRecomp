@@ -82,10 +82,20 @@ inline constexpr uint32_t ScalingMetalFx = 2;
 inline constexpr int InternalResolutionNative = 1;
 // The Switch's Minimum and Maximum resolution rows: scene heights in rows. Each is a multiple of 36, dynamic
 // resolution's step, so every one is a 16:9 width and a rung down from 540 and 720 (no 480: 853.3 columns).
+// Switch 2 adds the 1080-row rung: its docked output is 1920x1080.
+#ifdef __SWITCH2__
+inline constexpr uint32_t SwitchSceneHeights[] = {360, 432, 504, 540, 576, 648, 720, 1080};
+#else
 inline constexpr uint32_t SwitchSceneHeights[] = {360, 432, 504, 540, 576, 648, 720};
+#endif
 // Automatic maximum: 540 rows in both modes (720 docked is not yet tested with deko3d; the Maximum resolution
-// row offers it). The release env.txt sets no height, so these rows decide it.
+// row offers it). The release env.txt sets no height, so these rows decide it. Switch 2 renders its 1920x1080
+// docked output: 1080 rows docked, and 720 on the 1080p handheld screen.
+#ifdef __SWITCH2__
+inline constexpr uint32_t SwitchAutomaticHeight(bool docked) { return docked ? 1080 : 720; }
+#else
 inline constexpr uint32_t SwitchAutomaticHeight(bool docked) { return docked ? 540 : 540; }
+#endif
 // The Balanced and Performance presets' Minimum resolution, in both operation modes.
 inline constexpr uint32_t SwitchPresetMinimumHeight = 360;
 // Audio output: the stereo downmix, the game's 5.1 channels passed through,
@@ -147,7 +157,11 @@ struct Config
     uint32_t antialiasing = 0; // 0 Off, 1 FXAA, 2 SMAA, 3 experimental camera-based TAA.
     uint32_t shadowResolution = 1; // Shadow map width and height multiplier: 1/2/4.
     uint32_t ambientOcclusion = 0; // 0 Off, 1 SSAO, 2 GTAO.
+#ifdef __SWITCH2__
+    uint32_t frameRate = 60; // The Switch 2's screen is 60 Hz and it holds 60: 60 is the cap there.
+#else
     uint32_t frameRate = 30;
+#endif
     uint32_t loadingTransitions = 2; // Loading pace: 0 Original, 2 Fast (default). Transition effects keep their normal speed.
     // Settings -> Graphics -> VSync: Off, On, or FreeSync / G-SYNC Compatible
     // (variableRefreshRate, which wins over vsync). Applied live.

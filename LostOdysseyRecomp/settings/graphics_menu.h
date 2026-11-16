@@ -134,18 +134,24 @@ inline bool FsrOn(const Config& config)
 // original 720p at 30 FPS; Low-end also turns off the game's costliest effects
 // for weak hardware, Original keeps their retail state.
 #if LO_PLATFORM_SWITCH
-// The Switch's presets, all at 30 FPS with FSR on (it scales the 540-row scene to the screen):
-//   Quality      a fixed 540-row scene, every effect;
-//   Balanced     dynamic resolution 360-540 rows, depth of field at 50%, no bloom (the default, Config's own values);
+// The Switch's presets with FSR on (it scales the scene rows to the screen), at the console's rate: 30 FPS on
+// Switch 1, 60 on Switch 2 (1080 rows docked, 720 handheld):
+//   Quality      a fixed scene at the Automatic height, every effect;
+//   Balanced     dynamic resolution 360 rows to the Automatic height, depth of field at 50%, no bloom (the default,
+//                Config's own values);
 //   Performance  Balanced with the Low-end effects (no dynamic shadows, motion blur, depth of field or bloom).
-// The heights are Automatic (540) in both operation modes, the minimum 360 in both.
+// The heights are Automatic in both operation modes, the minimum 360 in both.
 enum class Preset : uint32_t { Quality, Balanced, Performance, Custom };
 inline constexpr uint32_t PresetChoiceCount = 3; // Custom is shown, never chosen
 inline void ApplyPreset(Config& config, Preset preset)
 {
     const bool low = preset == Preset::Performance;
     const bool dynamic = preset != Preset::Quality;
+#ifdef __SWITCH2__
+    config.frameRate = 60;
+#else
     config.frameRate = 30;
+#endif
     config.dynamicShadows = low ? 0 : 1;
     config.motionBlur = !low;
     config.depthOfFieldPercent = low ? 0 : preset == Preset::Balanced ? 50 : 100;

@@ -33,6 +33,15 @@
 #define LO_PLATFORM_SWITCH 0
 #endif
 
+// Nintendo Switch 2 (libounce + OunceVK, LO_TARGET_SWITCH2). It keeps the
+// Switch platform above: the toolchain ABI and the Vulkan driver are what
+// change, so only the few places that differ (1080p, 60 FPS) test this one.
+#if defined(__SWITCH2__)
+#define LO_PLATFORM_SWITCH2 1
+#else
+#define LO_PLATFORM_SWITCH2 0
+#endif
+
 #if defined(__ANDROID__)
 #define LO_PLATFORM_ANDROID 1
 #else

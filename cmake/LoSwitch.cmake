@@ -3,8 +3,9 @@
 # CMakeLists.txt when LO_TARGET_PLATFORM is "switch". See docs/SWITCH.md.
 
 # PC-only features. None of them has a Switch implementation: the renderer is
-# Vulkan on Mesa NVK, there is no updater or network shader download, and
-# shaders come from a prebuilt SPIR-V pack (no DXC on the console).
+# Vulkan on Mesa NVK (Switch 1) or OunceVK (Switch 2), there is no updater or
+# network shader download, and shaders come from a prebuilt SPIR-V pack (no DXC
+# on the console).
 foreach(_lo_switch_off IN ITEMS
         LO_ENABLE_DLSS LO_ENABLE_FSR LO_ENABLE_STREAMLINE_FG LO_ENABLE_XESS LO_ENABLE_XESS_FG
         LO_ENABLE_D3D12_DLSS_FG LO_ENABLE_FSR_FG LO_ENABLE_VULKAN_FSR_FG LO_ENABLE_METALFX_FG)
@@ -13,23 +14,55 @@ endforeach()
 
 set(DEVKITPRO "/opt/devkitpro" CACHE PATH "devkitPro root")
 
-# Mesa NVK for Horizon, linked statically (no Vulkan loader on the console).
-# The switch-dev Docker image installs it into devkitPro's portlibs.
-set(LO_SWITCH_NVK_LIBRARY "${DEVKITPRO}/portlibs/switch/lib/libvulkan.a"
-    CACHE FILEPATH "Mesa NVK Switch static Vulkan driver (libvulkan.a)")
-
-# Libraries the NVK archive may reference, depending on how mesa-switch was
-# built (UnleashedRecomp-NX links expat and drm_nouveau only when present).
-set(LO_SWITCH_NVK_EXTRA_LIBS "")
-if(NOT LO_SWITCH_CHECK_ONLY)
-    foreach(_lo_nvk_dep IN ITEMS drm_nouveau expat zstd z)
-        find_library(LO_SWITCH_LIB_${_lo_nvk_dep} ${_lo_nvk_dep}
-            HINTS "${DEVKITPRO}/portlibs/switch/lib" "${DEVKITPRO}/libnx/lib")
-        if(LO_SWITCH_LIB_${_lo_nvk_dep})
-            list(APPEND LO_SWITCH_NVK_EXTRA_LIBS "${LO_SWITCH_LIB_${_lo_nvk_dep}}")
+# Switch 2 packaging tools: libounce's toolchain finds switch-tools under its
+# own NX_*_EXE names, while the runtime target uses the LO_SWITCH_* entries.
+if(LO_TARGET_SWITCH2)
+    if(NOT LO_SWITCH_ELF2NRO)
+        if(NX_ELF2NRO_EXE)
+            set(LO_SWITCH_ELF2NRO "${NX_ELF2NRO_EXE}" CACHE FILEPATH "elf2nro (switch-tools)")
+        else()
+            find_program(LO_SWITCH_ELF2NRO elf2nro HINTS "${DEVKITPRO}/tools/bin")
         endif()
-    endforeach()
-    message(STATUS "LostOdysseyRecomp: NVK ${LO_SWITCH_NVK_LIBRARY} (+ ${LO_SWITCH_NVK_EXTRA_LIBS})")
+    endif()
+    if(NOT LO_SWITCH_NACPTOOL)
+        if(NX_NACPTOOL_EXE)
+            set(LO_SWITCH_NACPTOOL "${NX_NACPTOOL_EXE}" CACHE FILEPATH "nacptool (switch-tools)")
+        else()
+            find_program(LO_SWITCH_NACPTOOL nacptool HINTS "${DEVKITPRO}/tools/bin")
+        endif()
+    endif()
+endif()
+
+if(LO_TARGET_SWITCH2)
+    # OunceVK: libounce's Vulkan implementation, linked statically. Its
+    # libvulkan.a is an INPUT() stub for libouncevk.a and exports
+    # vkCreateInstance/vkCreateViSurfaceNN directly, so there is no ICD loader
+    # to bootstrap. It has no dependency on drm_nouveau/expat/zstd.
+    set(LO_SWITCH_NVK_LIBRARY "${DEVKITPRO}/portlibs/switch2/lib/libvulkan.a"
+        CACHE FILEPATH "OunceVK Switch 2 static Vulkan driver (libvulkan.a)")
+    set(LO_SWITCH_NVK_EXTRA_LIBS "")
+    if(NOT LO_SWITCH_CHECK_ONLY)
+        message(STATUS "LostOdysseyRecomp: OunceVK ${LO_SWITCH_NVK_LIBRARY}")
+    endif()
+else()
+    # Mesa NVK for Horizon, linked statically (no Vulkan loader on the console).
+    # The switch-dev Docker image installs it into devkitPro's portlibs.
+    set(LO_SWITCH_NVK_LIBRARY "${DEVKITPRO}/portlibs/switch/lib/libvulkan.a"
+        CACHE FILEPATH "Mesa NVK Switch static Vulkan driver (libvulkan.a)")
+
+    # Libraries the NVK archive may reference, depending on how mesa-switch was
+    # built (UnleashedRecomp-NX links expat and drm_nouveau only when present).
+    set(LO_SWITCH_NVK_EXTRA_LIBS "")
+    if(NOT LO_SWITCH_CHECK_ONLY)
+        foreach(_lo_nvk_dep IN ITEMS drm_nouveau expat zstd z)
+            find_library(LO_SWITCH_LIB_${_lo_nvk_dep} ${_lo_nvk_dep}
+                HINTS "${DEVKITPRO}/portlibs/switch/lib" "${DEVKITPRO}/libnx/lib")
+            if(LO_SWITCH_LIB_${_lo_nvk_dep})
+                list(APPEND LO_SWITCH_NVK_EXTRA_LIBS "${LO_SWITCH_LIB_${_lo_nvk_dep}}")
+            endif()
+        endforeach()
+        message(STATUS "LostOdysseyRecomp: NVK ${LO_SWITCH_NVK_LIBRARY} (+ ${LO_SWITCH_NVK_EXTRA_LIBS})")
+    endif()
 endif()
 
 # Switch releases (LostOdysseyNX, tags vX.Y.Z_NX) are numbered apart from the PC

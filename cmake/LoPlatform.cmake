@@ -5,9 +5,15 @@
 #
 #   LO_TARGET_PLATFORM  windows | linux | macos | android | switch
 #   LO_TARGET_ISA       x86_64 | x86 | aarch64
+#   LO_TARGET_SWITCH2   ON for a Switch 2 (libounce) build; implies the switch
+#                       platform above and only changes the toolchain ABI and
+#                       the Vulkan driver (OunceVK instead of Mesa NVK).
 
-if(LO_TARGET_SWITCH)
-    # Nintendo Switch homebrew; cmake/toolchains/switch-devkitA64.cmake.
+if(LO_TARGET_SWITCH OR CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
+    # Nintendo Switch homebrew; cmake/toolchains/switch-devkitA64.cmake, or
+    # cmake/toolchains/switch2-libounce.cmake for Switch 2. libounce's
+    # Switch2.cmake reports CMAKE_SYSTEM_NAME=NintendoSwitch without going
+    # through our toolchain file, so accept it here too.
     set(LO_TARGET_PLATFORM "switch")
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Android")
     set(LO_TARGET_PLATFORM "android")
@@ -47,7 +53,27 @@ else()
     message(FATAL_ERROR "Unsupported target processor '${_lo_processor}'")
 endif()
 
+# libounce's toolchain file sets NINTENDO_SWITCH2; a plain cache flag lets a
+# Switch 2 build be requested without its toolchain too.
+if(NINTENDO_SWITCH2)
+    set(_lo_switch2_default ON)
+else()
+    set(_lo_switch2_default OFF)
+endif()
+option(LO_TARGET_SWITCH2 "Build for Nintendo Switch 2 (libounce + OunceVK)" ${_lo_switch2_default})
+if(LO_TARGET_SWITCH2 AND NOT LO_TARGET_PLATFORM STREQUAL "switch")
+    message(FATAL_ERROR "LO_TARGET_SWITCH2 requires a Switch build")
+endif()
+if(LO_TARGET_PLATFORM STREQUAL "switch")
+    # libounce's toolchain file identifies the platform through
+    # CMAKE_SYSTEM_NAME, without setting our own flag.
+    set(LO_TARGET_SWITCH ON CACHE BOOL "Build for Nintendo Switch (libnx/libounce)" FORCE)
+endif()
+
 message(STATUS "LostOdysseyRecomp target: ${LO_TARGET_PLATFORM}-${LO_TARGET_ISA}")
+if(LO_TARGET_SWITCH2)
+    message(STATUS "LostOdysseyRecomp: Nintendo Switch 2 (libounce, OunceVK)")
+endif()
 
 if(LO_TARGET_PLATFORM STREQUAL "macos")
     # SDL's Cocoa backend and plume's Metal backend contain Objective-C(++)
