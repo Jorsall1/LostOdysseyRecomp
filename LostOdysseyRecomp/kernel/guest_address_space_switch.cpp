@@ -4,6 +4,7 @@
 #include <switch.h>
 #include <malloc.h>
 #include <algorithm>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -24,6 +25,12 @@
 //   E  0xE0000000 + y   backing y + 0x1000 (A shifted by one 4 KiB page)
 // Both syscalls need the homebrew loader to grant them: launch through title
 // takeover (hold R while starting a game), not the album applet.
+//
+// Switch 2 note: kaiHEN's loader does not fill the syscall hint table, so
+// envIsSyscallHinted() reports 0 even when the syscalls work. The backend is
+// therefore chosen by probing the syscalls on a real 4 KiB block instead of
+// trusting the hints, and a transfer-memory backend covers the case where the
+// kernel refuses svcMapProcessCodeMemory.
 namespace GuestAddressSpace
 {
 namespace
@@ -37,7 +44,21 @@ constexpr unsigned kSvcMapProcessMemory = 0x74;
 constexpr unsigned kSvcUnmapProcessMemory = 0x75;
 constexpr unsigned kSvcMapProcessCodeMemory = 0x77;
 constexpr unsigned kSvcUnmapProcessCodeMemory = 0x78;
+constexpr unsigned kSvcSetProcessMemoryPermission = 0x73;
+constexpr unsigned kSvcCreateTransferMemory = 0x15;
+constexpr unsigned kSvcMapTransferMemory = 0x51;
+constexpr unsigned kSvcUnmapTransferMemory = 0x52;
 
+// How committed pages reach the window.
+//   ProcessMemory:  heap -> code memory (0x77) -> window (0x74). The only
+//     backend that can start a mapping inside a chunk, which the E view needs
+//     because guest E+y reads backing y+0x1000.
+//   TransferMemory: heap -> transfer memory (0x15) -> window (0x51). A transfer
+//     memory always maps from its first page, so the E view is placed one page
+//     lower than A instead, and its first page stays unmapped.
+enum class Backend { Unchecked, None, ProcessMemory, TransferMemory };
+
+Backend s_backend = Backend::Unchecked;
 uint8_t* s_base = nullptr;
 VirtmemReservation* s_reservation = nullptr;
 Handle s_process = INVALID_HANDLE;
@@ -46,15 +67,179 @@ std::mutex s_mutex;
 // committed together with A and never on their own.
 bool s_committed[kChunkCount]{};
 size_t s_committedBytes = 0;
-// Code-memory source of each committed chunk (under s_mutex), to map a view again (EnsureBacked).
+// Code-memory source (ProcessMemory) or transfer-memory handle (TransferMemory)
+// of each committed chunk, under s_mutex, to map a view again (EnsureBacked).
 uintptr_t s_source[kChunkCount]{};
 RepairInfo s_repair{};
+bool s_storeAliasGapLogged = false;
+// One line (separated by " | ") for the log and the error dialog: nothing else
+// exists during Memory's construction, so a failed boot reports the kernel's
+// answers from here.
+char s_diagnostics[2048];
+size_t s_diagnosticLength = 0;
 
+void Diag(const char* format, ...)
+{
+    char line[320];
+    va_list args;
+    va_start(args, format);
+    const int written = std::vsnprintf(line, sizeof(line), format, args);
+    va_end(args);
+    if (written <= 0)
+        return;
+    const size_t length = size_t(written) < sizeof(line) ? size_t(written) : sizeof(line) - 1;
+    std::fprintf(stderr, "guest memory: %s\n", line);
+    if (s_diagnosticLength + length + 4 >= sizeof(s_diagnostics))
+        return;
+    if (s_diagnosticLength != 0)
+    {
+        std::memcpy(s_diagnostics + s_diagnosticLength, " | ", 3);
+        s_diagnosticLength += 3;
+    }
+    std::memcpy(s_diagnostics + s_diagnosticLength, line, length);
+    s_diagnosticLength += length;
+    s_diagnostics[s_diagnosticLength] = '\0';
+}
+
+#if !defined(__SWITCH2__)
 bool ProcessMemorySyscallsAvailable()
 {
     return envIsSyscallHinted(kSvcMapProcessMemory) && envIsSyscallHinted(kSvcUnmapProcessMemory) &&
         envIsSyscallHinted(kSvcMapProcessCodeMemory) && envIsSyscallHinted(kSvcUnmapProcessCodeMemory);
 }
+#endif
+
+#if defined(__SWITCH2__)
+// Everything the failure report needs, gathered before anything can log it.
+void LogFacts()
+{
+    Diag("switch 2: hints 0x73=%d 0x74=%d 0x75=%d 0x77=%d 0x78=%d 0x15=%d 0x51=%d 0x52=%d",
+        int(envIsSyscallHinted(kSvcSetProcessMemoryPermission)), int(envIsSyscallHinted(kSvcMapProcessMemory)),
+        int(envIsSyscallHinted(kSvcUnmapProcessMemory)), int(envIsSyscallHinted(kSvcMapProcessCodeMemory)),
+        int(envIsSyscallHinted(kSvcUnmapProcessCodeMemory)), int(envIsSyscallHinted(kSvcCreateTransferMemory)),
+        int(envIsSyscallHinted(kSvcMapTransferMemory)), int(envIsSyscallHinted(kSvcUnmapTransferMemory)));
+
+    u64 total = 0, used = 0, aslr = 0, aslrSize = 0, heap = 0, heapSize = 0, alias = 0, aliasSize = 0;
+    const Result rcTotal = svcGetInfo(&total, InfoType_TotalMemorySize, CUR_PROCESS_HANDLE, 0);
+    const Result rcUsed = svcGetInfo(&used, InfoType_UsedMemorySize, CUR_PROCESS_HANDLE, 0);
+    const Result rcAslr = svcGetInfo(&aslr, InfoType_AslrRegionAddress, CUR_PROCESS_HANDLE, 0);
+    const Result rcAslrSize = svcGetInfo(&aslrSize, InfoType_AslrRegionSize, CUR_PROCESS_HANDLE, 0);
+    svcGetInfo(&heap, InfoType_HeapRegionAddress, CUR_PROCESS_HANDLE, 0);
+    svcGetInfo(&heapSize, InfoType_HeapRegionSize, CUR_PROCESS_HANDLE, 0);
+    svcGetInfo(&alias, InfoType_AliasRegionAddress, CUR_PROCESS_HANDLE, 0);
+    svcGetInfo(&aliasSize, InfoType_AliasRegionSize, CUR_PROCESS_HANDLE, 0);
+    Diag("switch 2: total=%#llx (rc %#x) used=%#llx (rc %#x)", (unsigned long long)total, rcTotal,
+        (unsigned long long)used, rcUsed);
+    Diag("switch 2: aslr=%#llx+%#llx (rc %#x/%#x) heap-region=%#llx+%#llx alias=%#llx+%#llx",
+        (unsigned long long)aslr, (unsigned long long)aslrSize, rcAslr, rcAslrSize, (unsigned long long)heap,
+        (unsigned long long)heapSize, (unsigned long long)alias, (unsigned long long)aliasSize);
+
+    const struct mallinfo memory = mallinfo();
+    Diag("switch 2: newlib heap %llu MiB in use, %llu MiB arena, window needs %#zx MiB contiguous",
+        (unsigned long long)(size_t(memory.uordblks) >> 20), (unsigned long long)(size_t(memory.arena) >> 20),
+        kSize >> 20);
+}
+
+// Probes the process-memory pair on a scratch page: map 4 KiB of real heap into
+// the code region, map that into an ordinary address, read it back, undo both.
+// Every result code is reported, so the hint table is never the answer.
+bool ProbeProcessMemory(Handle process)
+{
+    void* scratch = memalign(kPage, kPage);
+    if (!scratch)
+    {
+        Diag("probe process memory: no 4 KiB scratch allocation");
+        return false;
+    }
+    std::memset(scratch, 0x5A, kPage);
+
+    Result mapCode = 0, setPermission = 0, mapView = 0;
+    void* code = nullptr;
+    void* view = nullptr;
+    virtmemLock();
+    code = virtmemFindCodeMemory(kPage, kPage);
+    view = virtmemFindAslr(kPage, kPage);
+    if (code && view)
+    {
+        mapCode = svcMapProcessCodeMemory(process, uintptr_t(code), uintptr_t(scratch), kPage);
+        if (R_SUCCEEDED(mapCode))
+        {
+            setPermission = svcSetProcessMemoryPermission(process, uintptr_t(code), kPage, Perm_Rw);
+            mapView = svcMapProcessMemory(view, process, uintptr_t(code), kPage);
+        }
+    }
+    virtmemUnlock();
+    Diag("probe process memory: code=%p view=%p code=%#x perm=%#x map=%#x", code, view, mapCode, setPermission,
+        mapView);
+
+    bool ok = code && view && R_SUCCEEDED(mapCode) && R_SUCCEEDED(mapView);
+    if (ok)
+    {
+        // A read-only mapping would let the guest read but not write, so the
+        // permission result decides whether the probe succeeded.
+        volatile uint8_t* bytes = static_cast<uint8_t*>(view);
+        ok = bytes[0] == 0x5A && bytes[kPage - 1] == 0x5A;
+        if (ok && R_SUCCEEDED(setPermission))
+        {
+            bytes[0] = 0xA5;
+            ok = bytes[0] == 0xA5;
+        }
+        Diag("probe process memory: %s", ok ? "usable" : "mapping or permission unusable");
+    }
+    if (R_SUCCEEDED(mapView))
+        svcUnmapProcessMemory(view, process, uintptr_t(code), kPage);
+    if (R_SUCCEEDED(mapCode))
+        svcUnmapProcessCodeMemory(process, uintptr_t(code), uintptr_t(scratch), kPage);
+    // scratch, code and view are leaked on purpose: after a partial failure the
+    // kernel may still own those pages and freeing them would corrupt the heap.
+    return ok;
+}
+
+// Transfer memory is the fallback when the kernel refuses code memory: the
+// heap page is handed to the kernel (0x15) and mapped back (0x51). It needs no
+// process handle and no code region, but it cannot start inside a chunk.
+bool ProbeTransferMemory()
+{
+    void* scratch = memalign(kPage, kPage);
+    if (!scratch)
+    {
+        Diag("probe transfer memory: no 4 KiB scratch allocation");
+        return false;
+    }
+    std::memset(scratch, 0x3C, kPage);
+
+    Handle memory = INVALID_HANDLE;
+    const Result created = svcCreateTransferMemory(&memory, scratch, kPage, Perm_Rw);
+    void* view = nullptr;
+    Result mapped = 0;
+    if (R_SUCCEEDED(created))
+    {
+        virtmemLock();
+        view = virtmemFindAslr(kPage, kPage);
+        virtmemUnlock();
+        if (view)
+            mapped = svcMapTransferMemory(memory, view, kPage, Perm_Rw);
+    }
+    Diag("probe transfer memory: create=%#x view=%p map=%#x", created, view, mapped);
+
+    bool ok = R_SUCCEEDED(created) && view && R_SUCCEEDED(mapped);
+    if (ok)
+    {
+        volatile uint8_t* bytes = static_cast<uint8_t*>(view);
+        ok = bytes[0] == 0x3C && bytes[kPage - 1] == 0x3C;
+        if (ok)
+        {
+            bytes[0] = 0xC3;
+            ok = bytes[0] == 0xC3;
+        }
+        Diag("probe transfer memory: %s", ok ? "usable" : "mapping unusable");
+        svcUnmapTransferMemory(memory, view, kPage);
+    }
+    if (R_SUCCEEDED(created))
+        svcCloseHandle(memory); // The pages stay with the kernel; scratch is not freed.
+    return ok;
+}
+#endif
 
 struct HandleReceive
 {
@@ -105,6 +290,30 @@ Handle OwnProcessHandle()
     return receive.received;
 }
 
+// Maps [source + sourceOffset, ...) of one chunk into the window at
+// windowOffset. A transfer memory can only be mapped from its first page.
+bool MapView(size_t windowOffset, uintptr_t source, size_t sourceOffset, size_t length, int32_t view,
+             size_t chunkOffset)
+{
+    if (length == 0)
+        return true;
+    Result rc = 0;
+    if (s_backend == Backend::TransferMemory)
+    {
+        if (sourceOffset != 0)
+            rc = 0xFFFFFFFFu;
+        else
+            rc = svcMapTransferMemory(Handle(source), s_base + windowOffset, length, Perm_Rw);
+    }
+    else
+    {
+        rc = svcMapProcessMemory(s_base + windowOffset, s_process, source + sourceOffset, length);
+    }
+    if (R_FAILED(rc))
+        RecordFailure(FailureOperation::MapView, rc, view, s_base + windowOffset, length, chunkOffset);
+    return R_SUCCEEDED(rc);
+}
+
 // Backs [offset, offset + size) of the window with fresh zeroed memory and,
 // for the A view, maps the same pages at the C and E aliases.
 bool MapChunk(size_t offset, size_t size, uintptr_t& sourceOut)
@@ -117,67 +326,100 @@ bool MapChunk(size_t offset, size_t size, uintptr_t& sourceOut)
     }
     std::memset(backing, 0, size);
 
-    // The address is a random free slice, and the mapping can still fail there (a chunk failed about once in 100 runs, at
-    // any time, with most of the heap free, and the game then wrote through a null allocation). Another slice works.
-    constexpr int kMapAttempts = 16;
-    void* source = nullptr;
+    uintptr_t source = 0;
     Result rc = 0;
-    for (int attempt = 0; attempt < kMapAttempts; ++attempt)
+    if (s_backend == Backend::TransferMemory)
     {
-        virtmemLock();
-        source = virtmemFindCodeMemory(size, kPage);
-        bool mapped = false;
-        if (source)
+        Handle memory = INVALID_HANDLE;
+        rc = svcCreateTransferMemory(&memory, backing, size, Perm_Rw);
+        if (R_FAILED(rc))
         {
-            rc = svcMapProcessCodeMemory(s_process, uintptr_t(source), uintptr_t(backing), size);
-            mapped = R_SUCCEEDED(rc);
-            if (mapped)
+            Diag("chunk %#zx: svcCreateTransferMemory(%#zx) failed: %#x", offset, size, rc);
+            RecordFailure(FailureOperation::CreateBacking, rc, -1, backing, size, offset);
+            return false; // backing stays leaked: the kernel may own part of it
+        }
+        source = uintptr_t(memory);
+    }
+    else
+    {
+        // The address is a random free slice, and the mapping can still fail there (a chunk failed about once in 100
+        // runs, at any time, with most of the heap free, and the game then wrote through a null allocation). Another
+        // slice works.
+        constexpr int kMapAttempts = 16;
+        void* code = nullptr;
+        for (int attempt = 0; attempt < kMapAttempts; ++attempt)
+        {
+            virtmemLock();
+            code = virtmemFindCodeMemory(size, kPage);
+            bool mapped = false;
+            if (code)
             {
-                rc = svcSetProcessMemoryPermission(s_process, uintptr_t(source), size, Perm_Rw);
-                if (R_FAILED(rc))
+                rc = svcMapProcessCodeMemory(s_process, uintptr_t(code), uintptr_t(backing), size);
+                mapped = R_SUCCEEDED(rc);
+                if (mapped)
                 {
-                    svcUnmapProcessCodeMemory(s_process, uintptr_t(source), uintptr_t(backing), size);
-                    mapped = false;
+                    rc = svcSetProcessMemoryPermission(s_process, uintptr_t(code), size, Perm_Rw);
+                    if (R_FAILED(rc))
+                    {
+                        svcUnmapProcessCodeMemory(s_process, uintptr_t(code), uintptr_t(backing), size);
+                        mapped = false;
+                    }
                 }
             }
+            virtmemUnlock();
+            if (mapped)
+                break;
+            std::fprintf(stderr, "guest memory: chunk %#zx attempt %d failed at %p, rc %#x\n", offset, attempt, code,
+                rc);
+            code = nullptr;
         }
-        virtmemUnlock();
-        if (mapped)
-            break;
-        std::fprintf(stderr, "guest memory: chunk %#zx attempt %d failed at %p, rc %#x\n", offset, attempt, source, rc);
-        source = nullptr;
-    }
-    if (!source)
-    {
-        RecordFailure(FailureOperation::CreateBacking, rc, -1, source, size, offset);
-        free(backing);
-        return false;
+        if (!code)
+        {
+            RecordFailure(FailureOperation::CreateBacking, rc, -1, code, size, offset);
+            free(backing);
+            return false;
+        }
+        source = uintptr_t(code);
     }
 
-    auto map = [&](size_t destination, size_t sourceOffset, size_t length, int32_t view) {
-        rc = svcMapProcessMemory(s_base + destination, s_process,
-            uintptr_t(source) + sourceOffset, length);
-        if (R_FAILED(rc))
-            RecordFailure(FailureOperation::MapView, rc, view, s_base + destination, length, offset);
-        return R_SUCCEEDED(rc);
-    };
-
-    bool ok = map(offset, 0, size, offset < kStarts[1] ? 0 : 1);
+    bool ok = MapView(offset, source, 0, size, offset < kStarts[1] ? 0 : 1, offset);
     if (ok && offset >= kStarts[1] && offset < kStarts[2])
     {
         const size_t physical = offset - kStarts[1];
-        ok = map(kStarts[2] + physical, 0, size, 2);
-        // E: guest E+y reads backing y+0x1000. The first page of the first
-        // chunk has no E address (it would fall into C).
+        ok = MapView(kStarts[2] + physical, source, 0, size, 2, offset);
         if (ok)
         {
-            const size_t skip = physical == 0 ? kPage : 0;
-            ok = map(kStarts[3] + physical + skip - kPage, skip, size - skip, 3);
+            if (s_backend == Backend::TransferMemory)
+            {
+                // A transfer memory maps from its first page, so the E view is
+                // placed one page lower than A. The guest's first E page needs
+                // a 4 KiB source offset and is the one page left unmapped.
+                if (physical == 0)
+                {
+                    if (!s_storeAliasGapLogged)
+                    {
+                        s_storeAliasGapLogged = true;
+                        Diag("transfer memory backend: E %#zx-%#zx stays unmapped (needs a 4 KiB source offset)",
+                            kStarts[3], kStarts[3] + kChunk - kPage);
+                    }
+                }
+                else
+                {
+                    ok = MapView(kStarts[3] + physical - kPage, source, 0, size, 3, offset);
+                }
+            }
+            else
+            {
+                // E: guest E+y reads backing y+0x1000. The first page of the
+                // first chunk has no E address (it would fall into C).
+                const size_t skip = physical == 0 ? kPage : 0;
+                ok = MapView(kStarts[3] + physical + skip - kPage, source, skip, size - skip, 3, offset);
+            }
         }
     }
     // Mapped views are never released: guest memory lives for the whole run.
     if (ok)
-        sourceOut = uintptr_t(source);
+        sourceOut = source;
     return ok;
 }
 }
@@ -185,18 +427,28 @@ bool MapChunk(size_t offset, size_t size, uintptr_t& sourceOut)
 uint8_t* Allocate()
 {
     ClearFailure();
+    s_diagnosticLength = 0;
+    s_diagnostics[0] = '\0';
+    s_backend = Backend::Unchecked;
+
+    s_process = OwnProcessHandle();
+#ifdef __SWITCH2__
+    Diag("switch 2: own process handle env=%#x resolved=%#x", envGetOwnProcessHandle(), s_process);
+    LogFacts();
+#else
     if (!ProcessMemorySyscallsAvailable())
     {
         // Typical cause: started from the album applet. Logged by main.cpp.
         RecordFailure(FailureOperation::ReserveAny, 0xFFFFFFFFu, -1, nullptr, kSize);
         return nullptr;
     }
-    s_process = OwnProcessHandle();
     if (s_process == INVALID_HANDLE)
     {
         RecordFailure(FailureOperation::ReserveAny, 0xFFFFFFFEu, -1, nullptr, kSize);
         return nullptr;
     }
+    s_backend = Backend::ProcessMemory;
+#endif
 
     virtmemLock();
     s_base = static_cast<uint8_t*>(virtmemFindAslr(kSize, kChunk));
@@ -205,10 +457,38 @@ uint8_t* Allocate()
     virtmemUnlock();
     if (!s_base || !s_reservation)
     {
+        Diag("window: %#zx MiB at %p not reserved (reservation %p)", kSize >> 20, s_base, s_reservation);
         RecordFailure(FailureOperation::ReserveAny, 0, -1, s_base, kSize);
         s_base = nullptr;
         return nullptr;
     }
+    Diag("window: reserved %#zx MiB at %p", kSize >> 20, s_base);
+
+#ifdef __SWITCH2__
+    // The hints are not trusted: a loader that does not fill the table still
+    // lets the syscalls through, so ask the kernel with a real mapping.
+    if (s_process != INVALID_HANDLE && ProbeProcessMemory(s_process))
+        s_backend = Backend::ProcessMemory;
+    else if (ProbeTransferMemory())
+        s_backend = Backend::TransferMemory;
+    else
+        s_backend = Backend::None;
+
+    if (s_backend == Backend::None)
+    {
+        Diag("backend: none, the kernel refused process memory and transfer memory");
+        RecordFailure(FailureOperation::ReserveAny, s_process == INVALID_HANDLE ? 0xFFFFFFFEu : 0xFFFFFFFFu, -1,
+                      nullptr, kSize);
+        virtmemLock();
+        virtmemRemoveReservation(s_reservation);
+        virtmemUnlock();
+        s_reservation = nullptr;
+        s_base = nullptr;
+        return nullptr;
+    }
+    Diag("backend: %s", s_backend == Backend::ProcessMemory ? "process memory (0x77/0x74)"
+                                                            : "transfer memory (0x15/0x51)");
+#endif
     // The guest null page stays unmapped: chunk 0 is committed from 0x1000.
     return s_base;
 }
@@ -321,7 +601,7 @@ Backing EnsureBacked(uint32_t address, uint32_t size)
         const uint64_t chunkEnd = chunkStart + kChunk;
         const uintptr_t source = s_source[chunk];
         repair.source = source;
-        if (source)
+        if (source && s_backend == Backend::ProcessMemory)
         {
             MemoryInfo backing{};
             if (R_SUCCEEDED(svcQueryMemory(&backing, &pageInfo, source)))
@@ -350,9 +630,23 @@ Backing EnsureBacked(uint32_t address, uint32_t size)
         const uint64_t blockEnd = std::min<uint64_t>(chunkEnd, uint64_t(info.addr + info.size - uintptr_t(s_base)));
         repair.mappedStart = blockStart;
         repair.mappedSize = blockEnd > blockStart ? blockEnd - blockStart : 0;
-        repair.result = source && blockEnd > blockStart
-            ? svcMapProcessMemory(s_base + blockStart, s_process, source + (blockStart - mapStart), blockEnd - blockStart)
-            : 0xFFFFFFFFu;
+        uint32_t repairResult = 0xFFFFFFFFu;
+        if (source && blockEnd > blockStart)
+        {
+            if (s_backend == Backend::TransferMemory)
+            {
+                // Transfer memory maps from its first page only.
+                if (blockStart == mapStart)
+                    repairResult = uint32_t(svcMapTransferMemory(Handle(source), s_base + blockStart,
+                        blockEnd - blockStart, Perm_Rw));
+            }
+            else
+            {
+                repairResult = uint32_t(svcMapProcessMemory(s_base + blockStart, s_process,
+                    source + (blockStart - mapStart), blockEnd - blockStart));
+            }
+        }
+        repair.result = repairResult;
         repair.count = s_repair.count + 1;
         s_repair = repair;
         if (R_FAILED(repair.result))
@@ -372,6 +666,11 @@ size_t CommittedBytes()
 {
     std::lock_guard lock(s_mutex);
     return s_committedBytes;
+}
+
+const char* DiagnosticsText()
+{
+    return s_diagnostics;
 }
 }
 #endif

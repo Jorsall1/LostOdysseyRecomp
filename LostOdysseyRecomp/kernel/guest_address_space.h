@@ -81,6 +81,10 @@ struct RepairInfo
 RepairInfo LastRepair();
 // Logs LastRepair() as an error (patches/unbacked_guest_reads.cpp); the first few only.
 void LogRepair(const char* who);
+// One line with the Switch 2 syscall hints, memory regions and backend probe
+// results gathered by Allocate(), for the log and the error dialog. Empty on
+// the Switch 1 build and the desktop hosts.
+const char* DiagnosticsText();
 #else
 // Desktop hosts commit on first touch.
 inline bool Commit(uint32_t, uint32_t) { return true; }

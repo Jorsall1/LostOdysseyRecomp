@@ -815,10 +815,13 @@ int main(int argc, char* argv[])
 #elif LO_PLATFORM_SWITCH
         LOG_ERROR("guest address space: Horizon result={:#x} api={}", failure.error,
                   GuestAddressSpace::FailureApiName(failure.operation));
+        if (const char* const diagnostics = GuestAddressSpace::DiagnosticsText(); diagnostics && *diagnostics)
+            LOG_ERROR("guest address space: {}", diagnostics);
         os::switch_platform::ShowError("Lost Odyssey Recomp could not reserve its memory.",
-            "The game needs the full console memory and the process memory syscalls.\n\n"
+            std::string("The game needs the full console memory and the process memory syscalls.\n\n"
             "Start the Homebrew Menu through title takeover: hold R while launching any game, "
-            "then start Lost Odyssey Recomp. Starting from the Album applet does not work.");
+            "then start Lost Odyssey Recomp. Starting from the Album applet does not work.") +
+            (GuestAddressSpace::DiagnosticsText()[0] ? std::string("\n\n") + GuestAddressSpace::DiagnosticsText() : std::string()));
 #else
         LOG_ERROR("guest address space: errno={}: {}", failure.error, std::strerror(int(failure.error)));
 #endif

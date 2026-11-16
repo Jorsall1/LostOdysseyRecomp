@@ -1,0 +1,150 @@
+Lost Odyssey Recomp - Switch 2 "could not reserve its memory" fix
+===============================================================
+
+Build: 15:50, BUILD_EXIT=0
+  build/LostOdysseyRecomp/LostOdysseyRecomp.nro   85,971,377 bytes
+  sha256 77b72829806c95740f3799ec7406ab102966166584b6614413f2069716c394b8
+  copied to /mnt/c/Users/jorda/Desktop/LostOdysseyRecomp.nro (same hash)
+
+
+1. WHAT FAILED
+--------------
+kaiHEN 20261116, title takeover (hold R), the process reached main() and then
+printed:
+
+    fatal: Lost Odyssey Recomp could not reserve its memory.
+    The game needs the full console memory and the process memory syscalls.
+
+That message comes from main.cpp when GuestAddressSpace::Allocate() returns null
+(memory.cpp Memory::Memory() then leaves g_memory.base null). Allocate() bailed
+out before touching the kernel:
+
+    if (!ProcessMemorySyscallsAvailable())      // envIsSyscallHinted(0x74/0x75/0x77/0x78)
+        return nullptr;                         // record 0xFFFFFFFF
+
+The syscall hint table is filled by the loader from the NPDM's "syscall hint"
+list. kaiHEN's loader does not populate it for homebrew NROs, so all four
+queries return 0 and the port refused to even try - even though the kernel
+patches themselves grant svcMapProcessMemory / svcMapProcessCodeMemory. The
+hint table is advisory; the syscalls are the truth.
+
+
+2. WHAT CHANGED
+---------------
+LostOdysseyRecomp/kernel/guest_address_space_switch.cpp  (__SWITCH2__ paths)
+
+2.1 Diagnostics, printed before anything else can log them
+
+Every line goes to stderr as it happens and is also collected into one string
+that main.cpp now writes to the log and appends to the on-screen error dialog,
+so a failure is readable from the console, nxlink, the SD log and a photo.
+
+    guest memory: switch 2: hints 0x73=0 0x74=0 0x75=0 0x77=0 0x78=0 0x15=1 0x51=0 0x52=0
+    guest memory: switch 2: total=0x... (rc 0) used=0x... (rc 0)
+    guest memory: switch 2: aslr=0x...+0x... (rc 0/0) heap-region=0x...+0x... alias=0x...+0x...
+    guest memory: switch 2: newlib heap ... MiB in use, ... MiB arena, window needs 0x1000 MiB contiguous
+    guest memory: switch 2: own process handle env=0x... resolved=0x...
+    guest memory: window: reserved 4096 MiB at 0x...
+    guest memory: probe process memory: code=0x... view=0x... code=0x0 perm=0x0 map=0x0
+    guest memory: probe process memory: usable
+    guest memory: backend: process memory (0x77/0x74)
+
+The svcGetInfo values are TotalMemorySize(6), UsedMemorySize(7),
+AslrRegionAddress/Size(12/13), HeapRegionAddress/Size(4/5) and
+AliasRegionAddress/Size(2/3), plus mallinfo for the newlib heap. If the 4 GiB
+window ever fails to reserve, aslr+size says whether the region is even large
+enough, which the old code could not tell you.
+
+2.2 The hint gate is gone on Switch 2: the syscalls are probed
+
+    ProbeProcessMemory(handle):
+        memalign 4 KiB, fill with 0x5A
+        code = virtmemFindCodeMemory(4 KiB)
+        view = virtmemFindAslr(4 KiB)
+        svcMapProcessCodeMemory(handle, code, scratch, 4 KiB)     -> rc
+        svcSetProcessMemoryPermission(handle, code, 4 KiB, Rw)    -> rc
+        svcMapProcessMemory(view, handle, code, 4 KiB)            -> rc
+        read back 0x5A/0x5A, write 0xA5 when the permission call succeeded
+        svcUnmapProcessMemory, svcUnmapProcessCodeMemory
+    Success only when the mapping exists and reads/writes back. The scratch
+    page and the two address slices are deliberately leaked: after a partial
+    failure the kernel may still own them.
+
+    Then, only if that fails, ProbeTransferMemory(): memalign 4 KiB,
+    svcCreateTransferMemory, svcMapTransferMemory at a scratch address, read and
+    write back, svcUnmapTransferMemory.
+
+No abort happens because a hint is missing. If the process handle is missing
+(envGetOwnProcessHandle invalid and the self-session copy in OwnProcessHandle()
+fails), the transfer-memory probe still runs, because it needs no handle.
+
+2.3 Fallback backend: transfer memory
+
+When the kernel refuses code memory, committed chunks are backed as transfer
+memory (0x15) and mapped into the window with svcMapTransferMemory (0x51):
+
+    HeapBuffer -> svcCreateTransferMemory -> mapped at A, and at C
+                                           -> mapped at E one page lower
+
+A transfer memory always maps from its first page, so unlike
+svcMapProcessMemory it cannot express the E view's 4 KiB source offset. The E
+view is placed one page lower instead, which reproduces "E+y reads backing
+y+0x1000" exactly, except for the guest's first E page (0xE0000000), which needs
+the offset and stays unmapped. That page is reported once at startup:
+
+    guest memory: transfer memory backend: E 0xe0000000-0xe01ff000 stays unmapped (needs a 4 KiB source offset)
+
+Everything else - the virtual view, A, C, and E from 0xE01FF000 up - is fully
+coherent in that mode. It exists so a denied svcMapProcessCodeMemory still boots
+and reports precisely, not as an equivalent replacement.
+
+The healthy path on patched hardware is still the process-memory backend: it is
+tried first and reported as "backend: process memory (0x77/0x74)".
+
+2.4 Error reporting
+
+main.cpp's Switch failure branch now logs the collected diagnostics and appends
+them to the error dialog body, so the next run does not need a serial console.
+
+GuestAddressSpace::DiagnosticsText() was added to kernel/guest_address_space.h
+(returns an empty string on Switch 1 and the desktop hosts, so those builds are
+unchanged and the Switch 1 hint gate is untouched).
+
+
+3. BUILD
+--------
+    source /opt/devkitpro/switch2vars.sh && cmake --build build -j3
+    BUILD_EXIT=0, "Packaging LostOdysseyRecomp.nro", "[100%] Built target"
+
+Changed objects compiled with no warnings. The header edit invalidated the
+precompiled header, so gpu/renderer.cpp rebuilt as well (~20 min); nothing else
+in the image changed.
+
+Static checks on build/LostOdysseyRecomp/LostOdysseyRecomp.elf:
+    nm -u                                          0
+    GuestAddressSpace::DiagnosticsText             present
+    svcCreateTransferMemory / svcMapTransferMemory  present (libnx)
+    diagnostics strings                            present
+    "probe process memory: code=", "backend: %s",
+    "switch 2: hints 0x73=", "transfer memory backend: E"
+
+
+4. NEXT BOOT - WHAT TO READ
+---------------------------
+1. Healthy: the log shows "probe process memory: ... code=0x0 perm=0x0 map=0x0",
+   "usable" and "backend: process memory (0x77/0x74)", then the game continues
+   past memory init. The hint line may still say 0 everywhere; that is fine now
+   and is recorded for the report.
+2. If it says "backend: transfer memory (0x15/0x51)", the kernel refused code
+   memory. Expect work up to the first guest access to 0xE0000000 (2 MiB hole);
+   that access will fault, and the fault address identifies what needs the E
+   aliases.
+3. If it says "backend: none", the printed rcs are the definitive answer, e.g.
+   code=0x... (0xE0.. usually "no permission"), map=0x... or create=0x...
+   (0xD401/0xE401 class). In that case kaiHEN is not patching the syscall for
+   this title and the report should name that rc.
+4. If it says "window: 4096 MiB at 0x0 not reserved", the address space, not a
+   syscall, is the problem; aslr+size in the same line says how much contiguous
+   address space the process actually has.
+
+Nothing was committed to git.
