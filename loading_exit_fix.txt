@@ -1,0 +1,210 @@
+Lost Odyssey Recomp - Switch 2 (kaiHEN 20261116, title takeover)
+Report: the 100% LOADING hold (audio view + loader probe) and the exit that
+        dropped kaiHEN's R -> hbmenu hook
+==========================================================================
+
+Build   : branch switch2-ouncevk, devkitA64 (devkitpro/switch2), -j20
+Result  : cmake --build build -j20 -> BUILD_EXIT=0
+NRO     : build/LostOdysseyRecomp/LostOdysseyRecomp.nro
+          copied to /mnt/c/Users/Jorda/Desktop/LostOdysseyRecomp.nro
+          86,024,625 bytes, md5 51f3f280812cdea53aee7eeb6c7f520b
+Headers : none touched. .cpp only.
+
+
+=====================================================================
+PART 1 - WHAT THE 15 s DUMP ACTUALLY SAYS
+=====================================================================
+Every dumped address, resolved against the recompiled library
+(ppc_func_mapping.cpp is the symbol table):
+
+  0x82484BE8  sub_82484BE8        [Guest Main] per-frame subsystem update:
+                                  walks a list and calls slot 8 (update) on each
+  0x82484C24  sub_82484BE8+0x3C   the "bctrl" of that virtual update
+  0x82485030  sub_82485030        one such subsystem: drain the global pending
+                                  list at 0x83279B34 (lis -31945 / -28428)
+  0x82485048  sub_82485030+0x18   its first call, before the drain
+  0x82485C18  sub_82485C18        that call: begin-frame, then wait for the
+                                  previous frame's render commands
+  0x82322478  FRenderCommandFence::Wait
+                                  while (*fence > threshold) Sleep(0)
+  0x827CACA8  Sleep               timed NtWaitForSingleObjectEx on the caller
+  0x827CACFC  sub_827CACA8+0x54   the kernel call Site (this is st->lr)
+  0x824858F8  thread entry of the render thread, calls sub_824856A0 in a loop
+  0x824856A0  render thread body: frame pacing (1/60 s offsets), then
+  0x824858A4  its idle-ish pass: Sleep(0), sub_824854D8, present
+                                  (sub_823B63E0), sub_82821110
+  0x823B63F8  per-frame draw submit (sub_82389F88 = viewport/scene setup)
+  0x823B6554  sub_823B63F8+0x15C  its call to sub_82389F88
+  0x8285BEE8  worker pool wait-for-work: WaitForMultipleObjects(2, event),
+                                  then the queued callback at +36(r31)
+  0x8285BF54  that callback call site
+  0x8285BE00  pool thread body, loops back into sub_8285BEE8
+
+What that adds up to:
+
+  * [Guest Main] is NOT blocked. It is inside FRenderCommandFence::Wait, the
+    same fence loop fixed on 2026-11-16 (sub_82322478: while (*fence >
+    threshold) Sleep(0)). It returns every frame - the game really is running
+    at 60 fps - so nothing in the kernel is holding it.
+  * The render thread is in its normal present loop, and the 13 worker threads
+    are in the pool's wait-for-work loop with no work queued. The file reads
+    (LO.FPI, lo.fpd, xenon_*.fpd) are finished. There is no deadlock, no lost
+    wakeup, and no missing critical-section handover in this dump.
+  * So the loading screen is in a *guest state* that never advances: the
+    per-frame subsystem list at 0x82484BE8 runs, the pending list at
+    0x82485030 drains (each entry's slot 288 must answer "done", otherwise the
+    player spins at loc_82485090 with Sleep(0)), and one of those answers, or
+    the state that feeds them, never changes.
+
+  That is answer (b) in the question, but not in the GPU: it is the audio
+  submit, and it was silent for the whole run - see below.
+
+The audio hole: "frames submitted" climbs, peak stays 0
+------------------------------------------------------
+A guest pointer argument reaches an import as base + address
+(kernel/function.h, ArgTranslator::GetValue for pointer types:
+reinterpret_cast<T>(base + uint32_t(v))). The view the guest named in the
+register is the view that is read - there is no Translate() in that path.
+
+On the desktop hosts that is harmless because the A window is the same memory
+at offset 0, so 0x1A000000 and 0xBA000000 are the same bytes. Under
+Backend::Heap they are separate pages: the physical pool lives at
+0xA0000000..0xC0000000 and low guest RAM is ordinary host memory. A render
+driver that submits the *masked physical* address of its frame (0x1A000000 for
+a buffer that lives at 0xBA000000) therefore has its own mix read as zeroed
+guest RAM. The guest mixer keeps running, apu::SubmitFrame keeps counting
+frames, and peak stays exactly 0 - which is the log line we have.
+
+Fix (apu/audio.cpp): ResolveFrameView in SubmitFrame.
+  * While no frame has ever carried a sample, the submit path checks both
+    views. FrameLooksLikeAudio requires a non-zero buffer whose samples are
+    finite and inside +/-16 (a real mix), so half-written or random pool data
+    is not followed.
+  * If the submitted view is empty and the A window at 0xA0000000+(p&0x1FFFFFFF)
+    holds audio, that view is used from then on and one line is logged:
+        audio: submitted frame at 0x1a000000 is empty; its audio is at
+        0xba000000 in the A window (masked physical address read in the other
+        view under Backend::Heap)
+  * If the guest later names a buffer that really does hold its mix, the code
+    goes back to the submitted view, so this cannot latch onto a stale pool
+    page.
+  * True guest silence (both views empty) is left alone: the game's own silent
+    frames stay silent.
+
+The loader probe (ppc_recomp.24.cpp, sub_82485030)
+--------------------------------------------------
+This is the .cpp of the recompiled function the dump points at, so the probe
+sits exactly on the loop that never finishes:
+
+    [load] [Guest Main] still waiting on entry=0x........ vtable=0x........
+           slot288=0x........ cursor=N count=M (N busy spins)
+
+logged at most once every 16384 spins (a second or so), naming the object, its
+vtable and the slot that keeps answering "busy" - that is the job the loading
+screen is waiting for. And the advance line, once the queue drains after having
+been busy:
+
+    [load] [Guest Main] pending list drained: cursor=N count=M, N busy spins,
+           N busy reports so far
+
+Both go to stderr, so they land in stderr.log, exit.log's neighbour, and the
+network log. The next run therefore answers the question directly: which
+object blocks, or whether the drain is always empty (meaning the wait is a
+flag set elsewhere and the slot never even asks).
+
+
+=====================================================================
+PART 2 - THE EXIT THAT DROPPED kaiHEN's R -> hbmenu HOOK
+=====================================================================
+What our exit did (os/switch/switch_runtime.cpp, EndProcessToHbmenu):
+      QuiesceAudio()            (apu::SetPaused(true) + apu::xma::Shutdown())
+      os::logger::DrainForExit(); fflush(stdout/stderr)
+      __nx_win_exit()           <-- closes the window and display ourselves
+      appletUnlockExit()
+      std::exit(0)
+
+What libnx's own exit does - disassembled from this ELF, __libnx_exit at
+0x6091c0:
+
+      0x6091c8  bl  __appExit            (applet teardown: appletExit, i.e. the
+                                         Exit that tells am the applet leaves)
+      0x6091ec  bl  __nx_gpu_exit
+      0x6091fc  bl  __nx_win_exit        (closes the vi layer and display)
+      0x609200  bl  _serviceGuardCloseAll
+      0x609210  bl  _gsvSyncExit
+      0x609214  bl  _threadReleaseExited
+      0x609218  bl  envGetExitFuncPtr
+      0x609224  bl  __nx_exit            (svcExitProcess)
+
+So std::exit(0) already ran the entire applet teardown, including the
+__nx_win_exit we were calling by hand a moment earlier. That early call is the
+one thing this path did that no ordinary homebrew exit does: it tears the
+applet's window/display down before libnx sends the applet Exit, which is a
+plausible way to leave kaiHEN's takeover state inconsistent - exactly the
+14:47:32 symptom (exit_code=0 at 111.765 s, then holding R on a game no
+longer opened hbmenu).
+
+Change:
+  * No __nx_win_exit() on __SWITCH2__. The exit is now precisely libnx's:
+    appletUnlockExit() first (so am's 15 s forced-termination timer can never
+    start during the teardown - libnx requires the unlock before the process
+    ends), then std::exit(0), which runs __appExit -> appletExit ->
+    __nx_win_exit -> service teardown -> svcExitProcess.
+  * One line in stderr for the next run:
+        [exit] leaving through libnx's application exit (applet type N, exit
+        lock released)
+    The applet type tells us whether kaiHEN's takeover presented this as an
+    Application (0) or something else, which decides the next step if the hook
+    is still lost.
+  * Audio is still quiesced and the logs are still drained before that, so
+    neither audio thread is inside audren or guest memory during the teardown,
+    and exit.log keeps its trail.
+
+Note on the earlier removals: ISelfController::Exit stays out. The 2026-11-16
+system error dialog came from svcExitProcess with appletLockExit still held (now
+impossible: the unlock is the first thing the teardown does), not from the Exit
+request itself - that distinction is why this run keeps libnx's own teardown
+instead of hand-rolling one.
+
+
+=====================================================================
+FILES CHANGED
+=====================================================================
+  apu/audio.cpp
+      ResolveFrameView + FrameLooksLikeAudio + g_everHeardAudio: the guest's
+      masked physical audio frame is read from the A window when only that view
+      holds the mix; logs the correction once.
+  LostOdysseyRecompLib/ppc/ppc_recomp.24.cpp
+      sub_82485030: "still waiting on entry/vtable/slot288/cursor/count" at most
+      once per 16384 spins, and the "pending list drained" advance line.
+  os/switch/switch_runtime.cpp
+      EndProcessToHbmenu: appletUnlockExit() first, no manual __nx_win_exit on
+      Switch 2, one [exit] line with the applet type, then std::exit(0).
+  (from earlier in this branch: the 15 s guest-thread dump in the exit watchdog,
+   the two exit triggers + 2 s grace, and the GuestLockHold fence handover.)
+
+
+=====================================================================
+WHAT TO LOOK FOR ON THE NEXT RUN
+=====================================================================
+1. Audio: "audio frames submitted: N peak=..." should stop saying 0 after a
+   few seconds, and either
+       audio: submitted frame at 0x1a000000 is empty; its audio is at
+       0xba000000 ...
+   appears (the fix found the mix) or it does not and peak stays 0 (the guest
+   genuinely mixes silence; then the loader probes below are the evidence).
+2. "[load] [Guest Main] still waiting on entry=... slot288=..." names the job
+   holding the loading screen. Send that line.
+3. "[load] [Guest Main] pending list drained ..." appearing means the loader
+   advanced; nothing in that line means the queue is empty every frame.
+4. Exit: quit with HOME -> X once, then hold R on a game - hbmenu must come
+   back. stderr should end with
+       [exit] leaving through libnx's application exit (applet type N, ...)
+   and exit.log with "exit: ending the process (hbmenu, no applet Exit
+   request)".
+
+Limits: no Switch 2 hardware here, so this is static analysis of the dump
+addresses plus a clean full build (BUILD_EXIT=0) and confirmation that the new
+log strings are in the packaged ELF. The audio correction is the one candidate
+that both explains peak=0 and cannot fire on a guest that is really silent.
+Nothing is staged or committed.

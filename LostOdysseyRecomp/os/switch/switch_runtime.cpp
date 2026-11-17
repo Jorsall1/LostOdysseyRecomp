@@ -54,6 +54,15 @@ namespace os::switch_platform { void ApplyEnvFile(const char* path); }
 // os/log_file.h (not included: this file sees libnx headers, not the PCH).
 namespace os::logger { void DrainForExit() noexcept; }
 
+// Declared at file scope, not inside the anonymous namespace below: their
+// definitions live in other translation units and this file cannot include their
+// headers (libnx's Mutex and Event typedefs collide with the runtime's, and SDL
+// is not available here).
+namespace settings::quit_action { bool PushQuit(); } // settings/quit_action_hook.cpp: queues SDL_EVENT_QUIT
+namespace apu { void SetPaused(bool paused); }        // apu/audio.cpp: silences the SDL audio device
+namespace apu::xma { void Shutdown(); }               // apu/xma.cpp: stops the decoder worker
+void DumpGuestThreadStates();                         // kernel/imports.cpp: what every guest thread waits on
+
 namespace
 {
 // stderr (fd 2) goes through this device: the file plus the network log.
@@ -173,25 +182,71 @@ void WriteAddress(FILE* file, const char* name, uint64_t value)
         std::fprintf(file, "%-4s %016" PRIx64 "\n", name, value);
 }
 
-extern "C" void __nx_win_exit(void) __attribute__((weak));
+extern "C" void __nx_win_exit(void) __attribute__((weak)); // weak: the SDK's libnx provides it
 
-// Under kaiHEN title takeover this NRO runs inside the donor game, and
-// ISelfController::Exit (serviceDispatch on the SelfController session, command
-// 0) tells the applet manager to end *that game*: the console showed the HOME
-// menu with hbmenu gone (2026-11-16, runtime-1794932712369211.log). nx-hbloader
-// and kaiHEN catch the end of the process itself and return straight to hbmenu,
-// so every exit path here flushes the logs, closes the window the way libnx does
-// and calls svcExitProcess() - no applet Exit request anywhere.
+std::atomic<bool> g_endingProcess{false};
+
+// Mutes the audio device and stops the XMA worker before the process ends, on a
+// thread of its own and for at most 250 ms: both calls take a lock the audio
+// threads hold while they run, and the exit must not become a hang of its own.
+void QuiesceAudio()
+{
+    static Thread thread;
+    static bool started = false;
+    if (!started)
+    {
+        started = true;
+        if (R_FAILED(threadCreate(&thread, [](void*) {
+                apu::SetPaused(true);
+                apu::xma::Shutdown();
+            }, nullptr, nullptr, 0x4000, 0x2C, -2)) || R_FAILED(threadStart(&thread)))
+            return;
+    }
+    for (int tenth = 0; tenth < 25; ++tenth)
+        svcSleepThread(10'000'000ull);
+}
+
+// One exit for every path: the L+R+Plus+Minus watchdog, HOME -> X, the title's
+// Quit, and the crash report.
+//
+//  * appletLockExit() is held from Initialize() until AllowExit(). Ending the
+//    process with exit still locked made am treat it as a fatal application
+//    error on 2026-11-16 hardware: the system error dialog appeared and kaiHEN's
+//    R -> hbmenu hook stopped working. It is therefore always unlocked before
+//    the process ends, never after.
+//  * std::exit(0) rather than svcExitProcess(): it runs libnx's own application
+//    exit (__appExit: socketExit, fsdevUnmountAll, hidExit, appletExit) and the
+//    atexit handlers, which is the teardown that leaves Horizon and kaiHEN
+//    clean. No ISelfController::Exit request anywhere: under title takeover am
+//    applies that to the donor game and the console lands on the HOME menu with
+//    hbmenu gone.
+//  * audio first, so neither audio thread touches the device or guest memory
+//    while that teardown runs.
 [[noreturn]] void EndProcessToHbmenu()
 {
+    if (g_endingProcess.exchange(true, std::memory_order_acq_rel))
+        for (;;) // another thread is already ending the process
+            svcSleepThread(UINT64_MAX);
+    QuiesceAudio();
     os::logger::DrainForExit(); // lines still queued for the log writer
     // Not fflush(nullptr): it locks every open file, and a crashed thread may
     // still hold one of those locks.
     std::fflush(stdout);
     std::fflush(stderr);
-    if (&__nx_win_exit)
-        __nx_win_exit();
-    svcExitProcess();
+    // libnx's own exit does this work: __libnx_exit calls __appExit (appletExit,
+    // which is what tells am the applet is leaving), then __nx_win_exit,
+    // _serviceGuardCloseAll and __nx_exit. Closing the window and the applet
+    // here first is the one thing a normal homebrew exit never does, and after
+    // the HOME -> X run at 14:47:32 kaiHEN's R -> hbmenu hook no longer fired.
+    //
+    // The exit lock is released before anything else so am's 15 s
+    // forced-termination timer can never start while the teardown runs
+    // (libnx: appletUnlockExit must be used before main returns).
+    appletUnlockExit();
+    std::fprintf(stderr, "[exit] leaving through libnx's application exit (applet type %d, exit lock released)\n",
+                 int(appletGetAppletType()));
+    std::exit(0);              // __libnx_exit: __appExit (appletExit), __nx_win_exit, svcExitProcess
+    svcExitProcess();          // only if exit() itself gave up
     __builtin_unreachable();
 }
 
@@ -1035,11 +1090,18 @@ Thread g_exitWatchThread;
 bool g_exitWatchStarted = false;
 constexpr uint64_t kExitWatchPollNs = 100'000'000ull; // 100 ms
 constexpr auto kExitWatchHold = std::chrono::milliseconds(1500);
+// Time the normal quit (SDL_EVENT_QUIT -> GPU owner cleanup -> exit_code=0) gets
+// before this thread ends the process itself.
+constexpr auto kExitWatchGrace = std::chrono::milliseconds(2000);
+// A guest thread dump 15 s in, whether or not the GPU stalled: a screen that
+// stops progressing with frames still presenting (the 100% loading bar) leaves
+// no other trace of which guest thread is waiting and on what.
+constexpr auto kGuestDumpAfter = std::chrono::seconds(15);
 
-// Draining the logs first keeps the last lines on the card. No applet Exit
-// request: that ends the donor game the takeover runs in, which left the console
-// on the HOME menu with hbmenu gone; ending the process is what nx-hbloader and
-// kaiHEN turn into a return to hbmenu (EndProcessToHbmenu).
+// The watchdog's way out. It has already asked the game to quit the normal way
+// (SDL_EVENT_QUIT), and the GPU owner's cleanup did not finish in time, so the
+// teardown happens here: logs drained, audio muted, exit unlocked, libnx's own
+// application exit (EndProcessToHbmenu).
 [[noreturn]] void ExitToHbmenu()
 {
     EndProcessToHbmenu();
@@ -1055,29 +1117,62 @@ void ExitWatchdogMain(void*)
     padInitializeDefault(&pad);
     constexpr uint64_t combo = HidNpadButton_L | HidNpadButton_R | HidNpadButton_Plus | HidNpadButton_Minus;
     std::chrono::steady_clock::time_point heldSince{};
+    bool quitting = false;
+    std::chrono::steady_clock::time_point quitSince{};
+    const auto started = std::chrono::steady_clock::now();
+    bool dumpedGuestThreads = false;
     for (;;)
     {
         svcSleepThread(int64_t(kExitWatchPollNs)); // a kernel sleep: nothing else has to run
-        padUpdate(&pad);
-        if ((padGetButtons(&pad) & combo) != combo)
-        {
-            heldSince = {};
-            continue;
-        }
         const auto now = std::chrono::steady_clock::now();
-        if (heldSince == std::chrono::steady_clock::time_point{})
+
+        if (!dumpedGuestThreads && now - started >= kGuestDumpAfter)
         {
-            heldSince = now;
-            continue;
+            dumpedGuestThreads = true;
+            // The GPU-stall watchdog in gpu/command_processor.cpp only dumps
+            // when swaps stop. A fade or loading bar that keeps presenting while
+            // the guest waits never reaches it, so dump once here as well.
+            std::fprintf(stderr, "[watchdog] guest thread states after 15 s (frames may still be presenting)\n");
+            DumpGuestThreadStates();
         }
-        if (now - heldSince < kExitWatchHold)
+
+        if (quitting)
+        {
+            if (now - quitSince < kExitWatchGrace)
+                continue;
+            // stderr here: this file does not include os/logger.h (libnx's Mutex
+            // and Event typedefs collide with the runtime's), and stderr goes to
+            // stderr.log and the network log.
+            std::fprintf(stderr, "[watchdog] the quit did not finish within 2 s: ending the process for hbmenu "
+                                 "(applet exit unlocked, libnx teardown)\n");
+            ExitToHbmenu();
+        }
+
+        padUpdate(&pad);
+        const bool comboHeld = (padGetButtons(&pad) & combo) == combo;
+        if (!comboHeld)
+            heldSince = {};
+        else if (heldSince == std::chrono::steady_clock::time_point{})
+            heldSince = now;
+        const bool comboDone = comboHeld && heldSince != std::chrono::steady_clock::time_point{} &&
+                               now - heldSince >= kExitWatchHold;
+
+        // HOME -> X: am asks the applet to exit. SDL's Switch driver turns that
+        // into SDL_EVENT_QUIT - the clean shutdown that logged exit_code=0 - but
+        // only while the main loop pumps events, which a hung game never does;
+        // Horizon then kills it. Poll the applet on this thread too, so closing
+        // the game stays a normal quit even when the renderer is stuck.
+        const bool appletQuit = !appletMainLoop();
+        if (!comboDone && !appletQuit)
             continue;
-        // stderr here: this file does not include os/logger.h (libnx's Mutex and
-        // Event typedefs collide with the runtime's), and stderr goes to
-        // stderr.log and the network log.
-        std::fprintf(stderr, "[watchdog] L+R+Plus+Minus held for 1.5 s, ending the process for hbmenu "
-                             "(no applet Exit request: that ends the donor game)\n");
-        ExitToHbmenu();
+
+        quitting = true;
+        quitSince = now;
+        std::fprintf(stderr, "[watchdog] %s: asking the game to quit cleanly (SDL_EVENT_QUIT); "
+                             "if it does not finish in 2 s the process ends here\n",
+                     comboDone ? "L+R+Plus+Minus held for 1.5 s" : "the applet requested exit (HOME -> X)");
+        if (!settings::quit_action::PushQuit())
+            quitSince -= std::chrono::milliseconds(1500); // no event queue: go to the teardown sooner
     }
 }
 } // namespace

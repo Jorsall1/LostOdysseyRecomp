@@ -474,10 +474,72 @@ namespace apu
 
     static void EmitFrame(const uint32_t* words);
 
+    // Set once any frame has carried a sample; until then the submit path keeps
+    // checking which of the guest's two views of the frame holds the mix.
+    bool g_everHeardAudio = false;
+
+    static bool FrameLooksLikeAudio(const uint32_t* words)
+    {
+        bool any = false;
+        for (uint32_t i = 0; i < XAUDIO_NUM_SAMPLES * XAUDIO_NUM_CHANNELS; ++i)
+        {
+            const uint32_t raw = words[i];
+            if (raw == 0)
+                continue;
+            any = true;
+            const float value = std::bit_cast<float>(ByteSwap(raw));
+            if (!std::isfinite(value) || std::abs(value) > 16.0f)
+                return false; // not a mix: half-written, random bits or another buffer
+        }
+        return any;
+    }
+
+    // Switch 2 hardware, 2026-11-17: "audio frames submitted" climbed while
+    // peak stayed 0 for the whole 100% loading screen, so the guest mixer ran and
+    // every frame read as silence. A guest pointer argument reaches an import as
+    // base + address (ArgTranslator::GetValue), so the view the guest named is
+    // the view that is read - and under Backend::Heap the two views of a
+    // physical buffer are no longer the same pages, which they are on the
+    // desktop hosts. A render driver that submits the masked physical address of
+    // its buffer (0x1A000000 for a buffer that lives at 0xBA000000) therefore
+    // reads zeroed guest RAM instead of its own mix.
+    //
+    // While no frame has carried a sample yet, use the A window when only it has
+    // audio. FrameLooksLikeAudio keeps this from following random pool data: a
+    // real mix is finite and inside a sane range, and all-zero frames are the
+    // guest's own silence.
+    static const uint32_t* ResolveFrameView(const uint32_t* words)
+    {
+        static bool aWindow = false;
+        const uintptr_t base = reinterpret_cast<uintptr_t>(g_memory.base);
+        const uint32_t address = uint32_t(reinterpret_cast<uintptr_t>(words) - base);
+        const auto* aWords = reinterpret_cast<const uint32_t*>(base + 0xA0000000u + (address & 0x1FFFFFFFu));
+        if (aWindow)
+        {
+            if (FrameLooksLikeAudio(words))
+            {
+                aWindow = false; // the guest is naming a buffer that really holds its mix
+                return words;
+            }
+            return FrameLooksLikeAudio(aWords) ? aWords : words;
+        }
+        // A virtual buffer cannot also be a masked physical address, and a frame
+        // with audio in the submitted view needs no help.
+        if (g_everHeardAudio || address >= 0x20000000u || FrameLooksLikeAudio(words))
+            return words;
+        if (!FrameLooksLikeAudio(aWords))
+            return words; // silence in both views: the guest really is silent
+        aWindow = true;
+        LOG_WARNING("audio: submitted frame at {:#x} is empty; its audio is at {:#x} in the A window "
+                    "(masked physical address read in the other view under Backend::Heap)",
+            address, address + 0xA0000000u);
+        return aWords;
+    }
+
     void SubmitFrame(const void* samples)
     {
         if (!samples) return;
-        const auto* words = static_cast<const uint32_t*>(samples);
+        const auto* words = ResolveFrameView(static_cast<const uint32_t*>(samples));
         const uint32_t rate = g_guestFramesPerOutput.load(std::memory_order_relaxed);
         if (rate > 1 || g_fastForwardAudio.Active())
         {
@@ -564,6 +626,8 @@ namespace apu
             peak = std::max({peak, std::abs(stereo[i * 2]), std::abs(stereo[i * 2 + 1])});
         }
         g_testPosition = testOn ? pan.Position() : -1.0f;
+        if (peak > 0)
+            g_everHeardAudio = true;
         uint32_t n = ++g_framesSubmitted;
         CaptureRequested(stereo.data(), n);
         // Bounded diagnostic capture, before mute; raw f32le, 48 kHz stereo.

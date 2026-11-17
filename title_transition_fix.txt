@@ -1,0 +1,164 @@
+Lost Odyssey Recomp - Switch 2 (kaiHEN 20261116, title takeover)
+Report: clean exit without an OS error, and the 100% LOADING / peak=0 hold
+==========================================================================
+
+Build   : branch switch2-ouncevk, devkitA64 (devkitpro/switch2), -j20
+Result  : cmake --build build -j20 -> BUILD_EXIT=0 (no errors; warnings only,
+          all pre-existing: u8path deprecation, memset in VdQueryVideoMode)
+NRO     : build/LostOdysseyRecomp/LostOdysseyRecomp.nro
+          copied to /mnt/c/Users/Jorda/Desktop/LostOdysseyRecomp.nro
+Headers : none touched. Everything below is in .cpp files.
+
+
+=====================================================================
+ITEM 1 - CLEAN EXIT: NO SYSTEM ERROR, kaiHEN STILL HOOKED
+=====================================================================
+The diagnosis was right. os::switch_platform::Initialize() calls
+appletLockExit() (it stays held for the whole session so a quit can finish its
+saves), and the previous exit path called svcExitProcess() with that lock still
+held. am sees a process that ended while it had asked for the exit to be held,
+treats it as a fatal application error - the system error dialog - and the loader
+state kaiHEN's R -> hbmenu hook depends on is gone.
+
+What changed in os/switch/switch_runtime.cpp
+--------------------------------------------
+1. EndProcessToHbmenu() is now the one exit for every path, and it does exactly
+   what the console requires, in this order:
+
+       if (g_endingProcess.exchange(true)) park forever   // one exit only
+       QuiesceAudio()                  // apu::SetPaused(true) + apu::xma::Shutdown()
+                                       // on its own thread, waited for at most 250 ms
+       os::logger::DrainForExit()
+       fflush(stdout); fflush(stderr)
+       __nx_win_exit()                 // libnx closes the vi layer and display
+       appletUnlockExit()              // ALWAYS, before the process ends
+       std::exit(0)                    // libnx __appExit: socketExit,
+                                       // fsdevUnmountAll, hidExit, appletExit
+       svcExitProcess()                // only if exit() itself gave up
+
+   * No ISelfController::Exit anywhere on Switch 2. That request is what made
+     am end the donor game and drop hbmenu earlier today.
+   * std::exit(0), not _Exit: the atexit teardown (log drain, session archive)
+     and libnx's application exit run, which is what leaves Horizon and kaiHEN
+     in a clean state. Audio is muted and the XMA decoder stopped first, so
+     neither audio thread is inside audren or guest memory during it. The audio
+     mute runs on its own thread with a 250 ms cap: it takes the device mutex,
+     and the exit must not turn into a hang of its own when the game is stuck.
+   * ExitNow() (title Quit, ShowError) and ExitWithLog() (crash, out of memory,
+     second fault) both go through this same function on __SWITCH2__.
+
+2. ExitWatchdogMain() now has two triggers and a grace period:
+
+       trigger A: L + R + Plus + Minus held 1.5 s
+       trigger B: !appletMainLoop()      (HOME -> X closes the title)
+
+     On either one it does NOT kill the process. It first signals the normal
+     quit - settings::quit_action::PushQuit(), i.e. SDL_EVENT_QUIT, the path
+     that logged "exit_code=0" at 10:04:33 - so the GPU owner shuts down the
+     renderer properly. Then:
+
+       * process finished within 2.0 s  -> nothing else happens (clean quit)
+       * still alive after 2.0 s        -> EndProcessToHbmenu() runs the
+         teardown above (audio muted, logs drained, exit unlocked, libnx exit)
+
+     Why trigger B matters: SDL's Switch driver turns the applet exit into
+     SDL_EVENT_QUIT by calling appletMainLoop() itself, but only while the main
+     loop is pumping events. A hung game never gets there and Horizon kills it
+     a few seconds later. The watchdog polls the applet on its own thread, so
+     HOME -> X ends in the same clean quit even when the renderer is stuck.
+     If PushQuit fails (no event queue) the grace period is shortened, since
+     no clean quit can arrive.
+
+   stderr now shows which trigger fired and whether the grace period expired:
+       [watchdog] L+R+Plus+Minus held for 1.5 s: asking the game to quit
+                  cleanly (SDL_EVENT_QUIT); if it does not finish in 2 s the
+                  process ends here
+       [watchdog] the quit did not finish within 2 s: ending the process for
+                  hbmenu (applet exit unlocked, libnx teardown)
+
+
+=====================================================================
+ITEM 2 - THE 100% LOADING HOLD AND audio peak=0
+=====================================================================
+What the code says about the A window under Backend::Heap
+---------------------------------------------------------
+I traced every path that reaches guest memory through a physical address, and
+the two windows are consistent on both sides where it matters:
+
+  * XMA. The 320 context slots are allocated from the physical pool
+    (apu/xma.cpp: g_pageAllocator.Alloc(physicalRegion, ...), so 0xA0000000+n)
+    and the register the title's XMA driver reads holds that same value masked
+    (g_arrayGuest & 0x1FFFFFFF). The guest rebuilds 0xA0000000 + n and pokes
+    the context there; Physical() reads 0xA0000000 + (p & 0x1FFFFFFF). Both
+    sides use the A window, so contexts, input packets and output rings are the
+    same bytes under Heap as on the desktop hosts. Rewriting Physical() to read
+    RAM instead would break exactly this path, so it is deliberately unchanged.
+  * GPU. CommandProcessor::TranslatePhysical and renderer.cpp's Phys() both use
+    0xA0000000 + (p & 0x1FFFFFFF), and resolved surfaces are keyed by the same
+    physical value. The guest's render targets, command buffers and the front
+    buffer live in the physical pool and are written at that same A address.
+  * The one case that genuinely cannot work is a *virtual* buffer handed over as
+    a physical address: MmGetPhysicalAddress() returns address & 0x1FFFFFFF, so
+    a heap pointer 0x8A000000 would become 0x0A000000. On the desktop hosts the
+    A view maps offset 0, so 0xA0000000+0x0A000000 is RAM 0x0A000000 - not
+    0x8A000000 either. No host path can have depended on that, and changing the
+    A window to RAM would corrupt the pool paths above. There is therefore no
+    safe blind mirror to add; a wrong one would cost the 60 fps renderer.
+
+  peak=0 fits this: the guest mixer ran and submitted 256-sample frames, and
+  every sample was zero - the submit path itself (apu/audio.cpp EmitFrame, on
+  the host pointer the import bridge already translated) has nothing to get
+  wrong. Silence therefore means no voice was playing, i.e. a symptom of the
+  stall, not its cause.
+
+What was added: the requested 15 s dump
+---------------------------------------
+The existing dump only runs when completed swaps stop (gpu/command_processor.cpp,
+300 still frames). A 100%-full bar with the wheel spinning at 60 fps never
+triggers it, which is why the 12:40:38 log has no guest backtrace. The exit
+watchdog now dumps once, 15 s after it starts, whether or not frames are
+presenting:
+
+    [watchdog] guest thread states after 15 s (frames may still be presenting)
+    ... one line per guest thread: tid, name, pcr, kernel call, object, lr,
+        how long it has waited, holder and recursion for critical sections,
+        and the guest backtrace ...
+
+Read that block in the next runtime-*.log. It names the exact kernel call and
+guest caller the loading screen is sitting in, which decides the next fix:
+  * RtlEnterCriticalSection with a dead holder -> another lock cycle,
+  * NtWaitForSingleObject / KeWaitForSingleObject on an event -> missing
+    completion signal (file I/O, XMA, or a GPU fence),
+  * KeDelayExecutionThread in a Sleep loop with no other thread waiting ->
+    a guest state machine that never advances,
+  * NtReadFile or a device ioctl -> the load is still reading from the card.
+LO_LOAD_PROFILE=1 additionally dumps at 8, 20, 45 and 90 s of any load, and
+LO_WAIT_PROFILE=1 logs every guest wait over 1 ms, if that is wanted next run.
+
+
+=====================================================================
+FILES CHANGED
+=====================================================================
+  os/switch/switch_runtime.cpp
+      EndProcessToHbmenu (audio quiesce, appletUnlockExit, std::exit(0),
+      single-exit guard), QuiesceAudio, watchdog triggers + 2 s grace,
+      15 s guest thread dump, updated exit comments.
+  (kernel/imports.cpp, cpu/poll_wait.cpp, cpu/guest_alloc_lock.cpp were changed
+   in the previous round, for the fence-wait lock handover that took the GPU
+   stalls to zero; they are unchanged here.)
+
+
+=====================================================================
+WHAT TO CHECK ON THE CONSOLE
+=====================================================================
+1. L+R+Plus+Minus for 1.5 s while the game runs: it should quit by itself and
+   land back in hbmenu, with no system error dialog, and kaiHEN's R -> hbmenu
+   still working afterwards.
+2. HOME -> X: same clean landing.
+3. exit.log should end at "exit: ending the process (hbmenu, no applet Exit
+   request)" and then nothing - no "still running N s after the Exit request".
+4. Send the 15 s [watchdog] dump from the next 100% loading run.
+
+Limits: no Switch 2 hardware here. Verified by reading the code, a clean full
+build/link/package (BUILD_EXIT=0), and static review only. Nothing is staged or
+committed.
