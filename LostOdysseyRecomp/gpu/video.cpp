@@ -3335,7 +3335,19 @@ namespace gpu::video
     [[noreturn]] void FinishRequestedExit() {
         if (!ExitRequested()) {
             LOG_ERROR("video: exit without an owner-thread shutdown request");
+#if LO_PLATFORM_SWITCH
+            // Still the handover, never a bare _Exit: the applet exit lock taken
+            // in Initialize() is held on every path that reaches here, and ending
+            // the process with it held makes am report a fatal application error
+            // and drops kaiHEN's R -> hbmenu hook (2026-11-16 hardware), while an
+            // exit with no next load leaves the console on the HOME menu. This
+            // path is already a logic error being reported, so it keeps the
+            // immediate end (no libnx teardown, no GPU-owner Shutdown - the
+            // caller's state is unknown) but not the two handover steps.
+            os::switch_platform::ForceExitWithoutTeardown();
+#else
             std::fflush(nullptr); (discord_rpc::Shutdown(), std::_Exit(EXIT_FAILURE));
+#endif
         }
         // All presentation stack/recording guards have unwound at this point.
         LOG_INFO("video: shutdown stage=capture-archive begin");

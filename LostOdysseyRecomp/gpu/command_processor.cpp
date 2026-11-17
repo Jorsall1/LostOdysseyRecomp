@@ -1442,6 +1442,11 @@ namespace gpu
             uint32_t waitInfo = 0, pollRegAddr = 0, ref = 0, mask = 0, wait = 0;
             for (int attempt = 0; attempt < 200; attempt++)
             {
+                // A quit that arrives while the operands are still unparsed must
+                // not wait out this retry: 200 ms of it is well past the cleanup's
+                // budget, and RequestStopForExit only reaches the poll loop below.
+                if (!m_running)
+                    return true;
                 reader.readOffset = operandOffset;
                 waitInfo = reader.ReadAndSwap();
                 pollRegAddr = reader.ReadAndSwap();

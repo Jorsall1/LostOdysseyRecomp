@@ -1,0 +1,196 @@
+Plus+Minus / L+R+Plus+Minus exit audit - Switch 2, kaiHEN 20261117.1 (title takeover)
+======================================================================================
+Code only; two .cpp files changed, no header touched (renderer.o stays cached).
+Build: exit 0, 6 translation units, 0 undefined symbols.
+NRO: 86,028,721 bytes, md5 309082a80edba6f9952047540ad7ffac
+     copied to /mnt/c/Users/Jorda/Desktop/LostOdysseyRecomp.nro (md5 verified)
+
+SHORT ANSWERS
+  1. The Plus+Minus settings menu has no Quit button, on Switch 2 or anywhere
+     else - it never had one. Its only exit-flavoured row is "Quit to Main Menu",
+     which returns to the retail title menu. The in-menu quit that does exist is
+     the title screen's "Quit game" (Back / Backspace -> Yes), and it is not
+     hidden on Switch. Details in 1.
+  2. A stalled WAIT_REG_MEM already leaves within microseconds of the exit
+     request, not 10 ms - the mechanism is in 2, verified line by line. One
+     200 ms window before that loop did not look at the quit flag; that is fixed.
+     The bare _Exit in FinishRequestedExit() is fixed and no longer leaves the
+     applet exit lock held. See 3.
+  3. EndProcessToHbmenu() does the handover correctly, and yes, std::exit(0) has
+     real remaining races against live guest/GPU threads. No code change here can
+     close them without a header change, and I would not guess. Honest list in 4.
+
+1. THE QUIT ENTRY POINTS THAT ACTUALLY EXIST
+--------------------------------------------
+settings/menu.cpp builds the Plus+Minus pages (game tabs at ~1600-1960, system
+pages after). The actions are: Controls, Restore game defaults, "Quit to Main
+Menu" (line 1633), Debug, Achievements, Mods, Import discs & DLC, Add to Steam,
+Shader bundle, Prepare shaders again, Save settings. "Quit to Main Menu" opens
+the confirmation at line 2403 and returns to the retail title menu; it does not
+end the process. Nothing in that menu calls quit_action::PushQuit().
+
+The `#if !defined(__SWITCH__)` guards in menu.cpp are not hiding a quit row:
+  line  2  Steam shortcut include (desktop only)
+  line 34  Discord presence include
+  line 1299 row layout that differs on Android/Switch
+  line 4292 a desktop-only action block
+The repository has exactly one PushQuit call in the menus: menu.cpp:4587.
+
+That one is the title screen's Quit dialog (UpdateTitleQuit, ~4520-4610): the
+idle title menu takes Back (TitleQuitButton 0x0020, keyboard Backspace) ->
+"Quit game? Yes/No" -> Yes -> settings::quit_action::PushQuit(). title_entry.cpp:203
+draws the same label. Neither the button nor the dialog is Switch-guarded, so on
+Switch 2 the title's Quit is reachable and does queue the quit.
+
+Verdict for item 1: nothing to unhide; the Quit row you were looking for in
+Plus+Minus does not exist. Adding one is a one-line addAction plus a dispatch
+case; I did not add UI, since you asked to confirm, not to redesign the menu.
+
+2. QUIT -> CLEAN SHUTDOWN, AND WAIT_REG_MEM LEAVING THE WAIT
+------------------------------------------------------------
+Chain (verified in source):
+  PushQuit (quit_action_hook.cpp)      SDL_PushEvent(SDL_EVENT_QUIT), thread-safe
+  PumpWindowEvents (video.cpp)         SDL_EVENT_QUIT at 4062 and 3627 -> RequestExit()
+  video::RequestExit()                 g_commandProcessor.RequestStopForExit(),
+                                       RequestSkipShaderPreparation(), overlay prebuild stop
+  RequestStopForExit()                 m_running.store(false) + notify_all on
+                                       m_writePtrChanged, m_interruptCv, m_waitProgress
+  WAIT_REG_MEM poll loop               "while (m_running)" + the sleep is
+                                       m_waitProgress.wait_for(ms, predicate) with
+                                       predicate = interrupts progressed || !m_running || m_wake
+  -> the predicate is true the moment the request lands, so the stalled wait
+     returns immediately (microseconds), never after the 5 s / 30 s log deadlines.
+  WorkerMain tail -> video::FinishRequestedExit() -> Shutdown() ->
+  os::switch_platform::ExitNow() -> EndProcessToHbmenu().
+
+Two things make this work even while the GPU is stuck, and both are in the code:
+  - the stall loop itself pumps events (IdlePumpDue() -> video::PumpEvents(), and
+    PresentHostOverlayFrame keeps the menu drawn), so the queued SDL_EVENT_QUIT is
+    consumed even if the main thread never gets scheduled;
+  - the wait uses a condition variable, not a sleep, so RequestStopForExit's
+    notify_all is not a polling latency question.
+  - the exit watchdog thread polls appletMainLoop() itself (switch_runtime.cpp
+    ~1257), so HOME -> X becomes the same clean quit even when the main loop is
+    stuck; it queues the same SDL_EVENT_QUIT from its own thread (SDL_PushEvent
+    is thread-safe) and only ends the process itself if that quit has not
+    finished 2 s later.
+
+Gap found and fixed (gpu/command_processor.cpp, +5): the packet's operand re-read
+loop ("for attempt < 200" with a 1 ms sleep, used while the CPU is still filling
+the buffer) ran before the poll loop and did not check m_running. A quit landing
+in that window could be held up to ~200 ms. It now returns as soon as m_running
+is false, so the only remaining deferral is whatever the worker is inside of
+(renderer::ServiceOcclusionQueries(), a present, a guest code callback) - those
+return, they do not wait on the quit.
+
+3. FinishRequestedExit() "exit without an owner-thread shutdown request" - FIXED
+-------------------------------------------------------------------------------
+This was finding 3.7 in audit_report_v3.txt. It used to be, on every platform:
+
+    LOG_ERROR("video: exit without an owner-thread shutdown request");
+    std::fflush(nullptr); (discord_rpc::Shutdown(), std::_Exit(EXIT_FAILURE));
+
+On Switch 2 that ends the process with appletLockExit() still held and no next
+load: precisely the condition that made am report a fatal application error and
+dropped kaiHEN's R -> hbmenu hook on 2026-11-16 hardware. It now reads:
+
+    #if LO_PLATFORM_SWITCH
+        os::switch_platform::ForceExitWithoutTeardown();   // next load if the
+        // loader supports it, appletUnlockExit(), flushed stdout/stderr,
+        // svcExitProcess(); no libnx teardown, no GPU-owner Shutdown
+    #else
+        std::fflush(nullptr); (discord_rpc::Shutdown(), std::_Exit(EXIT_FAILURE));
+    #endif
+
+So on Switch it never leaves the exit lock held and never skips envSetNextLoad.
+It is deliberately still an immediate end: this branch is already a logic error
+being reported, the caller's GPU state is unknown, and the normal path
+(video::RequestExit() -> owner cleanup -> ExitNow -> EndProcessToHbmenu) is the
+one that runs Shutdown() and libnx's application exit. With this change there is
+no bare std::_Exit left on any Switch path (main.cpp's fallback was routed
+through the same helper in e9726ef3).
+
+4. EndProcessToHbmenu(), AND WHAT STILL RACES std::exit(0)
+-----------------------------------------------------------
+What it does, in order:
+  - g_endingProcess single-entrant guard. A second entrant (watchdog, fatal
+    signal) sleeps 5x1 s, then repeats the handover (envSetNextLoad if the loader
+    supports it, appletUnlockExit) and ends with svcExitProcess - no teardown.
+  - QuiesceAudio(): one thread does apu::SetPaused(true) + apu::xma::Shutdown();
+    the caller waits at most 250 ms. Both calls take locks an audio thread holds
+    while it runs, which is why it is a separate thread and why the wait is bounded.
+  - os::logger::DrainForExit(), then fflush(stdout)/fflush(stderr) - deliberately
+    not fflush(nullptr), which locks every open file.
+  - envHasNextLoad() ? envSetNextLoad("sdmc:/hbmenu.nro", "\"sdmc:/hbmenu.nro\"")
+    with an [exit] line to stderr either way.
+  - appletUnlockExit(), [exit] line, std::exit(0) -> __libnx_exit -> __appExit
+    (appletExit, hidExit, fsdevUnmountAll, socketExit) -> __nx_win_exit ->
+    _serviceGuardCloseAll -> __nx_exit. No ISelfController::Exit request first:
+    under title takeover that closes the donor game and lands on HOME with hbmenu
+    gone (2026-11-17 hardware).
+  - svcExitProcess() only if exit() itself gives up.
+
+Why this is the right shape: envGetExitFuncPtr/__libnx_exit is what actually
+returns the loader to the next load, so the exit has to go through std::exit (or
+an identical __appExit call) - a bare svcExitProcess with only the next load set
+does not run appletExit, and it is the applet manager that has to be told the
+applet is leaving.
+
+Honest list of what still races, given that exit:
+  a) Guest threads are never stopped. There is no stop-all/join-all API in this
+     tree (searched: none), and joining from the exiting thread can deadlock -
+     they may be blocked in a lock the exiting thread holds, or in a wait it just
+     interrupted. So __appExit can run while a guest thread is inside fsdev*,
+     hid* or socket*: those calls are unsynchronized against fsdevUnmountAll,
+     hidExit and socketExit. This is a real, unclosed race, the same class as the
+     one you are worried about. It is reduced (audio stopped first, the normal
+     path has already finished the GPU owner's Shutdown, logs drained) but not
+     eliminated, and closing it needs a guest-thread quiesce point - a header and
+     a design change, plus hardware validation.
+  b) The watchdog path is the widest window: 2 s (kExitWatchGrace) after asking
+     for a normal quit, the watchdog thread calls std::exit itself, possibly
+     while the GPU worker is mid-frame or mid-Shutdown. That is teardown under a
+     live GPU thread by construction. It is what the combo is for; the
+     alternative is hanging on a frozen console.
+  c) OnFatalSignal (SIGABRT / SIGSEGV) reaches the same function from a signal
+     handler, where std::exit, std::fprintf, malloc and mutexes are not
+     async-signal-safe. If the abort happens while another thread holds one of
+     those locks, the handler can wedge; am then kills the process. The
+     "reported" flag only prevents two handlers racing each other.
+  d) QuiesceAudio's first call creates and starts a libnx thread inside the exit
+     (and, via OnFatalSignal, inside a signal handler). If a crashed thread holds
+     the newlib/heap lock, that create can block; the 250 ms bound only covers
+     the wait after it.
+  e) std::exit runs atexit handlers and static destructors on the exiting thread
+     while guest threads may still run - same category as (a).
+  f) The second-entrant path ends with svcExitProcess: next load set and exit
+     lock released, so kaiHEN gets hbmenu back, but no appletExit, so am may
+     still consider the applet to have gone away abnormally. It only runs after
+     the first teardown has been wedged for 5 s, where the alternative is a hang.
+  None of these is introduced by this audit; (a), (b), (c) and (f) are inherent
+  to ending a multi-threaded process through libnx's application exit while the
+  threads cannot be stopped, and every hardware run so far preferred this over
+  svcExitProcess ending the process silently.
+
+5. DIFF SUMMARY
+---------------
+  gpu/video.cpp                 +12 -0  FinishRequestedExit's "no owner-thread
+                                        shutdown request" branch now performs the
+                                        Switch handover instead of a bare _Exit
+  gpu/command_processor.cpp     +5  -0  the WAIT_REG_MEM operand re-read loop
+                                        stops as soon as an exit is requested
+  No header changed. Nothing else in the menu, quit or exit code was touched.
+
+6. WHAT THE NEXT RUN'S LOG WILL SHOW
+------------------------------------
+  exit.log: "exit: started" -> "exit: logs flushed" -> "exit: ending the process
+    (hbmenu, no applet Exit request)". Stopping after "logs flushed" means the
+    quiesce or the next-load call wedged.
+  stderr.log: "[exit] next load sdmc:/hbmenu.nro: set (0x0)" confirms the loader
+    accepted the next load; "[exit] loader has no next-load support" means the
+    console will land on HOME instead of hbmenu; "[watchdog] the quit did not
+    finish within 2 s" means the watchdog ended it, not the clean path.
+  crash_report.txt / fatal-signal line: the exit came from SIGABRT/SIGSEGV, and
+    the pc/lr names the faulting code.
+  A clean Plus+Minus/title quit should show the three exit.log lines plus the
+  next-load line and nothing from the watchdog.
