@@ -1,0 +1,74 @@
+Early boot diagnostics for the Switch 2 guest address space backend
+====================================================================
+File touched: LostOdysseyRecomp/kernel/guest_address_space_switch.cpp
+Headers touched: none (gpu/renderer.cpp was not intentionally invalidated)
+
+Problem
+-------
+On real Switch 2 hardware (kaiHEN 20261116, title takeover) the 19:53 NRO
+exited before main() opened stderr.log or runtime-*.log, so no log was written
+at all. Memory g_memory is a static C++ object constructed from
+__libc_init_array *before* main(), so Allocate() -> ReserveWindow() /
+ProbeProcessMemory() runs with no logging available. A data abort or a loop
+there was therefore invisible on the SD card.
+
+Changes
+-------
+1. Unbuffered early boot log
+   - New EarlyLog()/OpenEarlyLog() helpers in the file's anonymous namespace.
+     EarlyLog() formats, writes, and fflush()es every single line, so each step
+     is on the card before it runs.
+   - Allocate() opens sdmc:/switch/LostOdysseyRecomp/early_boot.log in "w" mode
+     as its very first statement on __SWITCH2__, with
+     setvbuf(f, nullptr, _IONBF, 0) (nothing is buffered in the first place).
+     mkdir() of the folder is attempted first and its error ignored.
+   - The existing Diag() now also mirrors every line into early_boot.log, so the
+     full reservation/probe trace lands on the card, not only stderr.
+   - Explicit step lines before every risky call:
+       * OwnProcessHandle begin / resolved
+       * LogFacts begin / done, and one line before every svcGetInfo
+         (total memory, used memory, aslr, alias, heap, stack, address space
+         size via QueryInfoRegion)
+       * ReserveWindow begin (with the region values), virtmemLock before
+         virtmemFindAslr, before virtmemFindCodeMemory, and each of their
+         results; virtmemLock before every virtmemAddReservation
+       * every svcQueryMemory block in the gap scan (block number, address)
+       * ProbeProcessMemory: memalign, virtmemLock/FindCodeMemory/FindAslr,
+         svcMapProcessCodeMemory, svcSetProcessMemoryPermission,
+         svcMapProcessMemory, both unmaps, final ok flag
+       * ProbeTransferMemory: memalign, svcCreateTransferMemory,
+         virtmemLock/FindAslr, svcMapTransferMemory, svcUnmapTransferMemory,
+         final ok flag
+       * backend selection (process memory / transfer memory / none)
+
+2. ReserveWindow() scan hardening (FindGap)
+   - constexpr kMaxScanBlocks = 4096: the svcQueryMemory walk stops at the cap
+     and logs "stopped at cap of 4096 blocks".
+   - Non-zero rc now breaks with the result code logged
+     ("scan: svcQueryMemory(...) rc ..., stop").
+   - Zero-size block, block that does not advance past the cursor, and
+     address wrap-around (blockEnd < info.addr / blockEnd < cursor) all break
+     with a log line.
+   - The exclusion-advance inner loop can no longer spin: if PageAlign(advance)
+     is not greater than the candidate, the walk stops.
+   - Every block is logged as it is queried, and a summary line closes the walk.
+
+Build
+-----
+export DEVKITPRO=/opt/devkitpro && source /opt/devkitpro/switch2vars.sh &&
+cmake --build build -j20
+Result: exit 0, "[100%] Built target LostOdysseyRecomp", NRO packaged.
+(Only pre-existing compiler warnings from renderer.cpp/main.cpp; this file
+compiled clean.)
+
+Artifact
+--------
+build/LostOdysseyRecomp/LostOdysseyRecomp.nro copied to
+/mnt/c/Users/Jorda/Desktop/LostOdysseyRecomp.nro (verified identical by md5sum).
+
+What to read on hardware
+------------------------
+sdmc:/switch/LostOdysseyRecomp/early_boot.log is truncated ("w") on every boot
+and is flushed line by line. The last line before the console returns to the
+menu names the exact step that killed the boot. Note the file is intentionally
+never closed and the handle is held for the process lifetime.

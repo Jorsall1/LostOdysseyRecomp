@@ -10,6 +10,7 @@
 #include <cstring>
 #include <iterator>
 #include <mutex>
+#include <sys/stat.h>
 
 // Nintendo Switch backend (Horizon OS, libnx). Ported from UnleashedRecomp-NX
 // (kernel/memory.cpp) and extended with the Xbox 360 physical aliases.
@@ -79,6 +80,43 @@ bool s_storeAliasGapLogged = false;
 char s_diagnostics[4096];
 size_t s_diagnosticLength = 0;
 
+// Early boot trace. g_memory's constructor runs from __libc_init_array, long
+// before main() can open stderr.log, so a data abort or a loop inside
+// ReserveWindow()/Probe*() would otherwise leave the SD card with no new log at
+// all. Allocate() opens this file unbuffered and every line is flushed as it is
+// written, so the step that killed the boot is already on the card.
+FILE* s_earlyLog = nullptr; // opened on Switch 2 only; a no-op everywhere else
+
+void EarlyLog(const char* format, ...)
+{
+    if (!s_earlyLog)
+        return;
+    char line[384];
+    va_list args;
+    va_start(args, format);
+    const int written = std::vsnprintf(line, sizeof(line), format, args);
+    va_end(args);
+    if (written <= 0)
+        return;
+    const size_t length = size_t(written) < sizeof(line) ? size_t(written) : sizeof(line) - 1;
+    std::fwrite(line, 1, length, s_earlyLog);
+    std::fputc('\n', s_earlyLog);
+    std::fflush(s_earlyLog); // Unbuffered, but flush anyway: the next step may never run.
+}
+
+void OpenEarlyLog()
+{
+    if (s_earlyLog)
+        return;
+    mkdir("sdmc:/switch/LostOdysseyRecomp", 0777); // EEXIST is the normal case.
+    s_earlyLog = std::fopen("sdmc:/switch/LostOdysseyRecomp/early_boot.log", "w");
+    if (!s_earlyLog)
+        return;
+    std::setvbuf(s_earlyLog, nullptr, _IONBF, 0);
+    EarlyLog("early boot: %s opened before guest allocation (window %#zx MiB)",
+        "sdmc:/switch/LostOdysseyRecomp/early_boot.log", kSize >> 20);
+}
+
 void Diag(const char* format, ...)
 {
     char line[320];
@@ -90,6 +128,7 @@ void Diag(const char* format, ...)
         return;
     const size_t length = size_t(written) < sizeof(line) ? size_t(written) : sizeof(line) - 1;
     std::fprintf(stderr, "guest memory: %s\n", line);
+    EarlyLog("guest memory: %s", line);
     if (s_diagnosticLength + length + 4 >= sizeof(s_diagnostics))
         return;
     if (s_diagnosticLength != 0)
@@ -128,8 +167,13 @@ struct InfoRegion
 InfoRegion QueryInfoRegion(InfoType addressType, InfoType sizeType)
 {
     InfoRegion region{};
+    EarlyLog("svcGetInfo: address type %d", int(addressType));
     region.addressResult = svcGetInfo(&region.address, addressType, CUR_PROCESS_HANDLE, 0);
+    EarlyLog("svcGetInfo: size type %d", int(sizeType));
     region.sizeResult = svcGetInfo(&region.size, sizeType, CUR_PROCESS_HANDLE, 0);
+    EarlyLog("svcGetInfo: type %d/%d -> %#llx+%#llx (rc %#x/%#x)", int(addressType), int(sizeType),
+        (unsigned long long)region.address, (unsigned long long)region.size, uint32_t(region.addressResult),
+        uint32_t(region.sizeResult));
     return region;
 }
 
@@ -174,25 +218,58 @@ struct GapSearch
     u64 largestAt;
 };
 
+// Hard limit on the svcQueryMemory walk. A kernel answer that keeps reporting
+// the same block (or an address that wraps) must end the scan, not the boot.
+constexpr size_t kMaxScanBlocks = 4096;
+
 // Walks [start, end) block by block with svcQueryMemory and returns the first
 // page-aligned unmapped run of at least size bytes that overlaps none of
 // excluded. svcQueryMemory reports a whole block per call, so this costs one
 // call per memory block; the walk does not depend on libnx's virtmem table,
 // whose random placement cannot find a 4 GiB run in a region assembled from
-// several separate fragments.
+// several separate fragments. Every block is logged before it is queried, the
+// walk stops at kMaxScanBlocks blocks and on any anomaly (non-zero rc, empty
+// or non-advancing block, address wrap-around), so it can never loop forever.
 GapSearch FindGap(u64 start, u64 end, u64 size, const ExcludeRange* excluded, size_t excludedCount)
 {
     GapSearch result{};
     u64 cursor = std::max(PageAlign(start), u64(kPage));
+    EarlyLog("scan: %#llx-%#llx for %#llx MiB, cap %zu blocks", (unsigned long long)cursor,
+        (unsigned long long)end, (unsigned long long)(size >> 20), kMaxScanBlocks);
+    size_t blocks = 0;
     while (cursor < end && cursor + size > cursor)
     {
+        if (blocks >= kMaxScanBlocks)
+        {
+            EarlyLog("scan: stopped at cap of %zu blocks, cursor %#llx", kMaxScanBlocks,
+                (unsigned long long)cursor);
+            break;
+        }
+        ++blocks;
         MemoryInfo info{};
         u32 pageInfo = 0;
-        if (R_FAILED(svcQueryMemory(&info, &pageInfo, cursor)))
+        EarlyLog("scan: block %zu svcQueryMemory(%#llx)", blocks, (unsigned long long)cursor);
+        const Result rc = svcQueryMemory(&info, &pageInfo, cursor);
+        if (R_FAILED(rc))
+        {
+            EarlyLog("scan: svcQueryMemory(%#llx) rc %#x, stop", (unsigned long long)cursor, uint32_t(rc));
             break;
+        }
         const u64 blockEnd = info.addr + info.size;
+        EarlyLog("scan: block %zu -> %#llx+%#llx type %d perm %d", blocks, (unsigned long long)info.addr,
+            (unsigned long long)info.size, int(info.type), int(info.perm));
         if (info.size == 0 || blockEnd <= cursor)
+        {
+            EarlyLog("scan: block %zu does not advance past %#llx, stop", blocks,
+                (unsigned long long)cursor);
             break;
+        }
+        if (blockEnd < info.addr || blockEnd < cursor)
+        {
+            EarlyLog("scan: block %zu wraps (%#llx+%#llx), stop", blocks, (unsigned long long)info.addr,
+                (unsigned long long)info.size);
+            break;
+        }
         if (info.type == MemType_Unmapped)
         {
             const u64 limit = std::min<u64>(blockEnd, end);
@@ -212,21 +289,35 @@ GapSearch FindGap(u64 start, u64 end, u64 size, const ExcludeRange* excluded, si
                 if (advance == 0)
                 {
                     result.address = candidate;
+                    EarlyLog("scan: run %#llx-%#llx after %zu blocks", (unsigned long long)candidate,
+                        (unsigned long long)(candidate + size), blocks);
                     return result;
                 }
-                candidate = PageAlign(advance);
+                const u64 next = PageAlign(advance);
+                if (next <= candidate)
+                {
+                    EarlyLog("scan: exclusion at %#llx does not advance, stop", (unsigned long long)candidate);
+                    return result;
+                }
+                candidate = next;
             }
         }
         cursor = blockEnd;
     }
+    EarlyLog("scan: %#llx-%#llx done after %zu blocks, run %#llx largest %#llx",
+        (unsigned long long)start, (unsigned long long)end, blocks, (unsigned long long)result.address,
+        (unsigned long long)result.largest);
     return result;
 }
 
 VirtmemReservation* AddReservation(u64 address, size_t size)
 {
+    EarlyLog("reservation: virtmemLock for %#llx+%#zx", (unsigned long long)address, size);
     virtmemLock();
     VirtmemReservation* const reservation = virtmemAddReservation(reinterpret_cast<void*>(address), size);
     virtmemUnlock();
+    EarlyLog("reservation: virtmemAddReservation(%#llx, %#zx) -> %p", (unsigned long long)address, size,
+        static_cast<void*>(reservation));
     return reservation;
 }
 
@@ -282,10 +373,13 @@ uint8_t* ReserveWindow(size_t size, size_t guard, VirtmemReservation*& reservati
 {
     reservation = nullptr;
     {
+        EarlyLog("window: virtmemLock before virtmemFindAslr(%#zx, %#zx)", size, guard);
         virtmemLock();
         void* const base = virtmemFindAslr(size, guard);
         reservation = base ? virtmemAddReservation(base, size) : nullptr;
         virtmemUnlock();
+        EarlyLog("window: virtmemFindAslr(%#zx, %#zx) -> %p, reservation %p", size, guard, base,
+            static_cast<void*>(reservation));
         if (base && reservation)
         {
             Diag("window: virtmemFindAslr(%#zx, %#zx) placed %#zx MiB at %p", size, guard, size >> 20, base);
@@ -296,10 +390,13 @@ uint8_t* ReserveWindow(size_t size, size_t guard, VirtmemReservation*& reservati
         reservation = nullptr;
     }
     {
+        EarlyLog("window: virtmemLock before virtmemFindCodeMemory(%#zx, %#zx)", size, guard);
         virtmemLock();
         void* const base = virtmemFindCodeMemory(size, guard);
         reservation = base ? virtmemAddReservation(base, size) : nullptr;
         virtmemUnlock();
+        EarlyLog("window: virtmemFindCodeMemory(%#zx, %#zx) -> %p, reservation %p", size, guard, base,
+            static_cast<void*>(reservation));
         if (base && reservation)
         {
             Diag("window: virtmemFindCodeMemory(%#zx, %#zx) placed %#zx MiB at %p", size, guard, size >> 20, base);
@@ -350,7 +447,9 @@ void LogFacts()
         int(envIsSyscallHinted(kSvcMapTransferMemory)), int(envIsSyscallHinted(kSvcUnmapTransferMemory)));
 
     u64 total = 0, used = 0;
+    EarlyLog("svcGetInfo: total memory size");
     const Result rcTotal = svcGetInfo(&total, InfoType_TotalMemorySize, CUR_PROCESS_HANDLE, 0);
+    EarlyLog("svcGetInfo: used memory size");
     const Result rcUsed = svcGetInfo(&used, InfoType_UsedMemorySize, CUR_PROCESS_HANDLE, 0);
     Diag("switch 2: total=%#llx (rc %#x) used=%#llx (rc %#x)", (unsigned long long)total, uint32_t(rcTotal),
         (unsigned long long)used, uint32_t(rcUsed));
@@ -359,6 +458,7 @@ void LogFacts()
     s_aliasRegion = QueryInfoRegion(InfoType_AliasRegionAddress, InfoType_AliasRegionSize);
     s_heapRegion = QueryInfoRegion(InfoType_HeapRegionAddress, InfoType_HeapRegionSize);
     s_stackRegion = QueryInfoRegion(InfoType_StackRegionAddress, InfoType_StackRegionSize);
+    EarlyLog("svcGetInfo: address space size");
     s_addressSpaceResult = svcGetInfo(&s_addressSpaceSize, InfoType_AddressSpaceSize, CUR_PROCESS_HANDLE, 0);
     LogInfoRegion("aslr", s_aslrRegion);
     LogInfoRegion("alias", s_aliasRegion);
@@ -377,6 +477,7 @@ void LogFacts()
 // Every result code is reported, so the hint table is never the answer.
 bool ProbeProcessMemory(Handle process)
 {
+    EarlyLog("probe process memory: memalign(%#zx)", kPage);
     void* scratch = memalign(kPage, kPage);
     if (!scratch)
     {
@@ -388,16 +489,25 @@ bool ProbeProcessMemory(Handle process)
     Result mapCode = 0, setPermission = 0, mapView = 0;
     void* code = nullptr;
     void* view = nullptr;
+    EarlyLog("probe process memory: virtmemLock before virtmemFindCodeMemory/FindAslr(%#zx)", kPage);
     virtmemLock();
     code = virtmemFindCodeMemory(kPage, kPage);
     view = virtmemFindAslr(kPage, kPage);
+    EarlyLog("probe process memory: code=%p view=%p", code, view);
     if (code && view)
     {
+        EarlyLog("probe process memory: svcMapProcessCodeMemory(process %#x, %p, %p, %#zx)", process, code, scratch,
+            kPage);
         mapCode = svcMapProcessCodeMemory(process, uintptr_t(code), uintptr_t(scratch), kPage);
+        EarlyLog("probe process memory: svcMapProcessCodeMemory rc %#x", uint32_t(mapCode));
         if (R_SUCCEEDED(mapCode))
         {
+            EarlyLog("probe process memory: svcSetProcessMemoryPermission");
             setPermission = svcSetProcessMemoryPermission(process, uintptr_t(code), kPage, Perm_Rw);
+            EarlyLog("probe process memory: svcSetProcessMemoryPermission rc %#x", uint32_t(setPermission));
+            EarlyLog("probe process memory: svcMapProcessMemory");
             mapView = svcMapProcessMemory(view, process, uintptr_t(code), kPage);
+            EarlyLog("probe process memory: svcMapProcessMemory rc %#x", uint32_t(mapView));
         }
     }
     virtmemUnlock();
@@ -419,9 +529,16 @@ bool ProbeProcessMemory(Handle process)
         Diag("probe process memory: %s", ok ? "usable" : "mapping or permission unusable");
     }
     if (R_SUCCEEDED(mapView))
+    {
+        EarlyLog("probe process memory: svcUnmapProcessMemory");
         svcUnmapProcessMemory(view, process, uintptr_t(code), kPage);
+    }
     if (R_SUCCEEDED(mapCode))
+    {
+        EarlyLog("probe process memory: svcUnmapProcessCodeMemory");
         svcUnmapProcessCodeMemory(process, uintptr_t(code), uintptr_t(scratch), kPage);
+    }
+    EarlyLog("probe process memory: done, ok=%d", int(ok));
     // scratch, code and view are leaked on purpose: after a partial failure the
     // kernel may still own those pages and freeing them would corrupt the heap.
     return ok;
@@ -432,6 +549,7 @@ bool ProbeProcessMemory(Handle process)
 // process handle and no code region, but it cannot start inside a chunk.
 bool ProbeTransferMemory()
 {
+    EarlyLog("probe transfer memory: memalign(%#zx)", kPage);
     void* scratch = memalign(kPage, kPage);
     if (!scratch)
     {
@@ -441,16 +559,23 @@ bool ProbeTransferMemory()
     std::memset(scratch, 0x3C, kPage);
 
     Handle memory = INVALID_HANDLE;
+    EarlyLog("probe transfer memory: svcCreateTransferMemory(%p, %#zx)", scratch, kPage);
     const Result created = svcCreateTransferMemory(&memory, scratch, kPage, Perm_Rw);
+    EarlyLog("probe transfer memory: svcCreateTransferMemory rc %#x handle %#x", uint32_t(created), memory);
     void* view = nullptr;
     Result mapped = 0;
     if (R_SUCCEEDED(created))
     {
+        EarlyLog("probe transfer memory: virtmemLock before virtmemFindAslr(%#zx)", kPage);
         virtmemLock();
         view = virtmemFindAslr(kPage, kPage);
         virtmemUnlock();
         if (view)
+        {
+            EarlyLog("probe transfer memory: svcMapTransferMemory at %p", view);
             mapped = svcMapTransferMemory(memory, view, kPage, Perm_Rw);
+            EarlyLog("probe transfer memory: svcMapTransferMemory rc %#x", uint32_t(mapped));
+        }
     }
     Diag("probe transfer memory: create=%#x view=%p map=%#x", created, view, mapped);
 
@@ -465,10 +590,12 @@ bool ProbeTransferMemory()
             ok = bytes[0] == 0xC3;
         }
         Diag("probe transfer memory: %s", ok ? "usable" : "mapping unusable");
+        EarlyLog("probe transfer memory: svcUnmapTransferMemory");
         svcUnmapTransferMemory(memory, view, kPage);
     }
     if (R_SUCCEEDED(created))
         svcCloseHandle(memory); // The pages stay with the kernel; scratch is not freed.
+    EarlyLog("probe transfer memory: done, ok=%d", int(ok));
     return ok;
 }
 #endif
@@ -658,15 +785,25 @@ bool MapChunk(size_t offset, size_t size, uintptr_t& sourceOut)
 
 uint8_t* Allocate()
 {
+#ifdef __SWITCH2__
+    // Very first thing that runs: no log file exists this early in the boot, so
+    // open one here, unbuffered, before any syscall that might abort.
+    OpenEarlyLog();
+    EarlyLog("allocate: begin (window %#zx MiB, chunk %#zx KiB)", kSize >> 20, kChunk >> 10);
+#endif
     ClearFailure();
     s_diagnosticLength = 0;
     s_diagnostics[0] = '\0';
     s_backend = Backend::Unchecked;
 
+    EarlyLog("allocate: OwnProcessHandle begin");
     s_process = OwnProcessHandle();
+    EarlyLog("allocate: OwnProcessHandle resolved %#x", s_process);
 #ifdef __SWITCH2__
     Diag("switch 2: own process handle env=%#x resolved=%#x", envGetOwnProcessHandle(), s_process);
+    EarlyLog("allocate: LogFacts begin");
     LogFacts();
+    EarlyLog("allocate: LogFacts done");
 #else
     if (!ProcessMemorySyscallsAvailable())
     {
@@ -683,7 +820,14 @@ uint8_t* Allocate()
 #endif
 
 #if defined(__SWITCH2__)
+    EarlyLog("allocate: ReserveWindow(%#zx, %#zx) begin, aslr=%#llx+%#llx alias=%#llx+%#llx heap=%#llx+%#llx stack=%#llx+%#llx",
+        kSize, kChunk, (unsigned long long)s_aslrRegion.address, (unsigned long long)s_aslrRegion.size,
+        (unsigned long long)s_aliasRegion.address, (unsigned long long)s_aliasRegion.size,
+        (unsigned long long)s_heapRegion.address, (unsigned long long)s_heapRegion.size,
+        (unsigned long long)s_stackRegion.address, (unsigned long long)s_stackRegion.size);
     s_base = ReserveWindow(kSize, kChunk, s_reservation);
+    EarlyLog("allocate: ReserveWindow returned %p (reservation %p)", static_cast<void*>(s_base),
+        static_cast<void*>(s_reservation));
 #else
     virtmemLock();
     s_base = static_cast<uint8_t*>(virtmemFindAslr(kSize, kChunk));
@@ -703,12 +847,26 @@ uint8_t* Allocate()
 #ifdef __SWITCH2__
     // The hints are not trusted: a loader that does not fill the table still
     // lets the syscalls through, so ask the kernel with a real mapping.
+    EarlyLog("allocate: ProbeProcessMemory begin (process %#x)", s_process);
     if (s_process != INVALID_HANDLE && ProbeProcessMemory(s_process))
+    {
+        EarlyLog("allocate: ProbeProcessMemory succeeded");
         s_backend = Backend::ProcessMemory;
-    else if (ProbeTransferMemory())
-        s_backend = Backend::TransferMemory;
+    }
     else
-        s_backend = Backend::None;
+    {
+        EarlyLog("allocate: ProbeProcessMemory failed, ProbeTransferMemory begin");
+        if (ProbeTransferMemory())
+        {
+            EarlyLog("allocate: ProbeTransferMemory succeeded");
+            s_backend = Backend::TransferMemory;
+        }
+        else
+        {
+            EarlyLog("allocate: ProbeTransferMemory failed, no backend");
+            s_backend = Backend::None;
+        }
+    }
 
     if (s_backend == Backend::None)
     {
