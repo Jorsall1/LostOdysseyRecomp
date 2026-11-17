@@ -37,11 +37,13 @@
 // therefore chosen by probing the syscalls on a real 4 KiB block instead of
 // trusting the hints, and a transfer-memory backend covers the case where the
 // kernel refuses svcMapProcessCodeMemory.
-// Switch 2 with kaiHEN 20261116 (title takeover) is a stricter case: probing
-// svcMapProcessCodeMemory (SVC 0x77) does not return an error, the kernel
-// terminates the process on the spot (early_boot.log ends on that line). The
-// process-memory probe is therefore disabled on Switch 2 and the transfer
-// memory backend (0x15/0x51/0x52) is used directly.
+// Switch 2 with kaiHEN 20261116 (title takeover) is a stricter case still: the
+// donor title's NPDM syscall mask contains 0x73/0x74/0x75/0x77/0x78 and 0x51,
+// and a masked svc* does not return an error there, it terminates the process
+// (early_boot.log ends on that line). Neither process memory nor transfer
+// memory may be used, so Switch 2 backs the whole window with one plain heap
+// block instead (Backend::Heap): memalign() only, zero SVC. Guest addresses are
+// offsets into that block, exactly as Memory::Translate(base + offset) expects.
 namespace GuestAddressSpace
 {
 namespace
@@ -67,7 +69,10 @@ constexpr unsigned kSvcUnmapTransferMemory = 0x52;
 //   TransferMemory: heap -> transfer memory (0x15) -> window (0x51). A transfer
 //     memory always maps from its first page, so the E view is placed one page
 //     lower than A instead, and its first page stays unmapped.
-enum class Backend { Unchecked, None, ProcessMemory, TransferMemory };
+//   Heap: one memalign block holds the window; no mapping syscall at all, so
+//     C and E are ordinary ranges of the block rather than aliases of A.
+//     Committed chunks are zeroed on commit (heap memory is uninitialized).
+enum class Backend { Unchecked, None, ProcessMemory, TransferMemory, Heap };
 
 Backend s_backend = Backend::Unchecked;
 uint8_t* s_base = nullptr;
@@ -397,7 +402,7 @@ u64 AddressSpaceLimit()
 // elsewhere (Switch 2) always gets NULL from it. Each step is logged with its
 // outcome, so a failed boot reports exactly which placements the kernel's own
 // layout allowed.
-uint8_t* ReserveWindow(size_t size, size_t guard, VirtmemReservation*& reservation)
+[[maybe_unused]] uint8_t* ReserveWindow(size_t size, size_t guard, VirtmemReservation*& reservation)
 {
     reservation = nullptr;
     {
@@ -503,7 +508,7 @@ void LogFacts()
 // Probes the process-memory pair on a scratch page: map 4 KiB of real heap into
 // the code region, map that into an ordinary address, read it back, undo both.
 // Every result code is reported, so the hint table is never the answer.
-bool ProbeProcessMemory(Handle process)
+[[maybe_unused]] bool ProbeProcessMemory(Handle process)
 {
     EarlyLog("probe process memory: memalign(%#zx)", kPage);
     void* scratch = memalign(kPage, kPage);
@@ -575,7 +580,7 @@ bool ProbeProcessMemory(Handle process)
 // Transfer memory is the fallback when the kernel refuses code memory: the
 // heap page is handed to the kernel (0x15) and mapped back (0x51). It needs no
 // process handle and no code region, but it cannot start inside a chunk.
-bool ProbeTransferMemory()
+[[maybe_unused]] bool ProbeTransferMemory()
 {
     EarlyLog("probe transfer memory: memalign(%#zx)", kPage);
     void* scratch = memalign(kPage, kPage);
@@ -830,6 +835,32 @@ bool MapChunk(size_t offset, size_t size, uintptr_t& sourceOut)
 }
 }
 
+#if defined(__SWITCH2__)
+// Switch 2's only backend: the 4 GiB window is one contiguous heap block. This
+// is the one allocation path the donor title's syscall mask cannot refuse,
+// because it is plain malloc. Everything that used to be a kernel mapping
+// (code memory, transfer memory, A/C/E aliases) is gone with it.
+uint8_t* AllocateHeapWindow()
+{
+    const struct mallinfo before = mallinfo();
+    EarlyLog("heap window: mallinfo before: arena %llu MiB, in use %llu MiB",
+        (unsigned long long)(size_t(before.arena) >> 20), (unsigned long long)(size_t(before.uordblks) >> 20));
+    EarlyLog("heap window: memalign(%#zx, %#zx)", kPage, kSize);
+    uint8_t* const block = static_cast<uint8_t*>(memalign(kPage, kSize));
+    const struct mallinfo after = mallinfo();
+    EarlyLog("heap window: memalign -> %p, arena now %llu MiB, in use %llu MiB", static_cast<void*>(block),
+        (unsigned long long)(size_t(after.arena) >> 20), (unsigned long long)(size_t(after.uordblks) >> 20));
+    if (!block)
+    {
+        EarlyLog("heap window: memalign of %#zx MiB failed", kSize >> 20);
+        return nullptr;
+    }
+    // Not memset here: 4 GiB would touch every page during __libc_init_array.
+    // Commit() zeroes each chunk when the guest actually gets it.
+    return block;
+}
+#endif
+
 uint8_t* Allocate()
 {
 #ifdef __SWITCH2__
@@ -867,14 +898,18 @@ uint8_t* Allocate()
 #endif
 
 #if defined(__SWITCH2__)
-    EarlyLog("allocate: ReserveWindow(%#zx, %#zx) begin, aslr=%#llx+%#llx alias=%#llx+%#llx heap=%#llx+%#llx stack=%#llx+%#llx",
-        kSize, kChunk, (unsigned long long)s_aslrRegion.address, (unsigned long long)s_aslrRegion.size,
+    // No virtmem reservation and no ReserveWindow(): nothing is mapped into a
+    // reserved range any more, the window is one heap block (see
+    // AllocateHeapWindow). The regions are still logged as boot context.
+    EarlyLog("allocate: heap window begin, aslr=%#llx+%#llx alias=%#llx+%#llx heap=%#llx+%#llx stack=%#llx+%#llx",
+        (unsigned long long)s_aslrRegion.address, (unsigned long long)s_aslrRegion.size,
         (unsigned long long)s_aliasRegion.address, (unsigned long long)s_aliasRegion.size,
         (unsigned long long)s_heapRegion.address, (unsigned long long)s_heapRegion.size,
         (unsigned long long)s_stackRegion.address, (unsigned long long)s_stackRegion.size);
-    s_base = ReserveWindow(kSize, kChunk, s_reservation);
-    EarlyLog("allocate: ReserveWindow returned %p (reservation %p)", static_cast<void*>(s_base),
-        static_cast<void*>(s_reservation));
+    s_base = AllocateHeapWindow();
+    EarlyLog("allocate: heap window returned %p", static_cast<void*>(s_base));
+    if (s_base)
+        s_backend = Backend::Heap;
 #else
     virtmemLock();
     s_base = static_cast<uint8_t*>(virtmemFindAslr(kSize, kChunk));
@@ -883,73 +918,55 @@ uint8_t* Allocate()
     virtmemUnlock();
 #endif
 #ifdef __SWITCH2__
-    // svcMapProcessMemory needs a page-aligned destination and the guest null
-    // page has to stay unmapped: a scan answer that is neither is not usable.
+    // Every guest address is an offset into this block, so a misaligned base
+    // would break every 4 KiB view.
     if (s_base && (uintptr_t(s_base) < 0x10000 || (uintptr_t(s_base) & (kPage - 1)) != 0))
     {
         Diag("window: refusing unusable placement %p (unaligned or inside the null page guard)", s_base);
         s_base = nullptr;
     }
 #endif
-    if (!s_base || !s_reservation)
+    // The heap backend owns its block directly, so there is no reservation.
+    if (!s_base || (s_backend != Backend::Heap && !s_reservation))
     {
-        Diag("window: %#zx MiB at %p not reserved (reservation %p)", kSize >> 20, s_base, s_reservation);
+        Diag("window: %#zx MiB at %p not available (reservation %p)", kSize >> 20, s_base, s_reservation);
         RecordFailure(FailureOperation::ReserveAny, 0, -1, s_base, kSize);
         s_base = nullptr;
         return nullptr;
     }
+#ifdef __SWITCH2__
+    Diag("window: %#zx MiB heap block at %p (no virtual reservation)", kSize >> 20, s_base);
+#else
     Diag("window: reserved %#zx MiB at %p", kSize >> 20, s_base);
+#endif
 
 #ifdef __SWITCH2__
-    // The hints are not trusted: a loader that does not fill the table still
-    // lets the syscalls through, so ask the kernel with a real mapping. On
-    // Switch 2 the probe for process memory is skipped entirely: with kaiHEN
-    // 20261116, svcMapProcessCodeMemory (0x77) does not return an error there,
-    // it terminates the process, and early_boot.log stopped on that line after
-    // ReserveWindow() had already reserved the whole 4 GiB window. Transfer
-    // memory (0x15/0x51/0x52) is reachable and is the only backend used.
-    // kProbeProcessMemory is false, so the probe has no call site and the
-    // compiler drops ProbeProcessMemory from the binary entirely (the ELF no
-    // longer contains a single "probe process memory" string). A loader that
-    // grants 0x77 can set it true again.
-    constexpr bool kProbeProcessMemory = false;
-    EarlyLog("allocate: backend selection: process memory probe %s", kProbeProcessMemory ? "enabled" : "disabled");
-    bool usable = false;
-    if (kProbeProcessMemory && s_process != INVALID_HANDLE)
+    // No probe: the probes are what killed the previous two boots. kaiHEN
+    // 20261116 (title takeover) runs this NRO in a donor title whose NPDM
+    // syscall mask has 0x73, 0x74, 0x75, 0x77, 0x78 and 0x51 masked, while only
+    // 0x15 is allowed. A masked svc* does not return an error, the kernel
+    // terminates the process, so nothing that maps memory may be called here.
+    // Backend::Heap needs no SVC at all: the block is plain heap memory.
+    if (s_base)
     {
-        EarlyLog("allocate: ProbeProcessMemory begin (process %#x)", s_process);
-        usable = ProbeProcessMemory(s_process);
-        EarlyLog("allocate: ProbeProcessMemory %s", usable ? "succeeded" : "failed");
-        if (usable)
-            s_backend = Backend::ProcessMemory;
+        s_backend = Backend::Heap;
+        EarlyLog("allocate: backend: heap block %p, no mapping syscall used", static_cast<void*>(s_base));
     }
-    if (!usable)
+    else
     {
-        EarlyLog("allocate: ProbeTransferMemory begin (0x15/0x51/0x52)");
-        if (ProbeTransferMemory())
-        {
-            EarlyLog("allocate: ProbeTransferMemory succeeded");
-            s_backend = Backend::TransferMemory;
-        }
-        else
-        {
-            EarlyLog("allocate: ProbeTransferMemory failed, no backend");
-            s_backend = Backend::None;
-        }
-    }
-
-    if (s_backend == Backend::None)
-    {
-        Diag("backend: none, the kernel refused process memory and transfer memory");
-        RecordFailure(FailureOperation::ReserveAny, s_process == INVALID_HANDLE ? 0xFFFFFFFEu : 0xFFFFFFFFu, -1,
-                      nullptr, kSize);
-        virtmemLock();
-        virtmemRemoveReservation(s_reservation);
-        virtmemUnlock();
-        s_reservation = nullptr;
+        EarlyLog("allocate: backend: heap allocation failed, no backend");
+        s_backend = Backend::None;
+        Diag("backend: none, the %#zx MiB heap block could not be allocated", kSize >> 20);
+        RecordFailure(FailureOperation::ReserveAny, 0xFFFFFFFFu, -1, nullptr, kSize);
         s_base = nullptr;
         return nullptr;
     }
+    EarlyLog("allocate: backend heap ready, window %p, %#zx MiB", static_cast<void*>(s_base), kSize >> 20);
+    // C and E are distinct ranges of the block now, not hardware aliases of A:
+    // a write through A no longer shows up through C or E. Everything that
+    // reaches guest memory through A (XMA, GPU copies, the unbacked-read
+    // repair) keeps working; the hardware-alias paths are the documented loss.
+    Diag("backend: heap (no svcMap*, A/C/E are distinct ranges of one %#zx MiB block)", kSize >> 20);
     Diag("backend: %s", s_backend == Backend::ProcessMemory ? "process memory (0x77/0x74)"
                                                             : "transfer memory (0x15/0x51)");
 #endif
@@ -976,6 +993,26 @@ bool Commit(uint32_t address, uint32_t size)
     {
         if (s_committed[chunk])
             continue;
+        if (s_backend == Backend::Heap)
+        {
+            // The pages already exist in the block; committing only has to make
+            // them zero (memalign memory is uninitialized) and record them. The
+            // whole chunk is zeroed, null page included: with plain heap memory
+            // a guest null access reads zeros like it does on the desktop hosts
+            // instead of faulting.
+            const size_t start = size_t(chunk * kChunk);
+            const size_t heapLength = std::min<size_t>(kChunk, kSize - start);
+            std::memset(s_base + start, 0, heapLength);
+            if (s_earlyChunkLogs < kEarlyChunkLogs)
+            {
+                ++s_earlyChunkLogs;
+                EarlyLog("commit: chunk %zu heap %p+%#zx zeroed", size_t(chunk), static_cast<void*>(s_base + start),
+                    heapLength);
+            }
+            __atomic_store_n(&s_committed[chunk], true, __ATOMIC_RELEASE);
+            s_committedBytes += kChunk;
+            continue;
+        }
         size_t offset = size_t(chunk * kChunk);
         size_t length = kChunk;
         if (offset == 0)
@@ -1023,6 +1060,12 @@ Backing EnsureBacked(uint32_t address, uint32_t size)
         backed = backed && __atomic_load_n(&s_committed[chunk], __ATOMIC_ACQUIRE);
     if (!backed)
         return Commit(uint32_t(start), uint32_t(end - start)) ? Backing::NewlyBacked : Backing::Failed;
+
+    // Heap memory cannot go missing from the process: once committed it is
+    // mapped, so the kernel-side repair below is pointless (and svcQueryMemory
+    // on every XMA buffer is pure cost).
+    if (s_backend == Backend::Heap)
+        return Backing::AlreadyBacked;
 
     // Committed, so it should be mapped. Entering Uhra, reads of committed chunks still faulted
     // (no backing was needed or failed, yet the page was not there): check with the kernel, and

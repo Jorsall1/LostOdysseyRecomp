@@ -1,0 +1,127 @@
+Switch 2: the heap backend (no mapping syscalls at all)
+=======================================================
+File changed: LostOdysseyRecomp/kernel/guest_address_space_switch.cpp (only .cpp, no headers)
+Date: 2026-11-16
+
+1. What early_boot.log proved
+-----------------------------
+    hints 0x73=0 0x74=0 0x75=0 0x77=0 0x78=0 0x15=1 0x51=0 0x52=0
+    total=0x234000000  alias region=0xa96e00000+0x2000000000
+
+Two boots died the same way:
+
+    svcMapProcessCodeMemory (0x77)  -> process terminated (first boot)
+    svcMapTransferMemory   (0x51)  -> process terminated (second boot)
+
+with ReserveWindow() having already succeeded. Neither syscall is in the donor
+title's NPDM syscall mask. A masked svc* on Horizon does not return an error
+result - the kernel kills the process - so this cannot be detected or caught at
+runtime, only avoided. The hint table says the same thing (only 0x15 set), and
+0x73/0x74/0x75/0x78 are masked in the same way, which rules out every path that
+makes memory appear at a chosen virtual address.
+
+2. The new backend
+------------------
+Backend::Heap is now the only Switch 2 backend and issues zero SVCs:
+
+    uint8_t* AllocateHeapWindow()          // memalign(0x1000, 0x100000000)
+    {
+        memalign(kPage, kSize)  -> one contiguous 4 GiB block
+    }
+
+This works because the whole design already treats the window as
+`Memory::Translate(offset) == base + offset` (kernel/memory.h): every guest
+address 0x00000000..0xFFFFFFFF is an offset into that block, so one heap block is
+a complete window. The old code reserved a virtmem range and mapped chunks into
+it; that machinery (ReserveWindow/MapChunk/MapView) is no longer called on
+Switch 2 and the reservation is no longer created at all (s_reservation stays
+null, which Allocate() now accepts for the heap backend).
+
+Changes inside Allocate() on __SWITCH2__:
+  * No ReserveWindow(), no virtmemFindAslr/virtmemAddReservation.
+  * No ProbeProcessMemory(), no ProbeTransferMemory(): both are still compiled
+    but unreferenced ([[maybe_unused]]), so the compiler drops them. The ELF now
+    contains zero "probe process memory" and zero "probe transfer memory"
+    strings, i.e. no call site for 0x77, 0x51 (or 0x15) exists in the boot path.
+  * s_base = AllocateHeapWindow(); page-aligned and above the null page or the
+    window is refused (the same placement guard as before).
+  * s_backend = Backend::Heap; s_reservation is not required.
+
+Commit() on the heap backend does no mapping and no syscall:
+    start = chunk * kChunk; length = min(kChunk, kSize - start)
+    memset(s_base + start, 0, length)   // memalign memory is uninitialized
+    mark the chunk committed, count the bytes
+The whole chunk is zeroed including the guest null page, so a null guest access
+reads zeros exactly like the desktop hosts instead of faulting (plain heap
+memory cannot be left permanently unmapped).
+
+EnsureBacked() returns AlreadyBacked immediately on the heap backend: committed
+heap pages cannot go missing, so the svcQueryMemory/repair path (and its
+svcMapTransferMemory/svcMapProcessMemory calls) is never entered. This also
+removes a per-XMA-buffer kernel query from the hot path.
+
+3. What is lost with this backend (documented in code and here)
+---------------------------------------------------------------
+A (0xA0000000), C (0xC0000000) and E (0xE0000000) are now three ordinary ranges
+of the same block instead of hardware aliases of one physical page. A write
+through A is no longer visible through C or E, and E is no longer "A shifted by
+one 4 KiB page". Everything that reaches guest memory through A keeps working:
+  * recompiled code (all guest addresses are base + offset),
+  * XMA (Physical() uses 0xA0000000 + p, i.e. A),
+  * GPU copies and command-processor reads (physical A),
+  * the unbacked-read repair path in patches/unbacked_guest_reads.cpp.
+The guest paths that depend on real aliasing (data written through C/E and read
+through A, or the one-page E shift) will see stale/zero data rather than crash.
+Restoring true aliasing needs a mapping syscall, which the current NPDM mask
+makes impossible; a donor title whose mask contains 0x74 would be required.
+
+4. Logging (unbuffered file, fflush() after every line)
+-------------------------------------------------------
+    allocate: begin (window 4096 MiB, chunk 2048 KiB)
+    allocate: OwnProcessHandle resolved 0x...
+    switch 2: own process handle env=... resolved=...
+    svcGetInfo: ... (regions, address space size)
+    switch 2: address space size=..., window needs 4096 MiB contiguous
+    switch 2: newlib heap N MiB in use, M MiB arena
+    allocate: heap window begin, aslr=...+... alias=...+... heap=...+... stack=...+...
+    heap window: mallinfo before: arena N MiB, in use M MiB
+    heap window: memalign(0x1000, 0x100000000)
+    heap window: memalign -> 0x..., arena now N MiB, in use M MiB
+    allocate: heap window returned 0x...
+    window: 4096 MiB heap block at 0x... (no virtual reservation)
+    allocate: backend: heap block 0x..., no mapping syscall used
+    allocate: backend heap ready, window 0x..., 4096 MiB
+    backend: heap (no svcMap*, A/C/E are distinct ranges of one 4096 MiB block)
+    commit: chunk 0 heap 0x...+0x200000 zeroed
+    ... chunk 1..7 ...
+Then main()'s own runtime log should appear.
+
+5. Build
+--------
+    export DEVKITPRO=/opt/devkitpro && source /opt/devkitpro/switch2vars.sh
+    cmake --build build -j20
+exit 0. Only kernel/guest_address_space_switch.o recompiled (gpu/renderer.cpp
+stayed cached, nothing else rebuilt), "[100%] Built target LostOdysseyRecomp",
+NRO packaged. No warnings from this translation unit; only the two pre-existing
+ones elsewhere (plume VK_USE_PLATFORM_VI_NN redefine, main.cpp u8path deprecation).
+
+6. Artifact
+-----------
+build/LostOdysseyRecomp/LostOdysseyRecomp.nro -> /mnt/c/Users/Jorda/Desktop/LostOdysseyRecomp.nro
+size 85,975,473 bytes, md5 4657ce7244a67614d2b24f4c85c1ffc8 (both copies identical).
+
+7. What to watch in the next early_boot.log
+-------------------------------------------
+  * "heap window: memalign(0x1000, 0x100000000)" then "memalign -> 0x...".
+    If it prints "memalign of 4096 MiB failed" the console heap cannot serve one
+    contiguous 4 GiB block; that is the one hard requirement of this backend and
+    the next step would be a segmented window with a dynamic translation table
+    (which needs kernel/memory.h, so it is a separate change).
+  * "allocate: backend heap ready" -> Allocate() succeeded, no SVC was used.
+  * "commit: chunk 0 heap ... zeroed" through chunk 7 -> Memory's constructor's
+    three Commits ran; main() is next.
+
+Caveat: no Switch 2 hardware in this session. Verified statically in the built
+ELF: the new trace strings are present, and the probe strings (and therefore the
+0x77/0x51 call sites) are gone. Whether memalign() can hand out one 4 GiB block
+under kaiHEN is exactly what the next log will show.
