@@ -37,6 +37,11 @@
 // therefore chosen by probing the syscalls on a real 4 KiB block instead of
 // trusting the hints, and a transfer-memory backend covers the case where the
 // kernel refuses svcMapProcessCodeMemory.
+// Switch 2 with kaiHEN 20261116 (title takeover) is a stricter case: probing
+// svcMapProcessCodeMemory (SVC 0x77) does not return an error, the kernel
+// terminates the process on the spot (early_boot.log ends on that line). The
+// process-memory probe is therefore disabled on Switch 2 and the transfer
+// memory backend (0x15/0x51/0x52) is used directly.
 namespace GuestAddressSpace
 {
 namespace
@@ -593,9 +598,10 @@ bool ProbeTransferMemory()
         virtmemLock();
         view = virtmemFindAslr(kPage, kPage);
         virtmemUnlock();
+        EarlyLog("probe transfer memory: virtmemFindAslr -> %p", view);
         if (view)
         {
-            EarlyLog("probe transfer memory: svcMapTransferMemory at %p", view);
+            EarlyLog("probe transfer memory: svcMapTransferMemory(handle %#x, %p, %#zx)", memory, view, kPage);
             mapped = svcMapTransferMemory(memory, view, kPage, Perm_Rw);
             EarlyLog("probe transfer memory: svcMapTransferMemory rc %#x", uint32_t(mapped));
         }
@@ -605,16 +611,20 @@ bool ProbeTransferMemory()
     bool ok = R_SUCCEEDED(created) && view && R_SUCCEEDED(mapped);
     if (ok)
     {
+        EarlyLog("probe transfer memory: reading back %#zx bytes at %p", kPage, view);
         volatile uint8_t* bytes = static_cast<uint8_t*>(view);
         ok = bytes[0] == 0x3C && bytes[kPage - 1] == 0x3C;
+        EarlyLog("probe transfer memory: read back %s", ok ? "matches" : "mismatch");
         if (ok)
         {
             bytes[0] = 0xC3;
             ok = bytes[0] == 0xC3;
+            EarlyLog("probe transfer memory: write back %s", ok ? "matches" : "mismatch");
         }
         Diag("probe transfer memory: %s", ok ? "usable" : "mapping unusable");
         EarlyLog("probe transfer memory: svcUnmapTransferMemory");
         svcUnmapTransferMemory(memory, view, kPage);
+        EarlyLog("probe transfer memory: svcUnmapTransferMemory done");
     }
     if (R_SUCCEEDED(created))
         svcCloseHandle(memory); // The pages stay with the kernel; scratch is not freed.
@@ -697,6 +707,12 @@ bool MapView(size_t windowOffset, uintptr_t source, size_t sourceOffset, size_t 
             sourceOffset, length, uint32_t(rc));
         RecordFailure(FailureOperation::MapView, rc, view, s_base + windowOffset, length, chunkOffset);
     }
+    else if (s_earlyChunkLogs < kEarlyChunkLogs)
+    {
+        // Trace the views of the first chunks: a boot that dies before main()
+        // must show whether A, C or E was the mapping that broke.
+        EarlyLog("map: view %d window %#zx length %#zx mapped", view, windowOffset, length);
+    }
     return R_SUCCEEDED(rc);
 }
 
@@ -713,12 +729,16 @@ bool MapChunk(size_t offset, size_t size, uintptr_t& sourceOut)
     std::memset(backing, 0, size);
 
     uintptr_t source = 0;
-    Result rc = 0;
-    if (s_backend == Backend::TransferMemory)
-    {
-        Handle memory = INVALID_HANDLE;
-        rc = svcCreateTransferMemory(&memory, backing, size, Perm_Rw);
-        if (R_FAILED(rc))
+    Result rc = 0;        if (s_backend == Backend::TransferMemory)
+        {
+            Handle memory = INVALID_HANDLE;
+            const bool trace = s_earlyChunkLogs < kEarlyChunkLogs;
+            if (trace)
+                EarlyLog("chunk %#zx: svcCreateTransferMemory(%p, %#zx)", offset, backing, size);
+            rc = svcCreateTransferMemory(&memory, backing, size, Perm_Rw);
+            if (trace)
+                EarlyLog("chunk %#zx: svcCreateTransferMemory rc %#x handle %#x", offset, uint32_t(rc), memory);
+            if (R_FAILED(rc))
         {
             Diag("chunk %#zx: svcCreateTransferMemory(%#zx) failed: %#x", offset, size, rc);
             RecordFailure(FailureOperation::CreateBacking, rc, -1, backing, size, offset);
@@ -882,16 +902,30 @@ uint8_t* Allocate()
 
 #ifdef __SWITCH2__
     // The hints are not trusted: a loader that does not fill the table still
-    // lets the syscalls through, so ask the kernel with a real mapping.
-    EarlyLog("allocate: ProbeProcessMemory begin (process %#x)", s_process);
-    if (s_process != INVALID_HANDLE && ProbeProcessMemory(s_process))
+    // lets the syscalls through, so ask the kernel with a real mapping. On
+    // Switch 2 the probe for process memory is skipped entirely: with kaiHEN
+    // 20261116, svcMapProcessCodeMemory (0x77) does not return an error there,
+    // it terminates the process, and early_boot.log stopped on that line after
+    // ReserveWindow() had already reserved the whole 4 GiB window. Transfer
+    // memory (0x15/0x51/0x52) is reachable and is the only backend used.
+    // kProbeProcessMemory is false, so the probe has no call site and the
+    // compiler drops ProbeProcessMemory from the binary entirely (the ELF no
+    // longer contains a single "probe process memory" string). A loader that
+    // grants 0x77 can set it true again.
+    constexpr bool kProbeProcessMemory = false;
+    EarlyLog("allocate: backend selection: process memory probe %s", kProbeProcessMemory ? "enabled" : "disabled");
+    bool usable = false;
+    if (kProbeProcessMemory && s_process != INVALID_HANDLE)
     {
-        EarlyLog("allocate: ProbeProcessMemory succeeded");
-        s_backend = Backend::ProcessMemory;
+        EarlyLog("allocate: ProbeProcessMemory begin (process %#x)", s_process);
+        usable = ProbeProcessMemory(s_process);
+        EarlyLog("allocate: ProbeProcessMemory %s", usable ? "succeeded" : "failed");
+        if (usable)
+            s_backend = Backend::ProcessMemory;
     }
-    else
+    if (!usable)
     {
-        EarlyLog("allocate: ProbeProcessMemory failed, ProbeTransferMemory begin");
+        EarlyLog("allocate: ProbeTransferMemory begin (0x15/0x51/0x52)");
         if (ProbeTransferMemory())
         {
             EarlyLog("allocate: ProbeTransferMemory succeeded");

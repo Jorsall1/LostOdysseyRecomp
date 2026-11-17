@@ -1,0 +1,107 @@
+Switch 2: pre-main crash fixed - transfer memory backend
+========================================================
+File changed: LostOdysseyRecomp/kernel/guest_address_space_switch.cpp (only .cpp, no headers)
+Date: 2026-11-16
+
+1. What early_boot.log proved
+-----------------------------
+The log from real hardware (kaiHEN 20261116, title takeover) ended after:
+
+    window: reserved 4096 MiB at 0x...
+    probe process memory: svcMapProcessCodeMemory(process 0x281fb, ...)
+
+and the process was gone. So:
+
+  * ReserveWindow(0x100000000, 0x200000) SUCCEEDED. The 4 GiB guest window
+    reservation is fine; that code was never the problem.
+  * svcMapProcessCodeMemory (SVC 0x77) does not return an error on Switch 2 -
+    it kills the process. The hint table agrees with that:
+        hints 0x73=0 0x74=0 0x75=0 0x77=0 0x78=0 0x15=1 0x51=0 0x52=0
+    Only 0x15 (svcCreateTransferMemory) is marked available.
+  * The kernel reports an ~8.8 GiB process address space
+    (total=0x234000000 used=0x233c28000), which is why the 4 GiB window fit.
+  * The previous boot produced no log at all because sdmc: was not mounted
+    during __libc_init_array; that was fixed in the previous session
+    (fsdevMountSdmc() in OpenEarlyLog()), and this log confirms it works.
+
+2. The fix
+----------
+On __SWITCH2__, Allocate() no longer probes process memory. SVC 0x77 is never
+issued before main():
+
+    constexpr bool kProbeProcessMemory = false;
+    ... if (kProbeProcessMemory && s_process != INVALID_HANDLE) -> ProbeProcessMemory()
+    ... otherwise -> ProbeTransferMemory() -> Backend::TransferMemory
+
+Because the probe now has no call site, the compiler drops ProbeProcessMemory
+from the binary completely: `strings LostOdysseyRecomp.elf | grep -c 'probe
+process memory'` returns 0. There is no remaining path in the boot that can
+execute svcMapProcessCodeMemory. MapChunk() takes its TransferMemory branch
+(svcCreateTransferMemory 0x15 per 2 MiB chunk) and MapView() uses
+svcMapTransferMemory (0x51) / svcUnmapTransferMemory (0x52).
+
+The flag is kept so a loader that does grant 0x77 can re-enable the old backend
+with a one-line edit.
+
+Consequences of the transfer memory backend (already handled in MapChunk()):
+  * A transfer memory maps from its first page, so the E view (0xE0000000) is
+    placed one 4 KiB page lower than A; the guest's very first E page stays
+    unmapped and is reported once in the log as
+    "transfer memory backend: E 0xe0000000-0xe0001000 stays unmapped".
+
+3. Logging (all lines fopen'd unbuffered + fflush after every line)
+------------------------------------------------------------------
+Every step of ProbeTransferMemory() is now traced:
+    probe transfer memory: memalign
+    probe transfer memory: svcCreateTransferMemory(%p, 0x1000)
+    probe transfer memory: svcCreateTransferMemory rc .. handle ..
+    probe transfer memory: virtmemLock before virtmemFindAslr
+    probe transfer memory: virtmemFindAslr -> %p
+    probe transfer memory: svcMapTransferMemory(handle, %p, 0x1000)
+    probe transfer memory: svcMapTransferMemory rc ..
+    probe transfer memory: reading back 0x1000 bytes at %p
+    probe transfer memory: read back matches|mismatch
+    probe transfer memory: write back matches|mismatch
+    probe transfer memory: svcUnmapTransferMemory / done
+    probe transfer memory: done, ok=%d
+
+And the first 8 commits, at three levels so a failure is localised:
+    allocate: backend selection: process memory probe disabled
+    allocate: ProbeTransferMemory begin (0x15/0x51/0x52)
+    allocate: ProbeTransferMemory succeeded
+    backend: transfer memory (0x15/0x51)
+    chunk %#zx: svcCreateTransferMemory(%p, 0x200000)
+    chunk %#zx: svcCreateTransferMemory rc .. handle ..
+    map: view 0|1|2|3 window %#zx length %#zx mapped
+    map: view N ... failed: rc ..        (on failure)
+    commit: chunk 0..7 offset/length -> mapped|failed (source)
+Chunk logging stops after 8 entries so gameplay does not do an SD write per
+2 MiB of guest memory.
+
+4. Build
+--------
+    export DEVKITPRO=/opt/devkitpro && source /opt/devkitpro/switch2vars.sh
+    cmake --build build -j20
+Result: exit 0, only kernel/guest_address_space_switch.o recompiled (gpu/renderer.cpp
+stayed cached), "[100%] Built target LostOdysseyRecomp", NRO packaged.
+Pre-existing warnings only (plume VK_USE_PLATFORM_VI_NN redefine, main.cpp u8path
+deprecation). No new warnings from this change.
+
+5. Artifact
+-----------
+build/LostOdysseyRecomp/LostOdysseyRecomp.nro  -> /mnt/c/Users/Jorda/Desktop/LostOdysseyRecomp.nro
+size 85,983,665 bytes, md5 e365b56bca0f80cc55924d66242ab0a7 (both copies identical).
+
+6. What to check in the next early_boot.log
+-------------------------------------------
+  * "backend: transfer memory (0x15/0x51)"  -> the backend choice is right.
+  * "probe transfer memory: done, ok=1"     -> 0x15/0x51 work under kaiHEN.
+  * "commit: chunk 0 .. mapped" and chunks 1..7 mapped, then main()'s
+    runtime log appears -> the pre-main path is past.
+  * If the log stops inside ProbeTransferMemory, the last line names the exact
+    syscall and its result code.
+
+Caveat: no Switch 2 hardware was available for this session. The absence of
+svcMapProcessCodeMemory from the binary and the presence of every trace string
+were verified statically in the built ELF; the boot itself still has to confirm
+that the transfer memory path runs to main().
