@@ -107,6 +107,22 @@ std::string Join(const NameList& list)
 
 __attribute__((constructor(101))) void ApplyEarly()
 {
+    // Switch 2 wrote every log line to the SD card before Log() returned
+    // (logger.h's LO_SWITCH_SYNC_LOG): a small line already costs one card
+    // write of tens of milliseconds. The loading path logs one line per
+    // archive read (kernel/io/file_system.cpp), so a map or sound-bank load
+    // paid a card write inside every guest read, while the guest held its own
+    // heap critical section: the rendering thread then waited seconds in
+    // RtlEnterCriticalSection and the loading screen stopped producing frames
+    // (2026-11-16 boot, frozen at "open 'game:\xenon_snd.fpd'").
+    // The queued writer is the default again: lines go to memory under the
+    // log mutex and the writer thread puts them on the card, so warnings and
+    // errors are still written before Log() returns and the rest follow within
+    // 500 ms (or 128 KiB). env.txt can set LO_SWITCH_SYNC_LOG=1 to opt back in,
+    // e.g. to keep the very last line before a crash.
+    if (!__real_getenv("LO_SWITCH_SYNC_LOG"))
+        setenv("LO_SWITCH_SYNC_LOG", "0", 1);
+
     constexpr const char* root = LO_SWITCH_DATA_ROOT;
     char path[512];
     std::snprintf(path, sizeof(path), "%s%s/env.txt", std::strncmp(root, "sdmc:", 5) == 0 ? "" : "sdmc:", root);

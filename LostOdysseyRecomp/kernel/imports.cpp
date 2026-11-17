@@ -222,7 +222,19 @@ void DumpGuestThreadStates()
             bt += fmt::format(" {:#x}", ret);
             frame = caller;
         }
-        LOG_WARNING("  tid={:#x} [{}] pcr={:#x} {} obj={:#x} lr={:#x} liveLr={:#x} for {} ms bt:{}", st->threadId, st->name[0] ? st->name : "?", st->pcr, st->what, st->object, st->lr, liveLr, running ? 0 : now - st->since, bt);
+        // A thread in front of a guest critical section: OwningThread holds the
+        // owner's PCR, so the dump names the thread that holds the lock. Without
+        // it a stall dump cannot tell a holder blocked in a kernel call (it is
+        // listed too) from one busy in guest code (which is not listed).
+        std::string holder;
+        if (st->object != 0 && st->what[0] != 'r' && std::strcmp(st->what, "RtlEnterCriticalSection") == 0 &&
+            st->object < PPC_MEMORY_SIZE && st->object + sizeof(XRTL_CRITICAL_SECTION) <= PPC_MEMORY_SIZE)
+        {
+            const auto* section = reinterpret_cast<const XRTL_CRITICAL_SECTION*>(g_memory.Translate(st->object));
+            holder = fmt::format(" holder={:#x} recursion={}", GuestCriticalSection::Encode(section->OwningThread),
+                GuestCriticalSection::Encode(uint32_t(section->RecursionCount)));
+        }
+        LOG_WARNING("  tid={:#x} [{}] pcr={:#x} {} obj={:#x}{} lr={:#x} liveLr={:#x} for {} ms bt:{}", st->threadId, st->name[0] ? st->name : "?", st->pcr, st->what, st->object, holder, st->lr, liveLr, running ? 0 : now - st->since, bt);
     }
 }
 

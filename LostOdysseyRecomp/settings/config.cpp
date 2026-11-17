@@ -214,6 +214,17 @@ Config Validate(Config value)
     // A minimum above its maximum is the maximum: no dynamic range.
     for (uint32_t mode = 0; mode < 2; ++mode)
         value.minimumHeight[mode] = std::min(value.minimumHeight[mode], SwitchMaximumHeight(value, mode == 1));
+#if defined(__SWITCH2__)
+    // The output size, not the scene. The handheld screen is 1920x1080 and the
+    // docked output 2560x1440, while the scene still renders at the Maximum
+    // resolution rows above (1080 rows handheld, 1440 docked). SDL's Switch
+    // driver forwards the window size to libnx's nwindow, which is what the
+    // Vulkan swap chain reads (thirdparty/plume/plume_vulkan.cpp), so this is
+    // the whole output path. gpu/video.cpp re-applies it on dock/undock through
+    // PreviewConfig and rebuilds the swap chain.
+    value.width = Docked() ? 2560u : 1920u;
+    value.height = Docked() ? 1440u : 1080u;
+#endif
     if (const uint32_t rows = RenderHeightOverride()) value.internalResolution = int(rows);
     else value.internalResolution = int(SwitchMaximumHeight(value, Docked()));
     value.shadowResolution = 1;

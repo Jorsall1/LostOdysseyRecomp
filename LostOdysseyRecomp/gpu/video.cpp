@@ -149,6 +149,10 @@ namespace plume {
 // and Event typedefs collide with the runtime's).
 struct NWindow;
 extern "C" NWindow* nwindowGetDefault(void);
+#if defined(__SWITCH2__)
+// Result nwindowSetDimensions(NWindow*, u32 width, u32 height); 0 is success.
+extern "C" unsigned nwindowSetDimensions(NWindow*, unsigned, unsigned);
+#endif
 #endif
 
 // LO_VK_CUSTOM_DRIVER=<soname>: load a custom Vulkan driver from
@@ -419,8 +423,15 @@ namespace gpu::video
 {
     namespace
     {
+#if defined(__SWITCH2__)
+        // The Switch 2 output: 1920x1080 handheld, 2560x1440 docked (settings::Validate).
+        // The switch 1 build keeps the 720p/1080p sizes its display driver offers.
+        constexpr uint32_t kMaxWidth = 2560;
+        constexpr uint32_t kMaxHeight = 1440;
+#else
         constexpr uint32_t kMaxWidth = 1920;
         constexpr uint32_t kMaxHeight = 1080;
+#endif
 
 #if !defined(LO_VIDEO_SUBMISSION_UNIT)
         SDL_Window* g_window = nullptr;
@@ -2545,6 +2556,23 @@ namespace gpu::video
             // but must never show a window or take focus from the desktop user.
             const bool background = getenv("LO_BACKGROUND") != nullptr;
             const auto config=settings::GetConfig();
+            int requestWidth = int(config.width), requestHeight = int(config.height);
+#if defined(__SWITCH2__)
+            // SDL's Switch driver sets the libnx window to the SDL window size when
+            // it creates the window, and fails creation when the display refuses
+            // that size. Ask for the target here first, so a docked 1440p request
+            // falls back to 1080p (the swap chain then follows the window) instead
+            // of leaving the game without a window at all.
+            if (nwindowSetDimensions(nwindowGetDefault(), unsigned(requestWidth), unsigned(requestHeight)) != 0 &&
+                requestHeight > 1080)
+            {
+                LOG_WARNING("switch: the display refused {}x{}, using 1920x1080", requestWidth, requestHeight);
+                requestWidth = 1920;
+                requestHeight = 1080;
+            }
+            LOG_INFO("switch: output {}x{} ({} mode)", requestWidth, requestHeight,
+                os::switch_platform::IsDocked() ? "docked" : "handheld");
+#endif
             SDL_WindowFlags flags = SDL_WINDOW_RESIZABLE | (background ? SDL_WINDOW_HIDDEN : 0);
 #if LO_PLATFORM_MACOS
             // macOS renders through plume's Metal backend (CAMetalLayer).
@@ -2568,8 +2596,8 @@ namespace gpu::video
             SDL_SetStringProperty(windowProperties, SDL_PROP_WINDOW_CREATE_TITLE_STRING, lo_version::WindowTitle);
             SDL_SetNumberProperty(windowProperties, SDL_PROP_WINDOW_CREATE_X_NUMBER, position);
             SDL_SetNumberProperty(windowProperties, SDL_PROP_WINDOW_CREATE_Y_NUMBER, position);
-            SDL_SetNumberProperty(windowProperties, SDL_PROP_WINDOW_CREATE_WIDTH_NUMBER, config.width);
-            SDL_SetNumberProperty(windowProperties, SDL_PROP_WINDOW_CREATE_HEIGHT_NUMBER, config.height);
+            SDL_SetNumberProperty(windowProperties, SDL_PROP_WINDOW_CREATE_WIDTH_NUMBER, requestWidth);
+            SDL_SetNumberProperty(windowProperties, SDL_PROP_WINDOW_CREATE_HEIGHT_NUMBER, requestHeight);
             SDL_SetNumberProperty(windowProperties, SDL_PROP_WINDOW_CREATE_FLAGS_NUMBER, flags);
 #if defined(__ANDROID__)
             // Landscape only, as the manifest asks. Without the hint SDL requests
@@ -3581,8 +3609,15 @@ namespace gpu::video
 #if LO_PLATFORM_SWITCH
         if (os::switch_platform::TakeOperationModeChanged()) {
             settings::PreviewConfig(settings::GetConfig());
-            LOG_NOTICE("switch: {} mode, scene at {}p", os::switch_platform::IsDocked() ? "docked" : "handheld",
-                       settings::GetConfig().internalResolution);
+            const auto switched = settings::GetConfig();
+            // The output follows the display (settings::Validate: 1920x1080
+            // handheld, 2560x1440 docked). The window apply below resizes the SDL
+            // window, whose Switch driver forwards the size to the libnx window,
+            // so the swap chain has to be rebuilt for the new extent.
+            g_forceSwapResize = true;
+            LOG_NOTICE("switch: {} mode, scene at {}p, output {}x{}",
+                       os::switch_platform::IsDocked() ? "docked" : "handheld", switched.internalResolution,
+                       switched.width, switched.height);
         }
 #endif
         // Service close even during an outstanding FG window handshake. The

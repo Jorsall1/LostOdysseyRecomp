@@ -1050,7 +1050,17 @@ uint32_t NtReadFile(uint32_t handleValue, uint32_t Event, uint32_t ApcRoutine, u
     // Keep the object alive through completion, without nesting the file lock
     // with the logger, APC queue or event wait machinery. Results are local.
     IO_TEST_STAGE(BeforeCompletion, handleValue);
-    LOG_KERNEL("{} off={:#x} len={:#x} -> {:#x}{}", handle->path.filename().string(), offset, Length, read, Event ? " (event)" : "");
+    // One line per read is what a save file or a config needs, but the loading
+    // path reads LO.fpd / xenon_snd.fpd in thousands of blocks: on the Switch
+    // each line was a card write (and even queued, thousands of formattings)
+    // inside the guest's own load sequence. Trace the first reads of the
+    // session in full, then one in 1024 with its offset, length and result, so
+    // the log still shows where a load is reading.
+    static thread_local uint32_t s_readTraceIndex = 0;
+    const uint32_t readTraceIndex = s_readTraceIndex++;
+    if (readTraceIndex < 256 || (readTraceIndex & 1023) == 1023)
+        LOG_KERNEL("{} off={:#x} len={:#x} -> {:#x}{}{}", handle->path.filename().string(), offset, Length, read,
+            Event ? " (event)" : "", readTraceIndex >= 256 ? fmt::format(" (read #{}, sampled)", readTraceIndex) : "");
 
     if (IoStatusBlock)
     {

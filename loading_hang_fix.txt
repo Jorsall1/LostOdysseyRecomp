@@ -1,0 +1,187 @@
+Switch 2: loading-screen hang after xenon_snd.fpd - root cause and fix
+=======================================================================
+Date: 2026-11-17
+Build: kaiHEN 20261116 title takeover, branch switch2-ouncevk, pure heap backend
+Files changed (all .cpp, no header touched, gpu/renderer.cpp stayed cached):
+  * LostOdysseyRecomp/os/switch/env_file.cpp
+  * LostOdysseyRecomp/kernel/io/file_system.cpp
+  * LostOdysseyRecomp/kernel/imports.cpp
+
+1. What the 10:04:33 boot showed
+--------------------------------
+  exit_code=0 after 96 s, 11 frames total, LOADING wheel visible, LO.FPI +
+  lo.fpd + xenon_loc.fpd + xenon_sys.fpd + xenon_snd.fpd loaded at 3.771 s,
+  2037/4738 shader pipelines compiled with 0 failures, then nothing:
+  completed=11 submitted=11 stage=idle/event pump.
+
+  runtime-1794927873371346.log, 7.680 s (GPU stall watchdog):
+
+    tid=0x29fdadaa [Guest Main] pcr=0x403000 KeDelayExecutionThread obj=0x0
+      lr=0x827cacfc liveLr=0x827cacfc
+      bt: 0x823224a8 0x82485c50 0x82485048 0x82484c24
+    tid=0xac532654 [Guest 82beca90] pcr=0x2134000
+      RtlEnterCriticalSection obj=0x510610 lr=0x823acd58 for 5026 ms
+    tid=0x8760ad5b [Guest 82beca90] pcr=0xef0000
+      KeWaitForSingleObject obj=0x55e374 lr=0x827c139c
+    tid=0xf2cb85b2 [Guest 82beca90] pcr=0xff1000
+      KeWaitForSingleObject obj=0x55e3c4 lr=0x827c139c
+
+2. What those addresses are (checked in LostOdysseyRecompLib/ppc)
+----------------------------------------------------------------
+  0x823224a8  return address inside sub_82322478, FRenderCommandFence::Wait:
+              the guest loop that reads the fence counter and calls
+              KeDelayExecutionThread(0). This is the normal loading wait; Guest
+              Main is not the bug, it is the victim. Its callers are the render
+              command flush (0x82485c50 -> sub_82322478) reached from the
+              rendering-thread paths at 0x82485048 / 0x82484c24, which is
+              sub_82484BE8 walking a command list and calling each command's
+              Execute through its vtable (`lwz r11,0(r3); lwz r11,8(r11); bctrl`
+              with lr = 0x82484C24).
+  0x823acd58  return address inside sub_823ACCB0, the guest heap allocator:
+              `lwz r3,1408(r30); bl RtlEnterCriticalSection`. r30 + 1408 is
+              therefore 0x510610, the heap's own critical section. The thread is
+              not spinning in emulated code: it is parked inside our HLE
+              RtlEnterCriticalSection waiting for that lock.
+  0x827c139c  return address inside sub_827C12E0, a periodic worker: it waits on
+              its event with a timeout, and on STATUS_TIMEOUT (258) does one
+              pass of housekeeping under a different section (event + 0x20,
+              r31+14928). obj = 0x55e374 and 0x55e3c4 are 0x50 apart - two
+              instances of the same object, so both threads are in that loop and
+              are not themselves deadlocked.
+
+3. Root cause
+-------------
+The load did not deadlock in the guest kernel objects; it starved on SD writes
+made from inside guest kernel calls.
+
+  (a) On __SWITCH2__, logger.h defaulted LO_SWITCH_SYNC_LOG to 1: every single
+      log line did fwrite + fflush on the log file before Log() returned. SanDisk
+      writes on this console take tens of milliseconds each (60-110 ms measured
+      earlier for 64 KiB), and they are serialized through g_writeMutex.
+  (b) The loading path logs per operation. kernel/io/file_system.cpp logged one
+      LOG_KERNEL line per NtReadFile - and it did so *before* publishing the
+      IOSB / signalling the completion event, so the guest's read did not
+      complete until the card had the line:
+          LOG_KERNEL("{} off={:#x} len={:#x} -> {:#x}{}", ...)
+      LO.fpd / xenon_snd.fpd (1.48 GB) are read in thousands of blocks, so a
+      load that should take a second turned into thousands of synchronous card
+      writes inside the guest's own load sequence.
+  (c) The guest loader holds its heap critical section (0x510610) across those
+      reads. The rendering thread needs the same section to allocate render
+      commands, which is exactly the 5026 ms RtlEnterCriticalSection observed.
+  (d) With the rendering thread parked and Guest Main in
+      FRenderCommandFence::Wait, the command processor has nothing to parse:
+      completed=11 submitted=11, stage=idle/event pump, no loading-screen tick,
+      so the wheel froze and stayed frozen for the rest of the run.
+
+Timeline fits the log: the freeze starts at the first big archive read
+(3.771 s), the heap lock has been held for over 5 s by the time the watchdog
+dumps at 7.680 s, and the process only ends when the harness stops it.
+
+4. Why the GPU/XMA alias hint is not the cause
+----------------------------------------------
+Backend::Heap does leave 0xA0000000..0xBFFFFFFF as a distinct range (physical
+view) and 0x00000000..0x1FFFFFFF as a distinct range, with no hardware alias, so
+A/C/E no longer share pages. That loss is real but it is not this hang:
+  * the XMA context array and every device buffer are reached through
+    0xA0000000 + (physical & 0x1FFFFFFF) in apu/xma.cpp, gpu/renderer.cpp,
+    gpu/command_processor.cpp and gpu/video.cpp, i.e. through the A view, which
+    is the same range the guest writes;
+  * EnsureBacked() returns AlreadyBacked immediately on the heap backend, so
+    the XMA path never waits on a mapping, and the 0xA0000000 contexts
+    ("xma: 320 contexts at 0xa0000000") were created and used without a fault;
+  * the failed boot had zero shader failures and no unbacked-read report, and
+    the stalled threads are in the allocator, not in XMA or GPU code.
+Nothing in the dump points at an aliasing read returning stale zeroes.
+
+5. Changes
+----------
+5.1 os/switch/env_file.cpp - queued log writer is the default again
+    ApplyEarly() (constructor priority 101, which runs before every C++
+    static initializer, including logger.h's g_syncLog) now sets
+        LO_SWITCH_SYNC_LOG=0
+    when env.txt/process environment do not set it. Effect: Log() appends to
+    the in-memory queue under the log mutex and returns; the writer thread puts
+    the lines on the card.
+      * warnings and errors are still written before Log() returns:
+        logger.h's path is `if (g_syncLog || type == Error || type == Warning)
+        DrainPending()` - with g_syncLog now 0, those two types keep the
+        synchronous flush, so crash diagnostics survive;
+      * everything else is batched: the writer wakes every 500 ms and whenever
+        the queue passes 128 KiB, i.e. SD traffic is one write per pass instead
+        of one write per line, which is what the request asked for (flush on
+        warnings/errors, otherwise batched) without touching the header;
+      * env.txt can still set LO_SWITCH_SYNC_LOG=1 to get per-line flushing back
+        (env.txt is applied after the default and wins).
+
+5.2 kernel/io/file_system.cpp - no log line per archive block
+    The per-read trace is now sampled: the first 256 reads of a thread are
+    logged in full (startup, saves, configs, small files), then one in 1024 with
+    its offset, length and result and a "(read #N, sampled)" marker. The offset/
+    length/result information stays available for diagnosing a stuck load, but
+    a 1.48 GB archive no longer formats and queues ~23,000 lines while the guest
+    holds its load locks.
+
+5.3 kernel/imports.cpp - the stall dump now names the lock holder
+    DumpGuestThreadStates() decodes the section when a thread is parked in
+    RtlEnterCriticalSection and prints
+        holder=<owning PCR> recursion=<count>
+    next to obj. Both fields are stored big-endian by design (see
+    docs/notes/critical-section-endian.md), so they are decoded with
+    GuestCriticalSection::Encode. This makes the next hardware log answer the
+    one question this dump could not: whether the holder is blocked in a kernel
+    call too (it then appears in the same list) or is busy inside guest code
+    (it does not appear) - i.e. starvation versus a genuine lock cycle. It is
+    log-only; the lock path itself is unchanged.
+
+6. Build and artifact
+---------------------
+    export DEVKITPRO=/opt/devkitpro
+    source /opt/devkitpro/switch2vars.sh
+    cmake --build build -j20
+    BUILD_EXIT=0
+    "[100%] Linking CXX executable LostOdysseyRecomp.elf"
+    "Packaging LostOdysseyRecomp.nro"
+    "[100%] Built target LostOdysseyRecomp"
+
+No header was edited - os/logger.h still has its 2026-11-16 23:00 mtime - so
+the LO_SWITCH_SYNC_LOG default was moved into a .cpp rather than into the
+header, as requested. gpu/renderer.o did compile once in this build, but not
+because of this change: it was already stale in the build tree, because
+build/LostOdysseyRecomp/generated/lo_build_revision.h had been regenerated at
+10:22 today, after the previous renderer compile (2026-11-16 23:00). The
+objects that this change forces are only os/switch/env_file.o,
+kernel/io/file_system.o and kernel/imports.o (plus the link and packaging
+steps), so the next .cpp-only builds are back to the usual ~25 s.
+Warnings are the pre-existing ones only (main.cpp u8path deprecation,
+imports.cpp memset of XVIDEO_MODE through a guest pointer).
+
+Artifact:
+    build/LostOdysseyRecomp/LostOdysseyRecomp.nro
+      size 86,016,433 bytes, md5 26d7f7ba37c5eae471d79605758014a2
+    copied to /mnt/c/Users/Jorda/Desktop/LostOdysseyRecomp.nro (identical md5)
+
+7. What to check in the next boot
+---------------------------------
+  * The loading screen should now keep ticking (completed/submitted rising)
+    right where it froze before, i.e. through the xenon_snd.fpd phase.
+  * If it still stalls, the watchdog line for RtlEnterCriticalSection now ends
+    with holder=<PCR> recursion=<n>:
+      - holder PCR equal to a tid listed in the same dump -> a real lock cycle;
+        the pair of PCRs names both sides, and the next step is to break that
+        specific ordering in the HLE of the blocking call;
+      - holder PCR not listed anywhere -> the holder is busy in guest code
+        (invisible to the dump), which points at an emulation defect in what it
+        is polling, not at this logging path.
+  * runtime-*.log should be far shorter/slower-growing during a load, and
+    stderr.log still carries the driver's own output.
+
+8. Limitations
+--------------
+No Switch 2 hardware was available in this session: the fix is derived from the
+provided 10:04:33 log and the recompiled functions, and verified only by a clean
+build, packaging and static inspection of the edited paths. The starvation chain
+(per-line SD flush -> slow guest reads -> heap lock held -> rendering thread
+parked -> frozen wheel) explains every line of the dump, but it is confirmed
+only when the next hardware boot keeps presenting frames through the sound-bank
+load. The alias loss of Backend::Heap remains a real, separate limitation.

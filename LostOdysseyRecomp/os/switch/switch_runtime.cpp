@@ -9,6 +9,7 @@
 #include <switch.h>
 #include <sys/iosupport.h>
 #include <atomic>
+#include <chrono>
 #include <cinttypes>
 #include <cstdarg>
 #include <cstdio>
@@ -815,6 +816,12 @@ void SetScreenAwake(uint32_t mask, uint32_t reasons)
     mutexUnlock(&g_awakeMutex);
 }
 
+#if defined(__SWITCH2__)
+// Below: L + R + Plus + Minus held for 1.5 s flushes the logs and leaves to the
+// HOME menu even when the guest, the render thread or a loading screen hangs.
+void StartExitWatchdog();
+#endif
+
 void Initialize(const std::filesystem::path& dataRoot)
 {
     std::error_code ec;
@@ -901,6 +908,9 @@ void Initialize(const std::filesystem::path& dataRoot)
     }
     appletLockExit();
     appletHook(&g_operationModeHook, OnAppletEvent, nullptr);
+#if defined(__SWITCH2__)
+    StartExitWatchdog();
+#endif
 }
 
 void AllowExit()
@@ -982,6 +992,97 @@ void ExitNow()
     svcExitProcess();
     __builtin_unreachable();
 }
+
+#if defined(__SWITCH2__)
+namespace
+{
+// L + R + Plus + Minus, held together: the way out of a frozen game. The pad is
+// read on its own libnx thread straight from HID's shared memory, so the
+// combination still works while the applet's HOME handling (SDL runs it on the
+// event thread, which a hung GPU or guest thread can keep out of the loop) and
+// every guest thread are stuck.
+Thread g_exitWatchThread;
+bool g_exitWatchStarted = false;
+constexpr uint64_t kExitWatchPollNs = 100'000'000ull; // 100 ms
+constexpr auto kExitWatchHold = std::chrono::milliseconds(1500);
+
+// The applet Exit request on its own thread, then the end of the process even if
+// the reply never comes: ExitNow waits up to 100 s for that reply, which a
+// frozen title cannot afford when the player wants hbmenu back. Draining the
+// logs first keeps the last lines on the card.
+[[noreturn]] void ExitToHbmenu()
+{
+    os::logger::DrainForExit();
+    std::fflush(stdout);
+    std::fflush(stderr);
+    if (&__nx_win_exit) // libnx closes the vi layer and display before Exit
+        __nx_win_exit();
+    appletUnlockExit();
+    static std::atomic<bool> answered{false};
+    static Thread requestThread;
+    if (R_SUCCEEDED(threadCreate(&requestThread, [](void*) {
+            serviceDispatch(appletGetServiceSession_SelfController(), 0); // Exit
+            answered.store(true, std::memory_order_release);
+            for (;;)
+                svcSleepThread(UINT64_MAX);
+        }, nullptr, nullptr, 0x4000, 0x2C, -2)) && R_SUCCEEDED(threadStart(&requestThread)))
+    {
+        for (int poll = 0; poll < 20 && !answered.load(std::memory_order_acquire); ++poll)
+            svcSleepThread(int64_t(kExitWatchPollNs));
+    }
+    svcExitProcess();
+}
+
+void ExitWatchdogMain(void*)
+{
+    // Own pad state, so it does not depend on SDL's controller handling having
+    // started or on the main thread ever running again.
+    hidInitialize();
+    padConfigureInput(1, HidNpadStyleSet_NpadStandard);
+    PadState pad;
+    padInitializeDefault(&pad);
+    constexpr uint64_t combo = HidNpadButton_L | HidNpadButton_R | HidNpadButton_Plus | HidNpadButton_Minus;
+    std::chrono::steady_clock::time_point heldSince{};
+    for (;;)
+    {
+        svcSleepThread(int64_t(kExitWatchPollNs)); // a kernel sleep: nothing else has to run
+        padUpdate(&pad);
+        if ((padGetButtons(&pad) & combo) != combo)
+        {
+            heldSince = {};
+            continue;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (heldSince == std::chrono::steady_clock::time_point{})
+        {
+            heldSince = now;
+            continue;
+        }
+        if (now - heldSince < kExitWatchHold)
+            continue;
+        // stderr here: this file does not include os/logger.h (libnx's Mutex and
+        // Event typedefs collide with the runtime's), and stderr goes to
+        // stderr.log and the network log.
+        std::fprintf(stderr, "[watchdog] L+R+Plus+Minus held for 1.5 s, leaving to the HOME menu\n");
+        ExitToHbmenu();
+    }
+}
+} // namespace
+
+void StartExitWatchdog()
+{
+    if (g_exitWatchStarted)
+        return;
+    g_exitWatchStarted = true;
+    // Above the game's threads (0x3B) so busy cores cannot starve it, below
+    // SDL's audio and the log writer (0x2A).
+    if (R_SUCCEEDED(threadCreate(&g_exitWatchThread, ExitWatchdogMain, nullptr, nullptr, 0x8000, 0x2B, -2)) &&
+        R_SUCCEEDED(threadStart(&g_exitWatchThread)))
+        return;
+    g_exitWatchStarted = false;
+    std::fprintf(stderr, "[watchdog] the exit watchdog thread could not be started\n");
+}
+#endif
 
 void ShowError(const std::string& summary, const std::string& details)
 {

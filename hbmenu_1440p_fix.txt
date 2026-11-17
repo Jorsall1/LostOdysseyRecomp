@@ -1,0 +1,151 @@
+Switch 2: background exit-to-hbmenu watchdog and 1080p/1440p output
+====================================================================
+Date: 2026-11-17
+Branch: switch2-ouncevk (kaiHEN 20261116 title takeover, heap backend)
+Files changed (all .cpp, no header touched):
+  * LostOdysseyRecomp/os/switch/switch_runtime.cpp  (watchdog)
+  * LostOdysseyRecomp/settings/config.cpp           (output size per mode)
+  * LostOdysseyRecomp/gpu/video.cpp                 (present clamp, window
+                                                     creation, dock/undock)
+
+1. Background exit-to-hbmenu watchdog (L + R + Plus + Minus, 1.5 s)
+-------------------------------------------------------------------
+1.1 What it is
+    A libnx thread of its own, started from os::switch_platform::Initialize()
+    (the same place the applet lock, the operation-mode hook and the idle
+    watcher are set up), so it exists for the whole run:
+
+        threadCreate(&g_exitWatchThread, ExitWatchdogMain, nullptr, nullptr,
+                     0x8000, 0x2B, -2)
+
+    Priority 0x2B: above the game's threads (0x3B) so busy cores cannot starve
+    it, below SDL's audio and the log writer (0x2A). Nothing in it touches the
+    guest, the renderer, SDL or the log mutex.
+
+1.2 How it reads the pad
+    It does not go through SDL. It opens its own pad state and reads HID's
+    shared memory directly:
+
+        hidInitialize();
+        padConfigureInput(1, HidNpadStyleSet_NpadStandard);
+        padInitializeDefault(&pad);   // No1 + Handheld
+        for (;;) {
+            svcSleepThread(100 ms);   // kernel sleep: no other thread has to run
+            padUpdate(&pad);
+            if ((padGetButtons(&pad) & (L|R|Plus|Minus)) == all four) ...
+        }
+
+    This is the point of the feature: the applet's HOME/quit handling runs
+    inside SDL_PumpEvents on the video thread, which a stalled GPU worker or a
+    guest thread holding a lock keeps out of the event loop - exactly the state
+    the 10:04:33 boot ended in. The watchdog thread is independent of all of it,
+    so the combination still works while the loading screen is frozen.
+
+1.3 What 1.5 s held does
+    Combo held for 1500 ms (100 ms polls, steady_clock) ->
+        stderr: "[watchdog] L+R+Plus+Minus held for 1.5 s, leaving to the HOME menu"
+        os::logger::DrainForExit()      // queued lines reach the card
+        fflush(stdout); fflush(stderr)  // stderr.log and netlog
+        __nx_win_exit()                 // libnx closes the vi layer and display
+        appletUnlockExit()
+        IAppletCommonFunctions Exit (serviceDispatch SelfController cmd 0) on a
+            small libnx thread
+        wait at most 2 s for the reply (20 x 100 ms)
+        svcExitProcess()
+
+    ExitNow() was not reused because it waits up to 100 s for the Exit reply
+    (its loop only breaks early when the request fails), which is not "leaving
+    immediately"; the wait here is bounded to 2 s and the process ends either
+    way. The Exit request is still sent so the applet manager takes the title
+    down normally and hbmenu comes back, instead of the donor title being left
+    in a bad state.
+
+2. Output resolution: 1920x1080 handheld, 2560x1440 docked
+----------------------------------------------------------
+2.1 The size the game actually presents at
+    On this platform the output is libnx's nwindow: SDL's Switch video driver
+    forwards the SDL window size to nwindowSetDimensions (SWITCH_CreateWindow
+    and SWITCH_SetWindowSize), plume's Vulkan swap chain reads
+    nwindowGetDimensions (plume_vulkan.cpp: VulkanSwapChain::getWindowSize), and
+    the display scales that. Until now the config carried the PC default
+    1280x720 and SDL's switch driver reset the window to 1280x720 on every
+    undock.
+
+2.2 settings/config.cpp (settings::Validate, __SWITCH2__ only)
+        value.width  = Docked() ? 2560u : 1920u;
+        value.height = Docked() ? 1440u : 1080u;
+
+    Validate() runs at startup, when settings are applied, and again from
+    PreviewConfig() - which is what the dock/undock path calls - so the current
+    mode's size follows the console. The *scene* height is unchanged: the
+    Maximum resolution rows still use SwitchAutomaticHeight (1080 rows handheld,
+    1440 rows docked, settings/config.h) with the existing dynamic-resolution
+    minimum, so 1440p docked is supersampled from the 1440-row scene and 1080p
+    handheld from the 1080-row scene.
+
+2.3 gpu/video.cpp
+    * kMaxWidth / kMaxHeight are 2560x1440 under __SWITCH2__ (they were
+      1920x1080), so PresentFrame no longer drops a 1440p output and the
+      upload buffer covers it. Every other platform keeps 1920x1080.
+    * Window creation: before SDL creates its window on the libnx window, the
+      requested size is tried with nwindowSetDimensions. If the display refuses
+      1440p (docked) the request falls back to 1920x1080 and logs
+      "switch: the display refused WxH, using 1920x1080", so the game still gets
+      a window instead of failing creation. The applied size is logged once:
+      "switch: output WxH (docked|handheld)".
+    * Dock/undock: the existing TakeOperationModeChanged branch in
+      PumpWindowEvents now logs
+      "switch: <mode> mode, scene at <N>p, output WxH" and sets
+      g_forceSwapResize, because the window apply below it calls
+      SDL_SetWindowSize(config.width, config.height) -> nwindowSetDimensions,
+      which changes the swap chain extent. SDL's own dock handler still resets
+      the window to 720p/1080p, but it runs earlier in the same SDL_PumpEvents
+      pass, so the config size wins.
+
+3. Build and artifact
+---------------------
+    export DEVKITPRO=/opt/devkitpro
+    source /opt/devkitpro/switch2vars.sh
+    cmake --build build -j20
+    BUILD_EXIT=0
+    "[80%] Linking CXX executable LostOdysseyRecomp.elf"
+    "Packaging LostOdysseyRecomp.nro"
+    "[100%] Built target LostOdysseyRecomp"
+
+No header was edited (os/logger.h, settings/config.h and gpu/video.h keep their
+2026-11-16 mtimes). Objects rebuilt: gpu/video.o, os/switch/switch_runtime.o,
+settings/config.o (plus the previous set from the loading-hang fix). gpu/renderer.o
+recompiled too, but only because the build tree's generated
+lo_build_revision.h is regenerated by the LoBuildRevision target every build -
+not from a header edit. Only the pre-existing warnings remain (main.cpp u8path
+deprecation, imports.cpp memset of XVIDEO_MODE through a guest pointer).
+
+Artifact:
+    build/LostOdysseyRecomp/LostOdysseyRecomp.nro
+      size 86,020,529 bytes, md5 55faa53992bfa1198df7703322dd50c2
+    copied to /mnt/c/Users/Jorda/Desktop/LostOdysseyRecomp.nro (identical md5)
+
+4. What to check on the console
+-------------------------------
+  * Startup log lines: "switch: output 1920x1080 (handheld)" (or 2560x1440
+    docked); if "the display refused" appears, that mode stays at 1080p and the
+    game still renders.
+  * Dock/undock: "switch: docked mode, scene at 1440p, output 2560x1440" and the
+    reverse; the frame must keep presenting through the change (the swap chain
+    is rebuilt in the same pass).
+  * Freeze recovery: hold L + R + Plus + Minus for 1.5 s on any frozen screen
+    (loading wheel, black frame, menu). stderr.log gets the [watchdog] line, the
+    runtime log is drained, and hbmenu returns within about 2 s. L + R + Plus +
+    Minus is not part of the game's own input map.
+
+5. Limitations
+--------------
+No Switch 2 hardware in this session: the watchdog and the resolution change
+are verified by a clean build/link/package and by reading the paths they use
+(SDL's Switch driver -> nwindowSetDimensions -> plume swap chain extent), not by
+a device run. Two device-dependent points remain unproven: whether libnx's
+nwindow/vi accepts 2560x1440 docked on this firmware (the fallback keeps the
+game bootable if it does not; the log says which happened), and whether the
+1440p present path keeps 60 FPS with the 1440-row scene. The watchdog itself
+uses only HID shared memory and a kernel sleep, so it does not depend on any of
+that.
