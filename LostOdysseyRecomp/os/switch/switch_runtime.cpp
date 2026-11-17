@@ -66,6 +66,15 @@ namespace apu { void SetPaused(bool paused); }        // apu/audio.cpp: silences
 namespace apu::xma { void Shutdown(); }               // apu/xma.cpp: stops the decoder worker
 void DumpGuestThreadStates();                         // kernel/imports.cpp: what every guest thread waits on
 
+namespace os::switch_platform
+{
+// Set while the process is ending: a guest thread that reaches a file syscall
+// parks instead of entering fsdev, because libnx's application exit unmounts the
+// SD card under it (io/file_system.cpp reads this; see EndProcessToHbmenu).
+// Defined below, in a .cpp on both sides: no header carries it.
+extern std::atomic<bool> g_suppressGuestIo;
+}
+
 namespace
 {
 // stderr (fd 2) goes through this device: the file plus the network log.
@@ -227,6 +236,13 @@ void QuiesceAudio()
 //    while that teardown runs.
 [[noreturn]] void EndProcessToHbmenu()
 {
+    // Set before anything else, so the fallback path below has it too. From here
+    // on the process is ending and libnx's application exit will run
+    // fsdevUnmountAll; a guest thread of a hung game can still reach a file
+    // syscall from under that teardown (item 5 of retroarch_quit_fix.txt), so
+    // guest file I/O parks in io/file_system.cpp from now on instead of calling
+    // into fsdev on a device that is being unmounted.
+    os::switch_platform::g_suppressGuestIo.store(true, std::memory_order_release);
     if (g_endingProcess.exchange(true, std::memory_order_acq_rel))
     {
         // Another thread is already ending the process. Wait for it, but not
@@ -876,6 +892,10 @@ void ApplyAwakeLocked(uint32_t previous, uint32_t reasons)
 
 namespace os::switch_platform
 {
+// See EndProcessToHbmenu: guest file syscalls park while the process ends
+// (io/file_system.cpp reads it through an extern declaration).
+std::atomic<bool> g_suppressGuestIo{false};
+
 bool RawAppend(const char* fileName, const char* data, size_t size)
 {
     if (!g_rawReady || size == 0)
@@ -1181,8 +1201,13 @@ bool g_exitWatchStarted = false;
 constexpr uint64_t kExitWatchPollNs = 100'000'000ull; // 100 ms
 constexpr auto kExitWatchHold = std::chrono::milliseconds(1500);
 // Time the normal quit (SDL_EVENT_QUIT -> GPU owner cleanup -> exit_code=0) gets
-// before this thread ends the process itself.
-constexpr auto kExitWatchGrace = std::chrono::milliseconds(2000);
+// before this thread ends the process itself. 4 s, not 2: the GPU worker leaves
+// a WAIT_REG_MEM within microseconds of RequestStopForExit and the owner's
+// Shutdown then finishes in well under a second on a healthy build, so this is
+// pure headroom for a slow first-ever GPU teardown (Vulkan device destroy, SD
+// flush) - and it keeps the live-thread std::exit below as the last resort it is
+// meant to be, instead of racing a teardown that was still making progress.
+constexpr auto kExitWatchGrace = std::chrono::milliseconds(4000);
 // A guest thread dump 15 s in, whether or not the GPU stalled: a screen that
 // stops progressing with frames still presenting (the 100% loading bar) leaves
 // no other trace of which guest thread is waiting and on what.
@@ -1233,7 +1258,7 @@ void ExitWatchdogMain(void*)
             // stderr here: this file does not include os/logger.h (libnx's Mutex
             // and Event typedefs collide with the runtime's), and stderr goes to
             // stderr.log and the network log.
-            std::fprintf(stderr, "[watchdog] the quit did not finish within 2 s: ending the process for hbmenu "
+            std::fprintf(stderr, "[watchdog] the quit did not finish within 4 s: ending the process for hbmenu "
                                  "(applet exit unlocked, libnx teardown)\n");
             ExitToHbmenu();
         }
@@ -1259,7 +1284,7 @@ void ExitWatchdogMain(void*)
         quitting = true;
         quitSince = now;
         std::fprintf(stderr, "[watchdog] %s: asking the game to quit cleanly (SDL_EVENT_QUIT); "
-                             "if it does not finish in 2 s the process ends here\n",
+                             "if it does not finish in 4 s the process ends here\n",
                      comboDone ? "L+R+Plus+Minus held for 1.5 s" : "the applet requested exit (HOME -> X)");
         if (!settings::quit_action::PushQuit())
             quitSince -= std::chrono::milliseconds(1500); // no event queue: go to the teardown sooner

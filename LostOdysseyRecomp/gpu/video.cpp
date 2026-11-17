@@ -1415,7 +1415,14 @@ namespace gpu::video
                 // ExitProcess would run DLL detach in the driver and SDKs first.
                 TerminateProcess(GetCurrentProcess(), EXIT_FAILURE);
 #endif
+#if LO_PLATFORM_SWITCH
+                // A stopped device: no teardown (the original intent of the
+                // _Exit below), but still the handover - next load and applet
+                // exit lock - because a bare _Exit here leaves the lock held.
+                os::switch_platform::ForceExitWithoutTeardown();
+#else
                 (discord_rpc::Shutdown(), std::_Exit(EXIT_FAILURE));
+#endif
             }));
         }
 #endif
@@ -2071,8 +2078,15 @@ namespace gpu::video
         // safer than running their destructors against an undrained device.
         // Pipeline recipes and the driver cache are still written (no GPU wait).
         if (const auto flush = os::shaderlog::ExitFlush().exchange(nullptr)) flush();
+#if LO_PLATFORM_SWITCH
+        // Undrained device: the same immediate end the _Exit below chose (no
+        // libnx teardown, no destructors), minus the held applet exit lock and
+        // the missing next load.
+        os::switch_platform::ForceExitWithoutTeardown();
+#else
         std::fflush(nullptr);
         (discord_rpc::Shutdown(), std::_Exit(EXIT_FAILURE));
+#endif
     }
 #endif
 
@@ -2463,7 +2477,11 @@ namespace gpu::video
             g_temporalUpscaler->ShutdownAfterGpuDrain();
             if (!g_temporalUpscaler->ShutdownComplete()) {
                 LOG_ERROR("video: SR shutdown incomplete; retaining unresolved resources and device");
+#if LO_PLATFORM_SWITCH
+                os::switch_platform::ForceExitWithoutTeardown();
+#else
                 std::fflush(nullptr); (discord_rpc::Shutdown(), std::_Exit(EXIT_FAILURE));
+#endif
             }
         }
 #if defined(LO_ENABLE_D3D12_FG) && defined(_WIN32)

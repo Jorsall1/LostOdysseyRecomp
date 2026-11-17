@@ -1,0 +1,137 @@
+Lost Odyssey Recomp - Switch 2 (kaiHEN 20261117.1, title takeover)
+Two additions for the hang exit. .cpp files only; no header was touched, so
+gpu/renderer.o stayed cached and the build was 3 translation units.
+
+====================================================================
+1. "Quit to hbmenu" in the Plus + Minus menu   (settings/menu.cpp)
+====================================================================
+
+Where it is
+  Gameplay tab, after "Restore game defaults" and "Quit to Main Menu":
+  buttons / D-pad down past Quit to Main Menu -> "Quit to hbmenu" (value: Quit).
+  Also reachable with the pointer (a click on the value or an A press).
+
+What it does
+  `settings::quit_action::PushQuit()` - exactly the call the title's Quit dialog
+  uses: SDL_PushEvent(SDL_EVENT_QUIT). There is no dialog, no guest task, no
+  guest call at all: confirming the row is one SDL event.
+
+  The rest is the already-audited cooperative path:
+    SDL_EVENT_QUIT -> video.cpp quit request -> command_processor
+    RequestStopForExit()/Wake() -> FinishRequestedExit() ->
+    ExitNow() -> EndProcessToHbmenu(): envSetNextLoad("sdmc:/hbmenu.nro"),
+    appletUnlockExit(), std::exit(0) (libnx application exit).
+  On this build the NRO chain-loads sdmc:/hbmenu.nro, so the row lands in hbmenu
+  without the donor title being closed.
+
+How the row fits the layout without touching menu.h
+  GameRowCount (10) is asserted by the header's static_assert and by
+  tools/tests/menu_flow_test.cpp, so the count was not changed. menu.cpp adds
+  (Switch 2 only):
+      kGameHbmenuRow  = GameRowCount      (10, an action)
+      kGameRowsTotal  = GameRowCount + 1  (11, the tab's navigation length)
+  and uses kGameRowsTotal where the tab's row count is needed (Publish's hidden
+  row skip, arrow-key wrapping). Everything else (layout, scrolling, help box)
+  already works from the row vector, and 11 visible rows is the layout's
+  documented maximum for a non-scrolling tab.
+  A small TabAction() wrapper makes the row an action for pointer hit-testing
+  too; graphics_menu::IsAction (a header) only knows the shared rows.
+
+  The row is not hidden in title-entry mode (TitleModeHidden), which is correct:
+  with no game loaded, quitting to hbmenu is still meaningful.
+
+====================================================================
+2. Guest I/O gate during the exit teardown
+   (os/switch/switch_runtime.cpp + kernel/io/file_system.cpp)
+====================================================================
+
+The race (retroarch_quit_fix.txt, item 5)
+  EndProcessToHbmenu() ends with std::exit(0) -> libnx __appExit ->
+  fsdevUnmountAll(), which unmounts sdmc: while guest threads of a hung game are
+  still running. A guest thread that enters a file syscall at that moment calls
+  into fsdev on a device that is being unmounted - the crash/hang that made the
+  watchdog path unreliable.
+
+The flag
+  os/switch/switch_runtime.cpp:
+      namespace os::switch_platform { std::atomic<bool> g_suppressGuestIo; }
+  No header carries it (no .h was edited): switch_runtime.cpp declares it extern
+  above EndProcessToHbmenu, and kernel/io/file_system.cpp declares the same
+  extern in its own translation unit.
+
+  It is set as the *first* statement of EndProcessToHbmenu(), before the
+  g_endingProcess exchange, so all three entry routes have it:
+    - the cooperative quit (title Quit, the new menu row),
+    - the L+R+Plus+Minus / HOME -> X watchdog (including the second-entrant
+      fallback that finishes a wedged teardown),
+    - the crash report and the fatal-signal handler.
+
+The gate
+  kernel/io/file_system.cpp: ParkGuestIoForExit() reads the flag (acquire) and,
+  when set, parks the calling thread in
+      for (;;) SleepNanoseconds(INT64_MAX);   // svcSleepThread(INT64_MAX)
+  It is called first thing in the four guest file entry points:
+      OpenFileHandle  (NtCreateFile, NtOpenFile)
+      NtReadFile
+      NtWriteFile
+      NtReadFileScatter
+  A guest thread that arrives after the decision to exit therefore never reaches
+  fsdev; the exit thread owns the unmount and the process ends under it.
+
+  Deliberately NOT gated: os::switch_platform::RawAppend (its own fsp-srv
+  session), the logger and stderr. g_suppressGuestIo only guards the guest
+  syscall handlers, so exit.log / stderr.log / crash_report.txt are still written
+  all the way through the teardown, and the normal path before EndProcessToHbmenu
+  (save writes, disc reads, shader loads) is untouched.
+
+  A parked guest thread is not resumed: the process ends a moment later, so
+  parking is the correct terminal state, not a flow-control trick. No return codes
+  are fabricated in guest memory, so nothing downstream can read a bogus I/O
+  success.
+
+====================================================================
+3. Watchdog text fix (same file)
+====================================================================
+
+  kExitWatchGrace has been 4000 ms since the previous round, but two log lines
+  still said "2 s". They now say 4 s, so stderr.log matches the code:
+    [watchdog] ... asking the game to quit cleanly (SDL_EVENT_QUIT); if it does
+               not finish in 4 s the process ends here
+    [watchdog] the quit did not finish within 4 s: ending the process for hbmenu
+               (applet exit unlocked, libnx teardown)
+
+====================================================================
+Build and artifact
+====================================================================
+
+  export DEVKITPRO=/opt/devkitpro && source /opt/devkitpro/switch2vars.sh &&
+  cmake --build build -j20
+  -> BUILD_EXIT=0, 3 translation units rebuilt (file_system.o,
+     switch_runtime.o, menu.o), 0 undefined symbols, no new warnings (the
+     -Wmultichar lines in kernel/xdm.h are pre-existing).
+
+  NRO: 86,028,721 bytes, md5 a967c39ebe753875799865b6f6c15f69
+  build/LostOdysseyRecomp/LostOdysseyRecomp.nro copied to
+  /mnt/c/Users/Jorda/Desktop/LostOdysseyRecomp.nro, same md5 verified there.
+
+====================================================================
+What is still open (unchanged, and honest)
+====================================================================
+
+  * No hardware here: the row's behaviour on the console, and whether the parked
+    thread really keeps fsdev happy during the unmount, can only be confirmed by
+    a run. Signatures to look for in state/logs/:
+      "[watchdog] ... asking the game to quit cleanly" then
+      "[exit] next load sdmc:/hbmenu.nro: set" then
+      "[exit] leaving through libnx's application exit" and hbmenu on screen.
+    If the console instead shows am's fatal application error, check the
+    "[exit]" lines in stderr.log - the first one missing names the step.
+  * The gate parks threads; it does not stop them. A guest thread already inside
+    fsdev *before* the flag was set is still inside it. Making that impossible
+    needs a real guest-thread stop/join, which needs a header and design change.
+  * The new row only helps when the overlay opens. If the hang also stalls the
+    presentation/update thread that feeds the menu, the overlay will not appear;
+    L + R + Plus + Minus (the watchdog thread, priority 0x2B, reads HID shared
+    memory directly) remains the way out of that state.
+  * kaiHEN / hbmenu behaviour itself (next load honoured, R hook kept) is still
+    a hardware question.

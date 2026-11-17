@@ -68,6 +68,26 @@ bool TitleModeHidden(int tab, int r)
     if (tab == 0) return r < GameRetailRowCount || r == GameRestoreRow || r == GameMainMenuRow;
     return tab == 1 && (r == AudioVoiceRow || r == AudioMusicRow || r == AudioEffectsRow);
 }
+#if defined(__SWITCH2__)
+// The last action of the Gameplay tab on Switch 2: leaves through the cooperative
+// quit (SDL_EVENT_QUIT -> the GPU owner's cleanup -> EndProcessToHbmenu -> next
+// load sdmc:/hbmenu.nro), which needs no live guest thread, so it is the exit a
+// player can still use while the game hangs. GameRowCount stays the shared
+// layout's count (menu.h owns it and the menu tests assert it), so this row is
+// appended and the Switch 2 tab is one row longer.
+constexpr int kGameHbmenuRow = GameRowCount;
+constexpr int kGameRowsTotal = GameRowCount + 1;
+#else
+constexpr int kGameHbmenuRow = -1;
+constexpr int kGameRowsTotal = GameRowCount;
+#endif
+// An action row: confirming it runs it. graphics_menu::IsAction lives in a
+// header and knows the rows of the shared layout only; the Switch 2 row is an
+// action too, for the pointer.
+bool TabAction(int t, int r)
+{
+    return graphics_menu::IsAction(t, r) || (kGameHbmenuRow >= 0 && t == 0 && r == kGameHbmenuRow);
+}
 std::atomic<int> mouseTab{-1}, mouseRow{-1};
 std::atomic<int> mouseDialog{-1};
 std::atomic<uint16_t> mouseAction{0};
@@ -1444,7 +1464,7 @@ void Publish(uint8_t *base, uint32_t config)
     // Opened from the title menu, Gameplay and Audio start with hidden rows.
     if (tab == 0 || tab == 1)
     {
-        const int count = tab == 0 ? GameRowCount : AudioRowCount;
+        const int count = tab == 0 ? kGameRowsTotal : AudioRowCount;
         for (int i = 0; i < count && TitleModeHidden(tab, row); ++i)
             row = (row + 1) % count;
     }
@@ -1631,6 +1651,10 @@ void Publish(uint8_t *base, uint32_t config)
         next.rows.back().pageEntry = true;
         addAction(L"Restore game defaults", L"恢復遊戲預設設定", Tr(L"Restore", L"恢復"));
         addAction(L"Quit to Main Menu", L"退出到主選單", Tr(L"Return", L"返回"));
+#if defined(__SWITCH2__)
+        // Not hidden with the title-mode rows: quitting to hbmenu is always valid.
+        addAction(L"Quit to hbmenu", L"退出到 hbmenu", Tr(L"Quit", L"退出"));
+#endif
         for (int i = 0; i < GameRowCount; ++i)
             next.rows[i].hidden = TitleModeHidden(0, i);
     }
@@ -1984,6 +2008,11 @@ void Publish(uint8_t *base, uint32_t config)
     if (tab == 0 && row == GameControlsRow)
         next.help = Tr(L"Button prompts, vibration, and the controller and keyboard buttons.",
                        L"按鍵提示、震動，以及控制器與鍵盤的按鍵配置。");
+#if defined(__SWITCH2__)
+    if (tab == 0 && row == kGameHbmenuRow)
+        next.help = Tr(L"Closes the game and returns to hbmenu. Works while the game is stuck.",
+                       L"關閉遊戲並返回 hbmenu，遊戲卡住時也能使用。");
+#endif
     if (tab == 3 && row == SystemGameLanguageRow)
         next.help = !edit.gameLanguagePack.empty()
             ? Tr(L"Language pack from the mods folder. Voices and the rest stay in its base language. Applies after restarting.",
@@ -2825,7 +2854,7 @@ void PointerClick(float x, float y, bool reverse)
         // Pointer adjustment is explicit left/right, not a synthetic A press.
         // Keep confirmation reserved for action rows and modal dialogs.
         mouseAction = snapshot.tab == 2 && hit == size_t(GraphicsRow::HdrPeak) &&
-                      x >= 600 && x < 820 ? 0x1000 : graphics_menu::IsAction(snapshot.tab, int(hit))
+                      x >= 600 && x < 820 ? 0x1000 : TabAction(snapshot.tab, int(hit))
             ? (reverse ? 0 : 0x1000) : (reverse || (hdrLevel && x < 600) ||
                ((snapshot.rows[hit].singleValue || snapshot.rows[hit].choices.size() > 5) && x < 458) ? 4 : 8);
     }
@@ -3923,7 +3952,7 @@ PPC_FUNC(sub_822F19B0)
         row = 0;
         status.clear();
     }
-    const int count = tab == 0 ? GameRowCount : tab == 1 ? AudioRowCount : tab == 2 ? int(GraphicsRow::Count) : SystemRowCount;
+    const int count = tab == 0 ? kGameRowsTotal : tab == 1 ? AudioRowCount : tab == 2 ? int(GraphicsRow::Count) : SystemRowCount;
     // Provider-specific rows keep their logical ids and navigation skips them
     // when unavailable. Keyboard Enter reaches the menu as GAMEPAD_START
     // (hid.cpp), so one branch covers gamepad Start and Enter.
@@ -4332,6 +4361,19 @@ PPC_FUNC(sub_822F19B0)
         mainMenuChoice = 1; // Require an explicit selection of Return; Back always cancels.
         status.clear();
     }
+#if defined(__SWITCH2__)
+    if ((input & 0x1000) && tab == 0 && row == kGameHbmenuRow)
+    {
+        // Straight to the quit, with no dialog and no guest task: PushQuit queues
+        // SDL_EVENT_QUIT, the GPU owner thread stops the command processor and
+        // leaves through EndProcessToHbmenu (next load sdmc:/hbmenu.nro, applet
+        // exit lock released, libnx's application exit). If there is no event
+        // queue the watchdog's L + R + Plus + Minus and HOME -> X still exit.
+        if (!quit_action::PushQuit())
+            status = Tr(L"The quit could not be queued. Try again, or hold L + R + Plus + Minus.",
+                        L"無法排入退出要求。請再試一次，或按住 L + R + + + -。");
+    }
+#endif
     if ((input & 0x1000) && tab == 3 && row == SystemImportRow)
     {
 #if LO_PLATFORM_ANDROID

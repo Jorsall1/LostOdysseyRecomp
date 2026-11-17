@@ -3,6 +3,7 @@
 #include "disc_set.h"
 #include "io_diagnostics.h"
 #include "file_system_test.h"
+#include <atomic>
 #include <cerrno>
 #include <cstdlib>
 #include <memory>
@@ -16,6 +17,7 @@
 #include <modding/text_overlay.h>
 #include <os/logger.h>
 #include <optional>
+#include <os/switch_platform.h>
 #include <os/user_paths.h>
 #ifdef _WIN32
 #include <io.h>
@@ -76,6 +78,27 @@ static size_t GuestFwrite(const void* data, size_t size, std::FILE* file)
 #else
 static size_t GuestFread(void* out, size_t size, std::FILE* file) { return std::fread(out, 1, size, file); }
 static size_t GuestFwrite(const void* data, size_t size, std::FILE* file) { return std::fwrite(data, 1, size, file); }
+#endif
+
+#if LO_PLATFORM_SWITCH
+// os/switch/switch_runtime.cpp: set when the process has decided to end.
+namespace os::switch_platform { extern std::atomic<bool> g_suppressGuestIo; }
+
+// libnx's application exit runs fsdevUnmountAll, and a guest thread of a hung
+// game can still arrive at a file syscall while that unmount is in progress
+// (item 5 of retroarch_quit_fix.txt: the live-thread fsdev race). Once the
+// process is ending, park such a thread here for good: the exit thread owns the
+// unmount and the process ends under it, instead of the two racing.
+static void ParkGuestIoForExit()
+{
+    if (!os::switch_platform::g_suppressGuestIo.load(std::memory_order_acquire))
+        return;
+    for (;;)
+        os::switch_platform::SleepNanoseconds(std::numeric_limits<int64_t>::max());
+}
+#define GUEST_IO_PARK_FOR_EXIT() ParkGuestIoForExit()
+#else
+#define GUEST_IO_PARK_FOR_EXIT() ((void)0)
 #endif
 
 // Host read timing for the opt-in periodic Switch log.
@@ -715,6 +738,7 @@ static std::string GuestAnsiString(const XANSI_STRING* str)
 static uint32_t OpenFileHandle(be<uint32_t>* FileHandleOut, uint32_t DesiredAccess, XOBJECT_ATTRIBUTES* Attributes,
     XIO_STATUS_BLOCK* IoStatusBlock, uint32_t CreateDisposition, uint32_t CreateOptions)
 {
+    GUEST_IO_PARK_FOR_EXIT();
     std::string name = GuestAnsiString(Attributes ? Attributes->Name.get() : nullptr);
     const uint32_t rootDirectory = Attributes ? uint32_t(Attributes->RootDirectory) : 0;
     std::filesystem::path hostPath;
@@ -980,6 +1004,7 @@ static uint32_t ReadWithRanges(FileHandle& handle, uint64_t offset, uint8_t* out
 uint32_t NtReadFile(uint32_t handleValue, uint32_t Event, uint32_t ApcRoutine, uint32_t ApcContext,
     XIO_STATUS_BLOCK* IoStatusBlock, void* Buffer, uint32_t Length, be<uint64_t>* ByteOffset)
 {
+    GUEST_IO_PARK_FOR_EXIT();
     std::shared_ptr<FileHandle> handle;
     io_diagnostics::Request trace("NtReadFile", handleValue, UINT64_MAX, Length, IoGuestPcr());
     handle = GetKernelObject<FileHandle>(handleValue);
@@ -1085,6 +1110,7 @@ uint32_t NtReadFile(uint32_t handleValue, uint32_t Event, uint32_t ApcRoutine, u
 uint32_t NtWriteFile(uint32_t handleValue, uint32_t Event, uint32_t ApcRoutine, uint32_t ApcContext,
     XIO_STATUS_BLOCK* IoStatusBlock, const void* Buffer, uint32_t Length, be<uint64_t>* ByteOffset)
 {
+    GUEST_IO_PARK_FOR_EXIT();
     std::shared_ptr<FileHandle> handle;
     io_diagnostics::Request trace("NtWriteFile", handleValue, UINT64_MAX, Length, IoGuestPcr());
     handle = GetKernelObject<FileHandle>(handleValue);
@@ -1556,6 +1582,7 @@ uint32_t NtDeviceIoControlFile(uint32_t handleValue, uint32_t Event, uint32_t Ap
 uint32_t NtReadFileScatter(uint32_t handleValue, uint32_t Event, uint32_t ApcRoutine, uint32_t ApcContext,
     XIO_STATUS_BLOCK* IoStatusBlock, be<uint64_t>* SegmentArray, uint32_t Length, be<uint64_t>* ByteOffset)
 {
+    GUEST_IO_PARK_FOR_EXIT();
     std::shared_ptr<FileHandle> handle;
     io_diagnostics::Request trace("NtReadFileScatter", handleValue, UINT64_MAX, Length, IoGuestPcr());
     handle = GetKernelObject<FileHandle>(handleValue);

@@ -1,0 +1,171 @@
+Switch 2 clean-exit pass against the libounce / kaiHEN rules
+============================================================
+Two .cpp files changed, no header touched (renderer.o stayed cached).
+Build: exit 0, 6 translation units, 0 undefined symbols.
+NRO: 86,028,721 bytes, md5 fc93f7f34fd2b55a4e3151e47dadd6ff
+     copied to /mnt/c/Users/Jorda/Desktop/LostOdysseyRecomp.nro (md5 verified)
+
+The two rules, restated as constraints on this code:
+  R1  envSetNextLoad + appletUnlockExit + std::exit(0) is the clean exit, and it
+      is only clean when active worker/GPU/SD users have stopped. Racing
+      fsdevUnmountAll / hidExit / __nx_gpu_exit against live threads is the
+      failure mode.
+  R2  OunceVK allows one vi surface per process, so the Vulkan/SDL/GPU teardown
+      has to finish on the GPU owner before anything else ends the process.
+
+1. Plus + Minus -> Quit (settings/menu.cpp)
+-------------------------------------------
+Confirmed again, and the answer is unchanged: there is no Quit row in the
+Plus + Minus menu, on __SWITCH2__ or anywhere else. That menu builds Controls,
+Restore game defaults, "Quit to Main Menu" (line 1633 - returns to the retail
+title menu), Debug, Achievements, Mods, Import discs & DLC, Add to Steam,
+Shader bundle, Prepare shaders again, Save settings. None of them ends the
+process, and the file contains exactly one quit_action::PushQuit() call.
+
+The "Quit game" that does exist is the title screen's dialog (line ~4587 inside
+UpdateTitleQuit): idle title menu, Back (TitleQuitButton 0x0020) / Backspace ->
+"Yes" -> quit_action::PushQuit() -> SDL_PushEvent(SDL_EVENT_QUIT). It is not
+guarded on Switch, so on __SWITCH2__ it is reachable and it does queue the quit.
+The #if !defined(__SWITCH__) lines in menu.cpp are the Steam-shortcut include,
+Discord presence, a Switch row layout and a desktop-only action block. Nothing
+about a Quit is hidden.
+
+If a Quit row is wanted in the Plus + Minus menu itself it is one addAction plus
+one dispatch case to PushQuit(); I did not add UI, since item 1 asked to verify.
+
+2. WAIT_REG_MEM and every GPU poll loop leave in microseconds, not 10 ms
+------------------------------------------------------------------------
+CommandProcessor has four long-lived loops, all of them `while (m_running)`:
+  line  821  WorkerMain (the command/present loop)
+  line  907  VsyncMain
+  line  964  InterruptMain
+  line 1518  the WAIT_REG_MEM poll loop
+Nothing in them sleeps uninterruptibly. The only blocking wait is
+
+  m_waitProgress.wait_for(lock, wait / 0x100 ms, predicate)
+  predicate: interrupts progressed || !m_running || m_wake
+
+and RequestStopForExit() does m_running.store(false) plus notify_all() on
+m_waitProgress (and the other two condition variables). RequestExit() calls it
+first thing. So a quit releases a stalled WAIT_REG_MEM on the next predicate
+evaluation - microseconds after the notify, not the wait's own milliseconds and
+never the 5 s / 30 s log deadlines. The same notify_all wakes VsyncMain's and
+InterruptMain's waits.
+
+One window did not look at the flag, and it is closed: the WAIT_REG_MEM operand
+re-read loop (200 iterations of a 1 ms sleep, used while the CPU is still
+filling the buffer) ran before the poll loop. It now returns as soon as
+m_running is false (already committed in 8e096516-era work; the guard is at
+command_processor.cpp:1445). With that, the worst case between PushQuit and the
+worker returning is whatever call it is inside:
+  - renderer::ServiceOcclusionQueries() and video::PumpEvents() in the poll loop
+    return on their own (PumpEvents is why the queued SDL_EVENT_QUIT is consumed
+    even while the worker is stalled);
+  - a present or a guest code callback has to return before the loop re-tests -
+    that is the only unbounded-in-principle part, and it is the same work the
+    frame was already doing.
+There are no other poll loops in command_processor.cpp that ignore the flag.
+
+3. Every video.cpp exit path
+----------------------------
+There were five bare std::_Exit sites in gpu/video.cpp. Audited one by one:
+
+  a) FinishRequestedExit(), "exit without an owner-thread shutdown request"
+     (audit_report_v3 Finding 3.7/2.6): was fflush(nullptr) + _Exit(EXIT_FAILURE)
+     with the applet exit lock held and no next load. Now
+     os::switch_platform::ForceExitWithoutTeardown() under LO_PLATFORM_SWITCH;
+     desktop unchanged.
+  b) ExitAfterGpuStop()'s dialog thread (device loss): the process has to end -
+     a stopped device never draws again - and a teardown would hang. It kept
+     its hard end but not the handover: on Switch it now also calls
+     ForceExitWithoutTeardown(), so hbmenu comes back and the exit lock is
+     released.
+  c) Shutdown()'s "no proven completion or lost-device disposal boundary"
+     terminate: same treatment. This is the path R2 protects - it deliberately
+     does NOT run destructors against an undrained device or a second vi
+     surface; it just no longer leaves the process in a state that breaks
+     kaiHEN.
+  d) Shutdown()'s "SR shutdown incomplete" terminate: same treatment.
+  e) FinishRequestedExit()'s desktop branch (_Exit(EXIT_SUCCESS)) and the
+     Streamline (_WIN32) terminate: not compiled/reachable on Switch, left as is.
+Also checked main.cpp: RunGuest's fallback now ends through
+ForceExitWithoutTeardown() (e9726ef3); main.cpp:894 is the host-only
+"prepare shaders only" preparation mode, which never starts guest threads.
+
+So on Switch 2 every exit is now one of two shapes, and both do the handover:
+  clean:    video::RequestExit -> GPU owner Shutdown -> ExitNow ->
+            EndProcessToHbmenu -> envSetNextLoad + appletUnlockExit + std::exit(0)
+  immediate: ForceExitWithoutTeardown -> envSetNextLoad + appletUnlockExit +
+            flushed stdio + svcExitProcess (no libnx teardown, no destructors)
+There is no bare std::_Exit left on a Switch path.
+
+4. The live-thread std::exit(0) race, and the 4 s grace
+-------------------------------------------------------
+kExitWatchGrace went from 2000 to 4000 ms (switch_runtime.cpp). Rationale:
+WAIT_REG_MEM now leaves in microseconds and the owner's Shutdown has the whole
+4 s window, so the watchdog's std::exit - the one that genuinely races live
+threads - becomes the last resort instead of a competitor. On a healthy quit
+the teardown finishes long before either figure (the 2026-11-17 clean runs
+logged exit_code=0 well inside 2 s); on a real hang you now wait 4 s instead of
+2 s before the console goes back to hbmenu. The same grace covers HOME -> X,
+because the watchdog polls appletMainLoop() itself and queues the same
+SDL_EVENT_QUIT when the main loop is stuck.
+
+EndProcessToHbmenu() ordering, verified line by line (it is correct as asked):
+  single-entrant guard (g_endingProcess)
+  -> QuiesceAudio()          mute + XMA shutdown on their own thread, <=250 ms
+  -> os::logger::DrainForExit()
+  -> fflush(stdout) / fflush(stderr)   (never fflush(nullptr))
+  -> envHasNextLoad() ? envSetNextLoad("sdmc:/hbmenu.nro", "\"sdmc:/hbmenu.nro\"")
+     with an "[exit] next load ..." line either way
+  -> appletUnlockExit()
+  -> std::exit(0)   (__libnx_exit -> __appExit: appletExit, hidExit,
+                     fsdevUnmountAll, socketExit -> __nx_win_exit -> __nx_exit)
+  -> svcExitProcess() only if exit() itself gave up.
+The handover happens after the audio quiesce and the log drain, as required.
+
+5. Can a guest thread still meet fsdevUnmountAll?
+-------------------------------------------------
+Yes on the clean path, and this is the honest answer: std::exit(0) runs
+__appExit on whichever thread ends the process (the GPU owner for a normal quit,
+the watchdog thread for the combo/grace, a faulting thread for a signal), and
+nothing in this port stops the guest threads first - there is no stop-all API in
+the tree, and joining them from the exiting thread can deadlock on a lock the
+exiting thread holds. So between fsdevUnmountAll/hidExit/socketExit starting and
+the process actually exiting, a guest thread can still issue an fs/socket/hid
+call into a service that is being torn down. What reduces the window: audio is
+stopped first, the GPU owner is stopped on every path that reaches here from
+video::RequestExit, the logs are drained, and with the 4 s grace the watchdog no
+longer fires while the owner is still making progress.
+
+The watchdog/fallback path is the opposite case: the second entrant waits 5 s
+and then ends with svcExitProcess, which runs none of fsdevUnmountAll / hidExit /
+socketExit / appletExit. So no unmount race there at all - but also no
+application exit, so if it ever triggers, am may still consider the applet to
+have gone away abnormally (next load and the released exit lock are what keep
+kaiHEN's hbmenu working).
+
+If a future change wants the clean path to be strictly safe, it needs a guest
+thread quiesce point (stop at the next guest-thread safepoint, then join with a
+timeout) before std::exit. That is a header/design change and needs hardware
+validation, so it is not in this pass.
+
+6. What the next log will show
+------------------------------
+  exit.log        "exit: started" -> "exit: logs flushed" -> "exit: ending the
+                  process (hbmenu, no applet Exit request)"
+  stderr.log      "[exit] next load sdmc:/hbmenu.nro: set (0x0)"
+  watchdog        nothing from it on a clean quit. If you see
+                  "[watchdog] L+R+Plus+Minus held for 1.5 s: asking the game to
+                  quit cleanly" followed by "[watchdog] the quit did not finish
+                  within 4 s", the clean path really did wedge.
+  crash_report.txt  the exit came from SIGABRT/SIGSEGV, not from a quit.
+
+7. Diff summary
+---------------
+  gpu/video.cpp                 +18 -0   FinishRequestedExit's no-owner branch,
+                                         the device-loss dialog exit, Shutdown's
+                                         undrained-device exit and the SR exit
+                                         now do the Switch handover
+  os/switch/switch_runtime.cpp  +7  -2   kExitWatchGrace 2 s -> 4 s, comment
+  No header changed.
