@@ -228,8 +228,15 @@ void QuiesceAudio()
 [[noreturn]] void EndProcessToHbmenu()
 {
     if (g_endingProcess.exchange(true, std::memory_order_acq_rel))
-        for (;;) // another thread is already ending the process
-            svcSleepThread(UINT64_MAX);
+    {
+        // Another thread is already ending the process. Wait for it, but not
+        // forever: if that teardown wedges, the watchdog (which ends here too)
+        // must still take the console back to hbmenu instead of hanging with it.
+        for (int tenth = 0; tenth < 50; ++tenth)
+            svcSleepThread(100'000'000ull);
+        svcExitProcess();
+        __builtin_unreachable();
+    }
     QuiesceAudio();
     os::logger::DrainForExit(); // lines still queued for the log writer
     // Not fflush(nullptr): it locks every open file, and a crashed thread may

@@ -967,8 +967,6 @@ uint8_t* Allocate()
     // reaches guest memory through A (XMA, GPU copies, the unbacked-read
     // repair) keeps working; the hardware-alias paths are the documented loss.
     Diag("backend: heap (no svcMap*, A/C/E are distinct ranges of one %#zx MiB block)", kSize >> 20);
-    Diag("backend: %s", s_backend == Backend::ProcessMemory ? "process memory (0x77/0x74)"
-                                                            : "transfer memory (0x15/0x51)");
 #endif
     // The guest null page stays unmapped: chunk 0 is committed from 0x1000.
     return s_base;
@@ -985,8 +983,11 @@ bool Commit(uint32_t address, uint32_t size)
     if (!s_base || size == 0)
         return s_base != nullptr;
     const uint64_t end = uint64_t(address) + size;
-    if (end > kStarts[2])
-        return false; // C and E are aliases of A and are committed with it.
+    // C and E are aliases of A on the mapping backends and are committed with it.
+    // The heap backend has no aliases (A, C and E are separate ranges of the same
+    // 4 GiB block), so every range of the window is committed on its own.
+    if (end > (s_backend == Backend::Heap ? kSize : kStarts[2]))
+        return false;
 
     std::lock_guard lock(s_mutex);
     for (uint64_t chunk = address / kChunk; chunk * kChunk < end; ++chunk)
@@ -1044,16 +1045,24 @@ bool Commit(uint32_t address, uint32_t size)
 
 Backing EnsureBacked(uint32_t address, uint32_t size)
 {
-    if (!s_base || address < kPage || size == 0)
+    if (!s_base || address < kPage)
         return Backing::Failed;
-    // C and E alias A: commit the A pages behind them.
+    if (size == 0)
+        return Backing::AlreadyBacked; // nothing to back, as on the desktop hosts
+    // C and E alias A on the mapping backends: commit the A pages behind them.
+    // The heap backend has no aliases, and translating there would report the
+    // page backed while the range the caller actually reads stays uninitialized
+    // memalign memory.
     uint64_t start = address;
-    if (start >= kStarts[3])
-        start = start - kStarts[3] + kStarts[1] + kPage;
-    else if (start >= kStarts[2])
-        start = start - kStarts[2] + kStarts[1];
+    if (s_backend != Backend::Heap)
+    {
+        if (start >= kStarts[3])
+            start = start - kStarts[3] + kStarts[1] + kPage;
+        else if (start >= kStarts[2])
+            start = start - kStarts[2] + kStarts[1];
+    }
     const uint64_t end = start + size;
-    if (end > kStarts[2])
+    if (end > (s_backend == Backend::Heap ? kSize : kStarts[2]))
         return Backing::Failed;
     bool backed = true;
     for (uint64_t chunk = start / kChunk; chunk * kChunk < end; ++chunk)

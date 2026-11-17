@@ -1,0 +1,244 @@
+Lost Odyssey Recomp - Switch 2 (kaiHEN title takeover, branch switch2-ouncevk)
+Full bug-check audit of the Switch 2 port, 2026-11-17 (after commit b149b351)
+
+===============================================================================
+1. SCOPE AND METHOD
+===============================================================================
+Every source file the port changed was reviewed: the Switch 2 CMake/toolchain
+files, kernel/guest_address_space_switch.cpp (919 lines added), the runtime
+(os/switch/switch_runtime.cpp, 505 added), kernel/imports.cpp, apu/audio.cpp,
+gpu/command_processor.cpp, gpu/video.cpp, gpu/hor_plus.cpp,
+cpu/guest_alloc_lock.cpp, cpu/poll_wait.cpp, cpu/guest_frustum_box.cpp,
+main.cpp, settings/*, os/logger.h, os/switch/env_file.cpp,
+os/switch/cpu_profiler_switch.cpp, kernel/io/file_system.cpp and the plume
+Switch 2 patch.
+
+Method: read the committed diffs against 6ccea198^, trace each new code path to
+its callers and to the libnx/plume behaviour it depends on, cross-check the
+address model (guest virtual / A / C / E views, Backend::Heap) against
+kernel/memory.h and guest_address_space_layout.h, then build.
+
+VERDICT: no remaining blocker in the code that the port added. Five defects were
+found and are fixed (one of them a plausible repeat of the 1.983 s premature
+WAIT_REG_MEM release, one a real contract violation in the heap backend's page
+backing). Seven further issues are reported below without a change because they
+are either deliberate trade-offs or cannot be verified without hardware.
+
+===============================================================================
+2. DEFECTS FOUND AND FIXED
+===============================================================================
+2.1 HIGH - gpu/command_processor.cpp: the WAIT_REG_MEM alias fallback read the
+    low guest view without backing it.
+
+  The fallback added in b149b351 reads the same word through the guest's low
+  view: g_memory.Translate(wordAddress). Memory::Translate is only
+
+      void* Translate(size_t offset) const noexcept
+      {
+          if (offset) assert(offset < PPC_MEMORY_SIZE);
+          return base + offset;
+      }
+
+  no mapping check and, in a release build, no assert either. Two consequences:
+
+    * ProcessMemory / TransferMemory backends: the low view is a different
+      2 MiB chunk from the A view the wait polls, and it need not be mapped.
+      A memory wait on an address the guest never committed would fault inside
+      the GPU worker thread instead of falling through.
+    * Backend::Heap: the 4 GiB window is one memalign() block, so the read
+      cannot fault - but an uncommitted chunk is uninitialized heap memory, not
+      zero. A `!=` or `>=` wait (op 4/5) would then be satisfied by random bytes,
+      the fallback would copy them into the A window, and the wait would be
+      released early. That is the same failure class as the 1.983 s release:
+      the CPU writing on while NVK reads the ring.
+
+  Fix: back the low view once, before the poll loop, and gate the fallback on
+  that result. It matches the contract in guest_address_space.h ("the desktop
+  builds read zeros from such pages"): an unallocated page now reads zero, so it
+  cannot satisfy a wait by accident.
+
+      const bool lowViewBacked = isMemory && GuestAddressSpace::EnsureBacked(
+          pollRegAddr & ~3u, uint32_t(sizeof(uint32_t))) != GuestAddressSpace::Backing::Failed;
+      ...
+      if (lowViewBacked)   // was: if (low)
+      {
+          const uint32_t lowValue = GpuSwap(*low, pollRegAddr & 3);
+
+  The call is outside the loop, so it costs one EnsureBacked per WAIT_REG_MEM
+  packet, not one per poll iteration. Added #include <kernel/guest_address_space.h>.
+
+2.2 MEDIUM - kernel/guest_address_space_switch.cpp: EnsureBacked and Commit
+    treated C and E as aliases of A on the heap backend, where they are not.
+
+  On Horizon the C and E views are further mappings of A's code memory, so
+  EnsureBacked translated any address >= 0xC0000000 back to its A page, and
+  Commit refused anything past kStarts[2] (0xC0000000) for the same reason. Both
+  statements are false under Backend::Heap: all four views are separate ranges of
+  the one 4 GiB block (the port documents this itself: "a write through A no
+  longer shows up through C or E").
+
+  Effect: EnsureBacked(0xC0100000) reported AlreadyBacked without ever touching
+  the C chunk, so a guest read through C/E returned uninitialized memalign bytes
+  where the desktop hosts return zeros - and Commit could never repair it because
+  the address range was rejected.
+
+  Fix: translate C/E only on the mapping backends, and let the heap backend
+  commit anywhere in the window (its chunks are real pages, not aliases):
+      if (s_backend != Backend::Heap) { ... C/E translation ... }
+      if (end > (s_backend == Backend::Heap ? kSize : kStarts[2])) ...
+  Also: EnsureBacked(size == 0) now returns AlreadyBacked instead of Failed, as
+  the desktop stub does; nothing needs to be backed for an empty range.
+
+2.3 MEDIUM - kernel/guest_address_space_switch.cpp: the boot diagnostics printed
+    the wrong backend on Switch 2.
+
+  Inside the __SWITCH2__ block, after the heap window is confirmed, the code
+  still ran
+
+      Diag("backend: %s", s_backend == Backend::ProcessMemory ? "process memory (0x77/0x74)"
+                                                              : "transfer memory (0x15/0x51)");
+
+  s_backend is Backend::Heap there, so every early_boot.log and every crash
+  dialog said "backend: transfer memory (0x15/0x51)" although no transfer memory
+  syscall is ever made. Removed; the preceding line ("backend: heap (no svcMap*,
+  A/C/E are distinct ranges ...)") is the accurate one.
+
+2.4 MEDIUM - os/switch/switch_runtime.cpp: a second entrant into
+    EndProcessToHbmenu() slept forever.
+
+      if (g_endingProcess.exchange(true, ...))
+          for (;;) svcSleepThread(UINT64_MAX);
+
+  The watchdog and the crash handlers all end here. If the first entrant wedges
+  in the teardown (std::exit runs fsdevUnmountAll, socketExit, the logger's
+  atexit archive; a crashed thread can hold one of those locks), the thread that
+  exists specifically to rescue a hang hung with it and the console had no way
+  out but HOME.
+
+  Fix: wait 5 s for the first entrant, then svcExitProcess(). Exactly one thread
+  still performs the teardown, and a wedged teardown now degrades to a hard exit
+  instead of a permanently frozen console.
+
+2.5 LOW - apu/audio.cpp: ResolveFrameView() could compute an A view from a
+    pointer outside the guest window.
+
+      const uint32_t address = uint32_t(reinterpret_cast<uintptr_t>(words) - base);
+
+  A host pointer below base underflows to a large value and, if its low 29 bits
+  landed under 0x20000000, the helper would test an unrelated guest page for
+  audio. Added an explicit range check (null base, before base, or past the
+  4 GiB window) that returns the submitted pointer unchanged.
+
+===============================================================================
+3. FOUND, NOT CHANGED (deliberate or unverifiable here)
+===============================================================================
+3.1 OnFatalSignal() is not async-signal-safe. EndProcessToHbmenu() calls
+    QuiesceAudio(), which creates a 16 KiB thread (threadCreate allocates on the
+    newlib heap), then std::exit's atexit teardown. If the fault happened while
+    the faulting thread held the malloc or logger lock, the handler can block
+    instead of leaving. Acceptable: the L+R+Plus+Minus watchdog is the fallback,
+    and 2.4 now keeps that fallback from hanging behind the same exit.
+
+3.2 Whether Horizon delivers a hardware fault as SIGSEGV is not established.
+    libnx reports faults through __libnx_exception_handler on its own exception
+    stack; std::signal(SIGSEGV, ...) only covers faults the C library raises.
+    Registering it is harmless (libnx does not synthesise the signal), but the
+    detailed register/backtrace report is still the __libnx_exception_handler
+    path. SIGABRT from NVK/Mesa abort() is the case this actually catches.
+
+3.3 The out-of-memory new_handler ends with std::_Exit(1), which skips libnx's
+    teardown, so hbmenu is not chain-loaded on an OOM death. Deliberate: exit()
+    would allocate and re-enter the handler, and EndProcessToHbmenu() allocates
+    a thread. The report still lands on the card.
+
+3.4 The L+R+Plus+Minus watchdog calls appletMainLoop() from its own thread while
+    SDL owns the applet event loop. libnx's message queue is thread-safe, but the
+    two consumers split applet messages; the app's own appletHook still receives
+    operation-mode changes. Intended trade-off for exiting a hung game.
+
+3.5 GuestLockHold hands a guest critical section over while a thread is parked in
+    the render-fence Sleep(0) loop (kernel/imports.cpp). It is conservative
+    (owned by this thread, recursion > 0, another guest thread actually blocked
+    on it, only inside Park/Unpark) and restores the exact recursion depth. The
+    invariant it relies on - that sub_82322478's wait loop touches nothing the
+    section protects - is a reading of the recompiled function, not something the
+    code can assert. Left as shipped; a wrong assumption would surface as a
+    corrupted allocation, not a silent hang.
+
+3.6 Under Backend::Heap the A, C and E views are distinct memory, so a write
+    through one is not visible through the others. The WAIT_REG_MEM fallback and
+    the audio view resolver repair the two hot paths; every other alias consumer
+    (GPU copies that write A while the guest reads its own pointer) remains a
+    documented loss. This is the one structural difference from the desktop hosts
+    and the place to look next if data appears stale in a new subsystem.
+
+3.7 settings::Validate() forces the Switch 2 output to 2560x1440 docked and
+    1920x1080 handheld, and gpu/video.cpp clamps resizes to kMaxWidth/kMaxHeight
+    = 2560x1440. If a future firmware exposes a 4K docked surface, both must move
+    together; today the 1440p request is what the display accepts or refuses
+    (video.cpp falls back to 1920x1080 when nwindowSetDimensions refuses it).
+
+===============================================================================
+4. WHAT WAS CHECKED AND PASSED
+===============================================================================
+* WAIT_REG_MEM: the original condition switch is still byte-for-byte the
+  pre-round-1 version; the fallback remains gated on !matched && isMemory &&
+  low != A, re-tests the same condition on the low view, and only copies when the
+  low view is the one that satisfies it. The self-wait bookkeeping, sync epochs,
+  5 s/30 s warnings, occlusion servicing and overlay pump are untouched.
+* Address model: Memory::Translate is base + offset with no bounds enforcement
+  (documented above); TranslatePhysical is 0xA0000000 + (physical &
+  0x1FFFFFFF), matching the A window used by the audio resolver and the WAIT
+  copy. C/E arithmetic in EnsureBacked (A = C - 0xC0000000 + 0xA0000000,
+  A = E - 0xE0000000 + 0xA0000000 + 0x1000) is correct for the mapping backends.
+* Backend selection: Switch 2 takes Backend::Heap unconditionally and calls no
+  mapping syscall (0x73/0x74/0x75/0x77/0x78/0x51 are masked by the donor NPDM and
+  a masked svc* terminates the process). Probes are compiled but not called.
+* Guest critical sections: every entry path (imports RtlEnterCriticalSection
+  fast/slow, RtlTryEnterCriticalSection, the native allocator proxy in
+  guest_alloc_lock.cpp) records GuestLockHold::Entered exactly once, leave pops,
+  and ExTerminateThread's longjmp path resets the tracking.
+* Frustum box: hor_plus.cpp owns sub_823BDA78 for the culling margin and calls
+  RunGuestFrustumBox(), which returns false only in mode 0 so the recompiled
+  function runs once, not twice.
+* Audio: the submitted frame is 6 * XAUDIO_NUM_SAMPLES words, the same range
+  FrameLooksLikeAudio probes; the A view is only consulted before any frame has
+  carried a sample, and a frame with audio in the submitted view is always
+  preferred.
+* OS paths: everything written stays under sdmc:/switch/LostOdysseyRecomp; the
+  sdmc mount, early_boot.log and RawAppend sessions are unchanged.
+* Logging: the queued writer is the default again (env.txt may set
+  LO_SWITCH_SYNC_LOG=1; env_file's constructor runs at priority 101, before the
+  inline g_syncLog initializer, so the env.txt value is the one read).
+
+===============================================================================
+5. BUILD AND ARTIFACT
+===============================================================================
+    export DEVKITPRO=/opt/devkitpro && source /opt/devkitpro/switch2vars.sh
+    cmake --build build -j20
+    -> [100%] Built target LostOdysseyRecomp, BUILD_EXIT=0
+
+Only pre-existing warnings: kernel/xdm.h multi-character constants
+(-Wmultichar, 12x) and main.cpp std::filesystem::u8path deprecation (4x).
+
+    build/LostOdysseyRecomp/LostOdysseyRecomp.nro
+      size 86,032,817 bytes (was 86,028,721)
+      md5  46b98e782e02d2d44cfcb9e45e793e24
+    aarch64-none-elf-nm -u .../LostOdysseyRecomp.elf -> 0 undefined symbols
+
+Files changed by this audit (4, all .cpp):
+    gpu/command_processor.cpp               +9  -1  (low view backed, include)
+    kernel/guest_address_space_switch.cpp   +20 -11 (heap C/E backing, diag line)
+    os/switch/switch_runtime.cpp            +9  -2  (bounded second-entrant wait)
+    apu/audio.cpp                           +6  -1  (guest-window range guard)
+
+===============================================================================
+6. LIMITATIONS
+===============================================================================
+* No Switch 2 hardware here. Every finding is from code, build and binary
+  evidence; the shared low view being zero rather than uninitialized is the one
+  behaviour 2.1 changes on the console, and it is exactly what the desktop hosts
+  do.
+* The fixes were compiled for the Switch 2 target only; the Switch 1 / desktop
+  paths of the edited files were read, not built.
+* Nothing is committed.

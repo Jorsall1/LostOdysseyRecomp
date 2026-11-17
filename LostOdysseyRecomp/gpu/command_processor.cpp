@@ -17,6 +17,7 @@
 #include <debug/perf_stats.h>
 #include <cpu/guest_thread.h>
 #include <kernel/memory.h>
+#include <kernel/guest_address_space.h>
 #include <kernel/function.h>
 #include <os/debug_server.h>
 #include <os/logger.h>
@@ -1510,6 +1511,13 @@ namespace gpu
                     AdvanceSyncEpoch(SyncSource::WaitRegMem);
                 }
             }
+            // The alias repair below reads the same word through the guest's own
+            // (low) view, which is a different 2 MiB chunk from the A view: back it
+            // once here, so that read can neither fault on the mapping backends
+            // nor return uninitialized memalign bytes on the heap backend. An
+            // unallocated page then reads zeros, as it does on the desktop hosts.
+            const bool lowViewBacked = isMemory && GuestAddressSpace::EnsureBacked(
+                pollRegAddr & ~3u, uint32_t(sizeof(uint32_t))) != GuestAddressSpace::Backing::Failed;
             while (m_running)
             {
                 // Snapshot before reading, so a handler finishing after the read
@@ -1560,7 +1568,7 @@ namespace gpu
                     const uint32_t wordAddress = pollRegAddr & ~3u;
                     const uint32_t aWindowValue = value;
                     auto* low = reinterpret_cast<volatile uint32_t*>(g_memory.Translate(wordAddress));
-                    if (low)
+                    if (lowViewBacked)
                     {
                         const uint32_t lowValue = GpuSwap(*low, pollRegAddr & 3);
                         if (lowValue == aWindowValue)

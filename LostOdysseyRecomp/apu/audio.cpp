@@ -512,7 +512,12 @@ namespace apu
     {
         static bool aWindow = false;
         const uintptr_t base = reinterpret_cast<uintptr_t>(g_memory.base);
-        const uint32_t address = uint32_t(reinterpret_cast<uintptr_t>(words) - base);
+        const uintptr_t host = reinterpret_cast<uintptr_t>(words);
+        // Only a pointer inside the guest window has an A view; anything else is
+        // left exactly as submitted.
+        if (!base || host < base || host - base >= 0x100000000ull)
+            return words;
+        const uint32_t address = uint32_t(host - base);
         const auto* aWords = reinterpret_cast<const uint32_t*>(base + 0xA0000000u + (address & 0x1FFFFFFFu));
         if (aWindow)
         {
