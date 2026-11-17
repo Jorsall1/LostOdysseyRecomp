@@ -1,0 +1,130 @@
+WAIT_REG_MEM: low guest view fallback removed, stall diagnostics added
+=========================================================================
+Switch 2 (kaiHEN 20261116 title takeover, Backend::Heap), 2026-11-17.
+Only LostOdysseyRecomp/gpu/command_processor.cpp changed. No header was touched.
+
+BUILD
+  cmake --build build -j20            -> exit 0, 5 translation units rebuilt
+  0 undefined symbols (aarch64-none-elf-nm -u)
+  build/.../LostOdysseyRecomp.nro     -> 86,028,721 bytes
+  md5  0ca07e020f1b4e5c99f952602f9610d6
+  copied to /mnt/c/Users/Jorda/Desktop/LostOdysseyRecomp.nro (same md5, 18:06)
+  (the size is back to the pre-audit 86,028,721: the removed fallback was the
+  only code this build gained over it)
+
+1. WHAT WAS REMOVED AND WHY
+---------------------------
+The audit added an "alias repair" inside WAIT_REG_MEM: when the polled A window
+did not match, the same word was re-read through the guest's low view
+(0x00000000 + offset) and, if *that* matched ref, the low value was copied into
+the A window and the wait released. Its log line was:
+
+  [warn] WAIT_REG_MEM 0x10002: A window held 0x4, low guest view holds 0x0 and
+         matches ref 0x0 mask 0xffffffff; using and copying the low view
+
+That is a false release, not a repair. ref is 0, the comparison is equality over
+a full mask, and the low view at 0x00010000 is a boot-zeroed block that nothing
+has written yet on frames 0..6. "0 == 0" therefore matches on the very first
+poll of frame 0, every time, regardless of the real state of the buffer - the
+value the guest is supposed to publish there (0x4 in the A window) is never
+consulted. WAIT_REG_MEM is the GPU's ordering primitive: releasing one early
+lets the CPU overwrite a command buffer the GPU is still reading, which is
+exactly the sequence in runtime-1794955907365172.log - the warning at 1.983 s,
+NVK dead at 2.150 s.
+
+The whole block is gone: the EnsureBacked() call, the low-view read, the copy
+into the A window, the warning, and the include it needed
+(<kernel/guest_address_space.h>). WAIT_REG_MEM now reads only the address it
+polls, through TranslatePhysical(), and releases only on the condition the
+packet itself specifies. Nothing in the wait path reads 0x00010000 any more.
+
+  diff numstat: LostOdysseyRecomp/gpu/command_processor.cpp   24 / 71
+
+2. WHAT A STALL NOW LOGS (READ-ONLY - IT NEVER RELEASES THE WAIT)
+-----------------------------------------------------------------
+"WAIT_REG_MEM stalled 5s ..." now also prints, once per stall:
+
+  WAIT_REG_MEM stalled 5s (mem 0x10002 ref 0x0 mask 0xffffffff value 0x4), still waiting
+    polled 0x4 (ref 0x0 mask 0xffffffff) views: A 0x4 @ 0xa0010000 C 0x0 @ 0xc0010000 E 0x0 @ 0xe0110000
+
+  - polled: the value just read through the address the packet polls
+    (TranslatePhysical = 0xA0000000 + physical, see below).
+  - A: 0xA0000000 + offset, C: 0xC0000000 + offset, E: 0xE0000000 + offset +
+    0x1000 (the E view is the A view shifted by one 4 KiB page, per the layout
+    in kernel/guest_address_space_switch.cpp). All three are read through
+    g_memory.Translate() with the packet's own swap mode.
+  - then DumpGuestThreadStates() (capped at 4 dumps per run) so the log shows
+    what every guest thread is parked on at the same instant.
+
+Nothing in that block writes to any view, releases the wait, or changes the
+decision above it; the 5 s / 30 s backoff still applies. If the 116 s-style
+stall on mem 0x10002 returns, the log will show whether A still holds 0x4, and
+whether C or E ever received anything.
+
+3. WHO WRITES 0x10000 / 0xA0010000 / 0xC0010000 / 0xE0010000
+------------------------------------------------------------
+Every path that writes guest-visible memory was followed:
+
+  * GPU packets: PM4_MEM_WRITE, PM4_REG_TO_MEM and the scratch-register
+    writeback all write through CommandProcessor::TranslatePhysical(), which is
+    0xA0000000 + (physical & 0x1FFFFFFF). They can only ever land in the A
+    window.
+  * Guest PPC stores/loads: Memory::Translate(offset) is base + offset - the low
+    view. A guest pointer of 0x00010000 writes 0x00010000, never the A window.
+  * C and E: nothing in the tree writes them. The only reads are read-only
+    diagnostics in this file: the corrupt-operand alias dump (A/C/E of an
+    indirect buffer) and the new stall line. g_memory.Translate(0xC...) /
+    (0xE...) is a plain offset into the guest block on the heap backend, so on
+    Switch 2 those windows are *not* aliases of anything - the A, C and E
+    aliases exist only on the syscall backends that map the same code-memory
+    source more than once, and Switch 2 uses Backend::Heap, one memalign block.
+
+So there is no proven write to C or E to repair, and per instruction no view
+translation was added. The honest statement of the 0x10002 situation is:
+
+  the GPU packet wrote 0x4 at physical 0x10000 (A window) and the guest polls
+  that same word through the low view (0x00010000), which on the heap backend
+  is a different 2 MiB-aligned block that nothing has published to yet.
+
+Both views are legitimate guest addresses; the port cannot know which one the
+wait "meant" from ref/mask alone. Matching ref against a never-written block is
+not evidence of anything, which is why the fallback had to go. A future fix, if
+one is ever wanted, must be driven by "did the other view *change* after this
+wait started" (a snapshot at entry, compared on each poll) and never by
+"does the other view happen to satisfy ref" - and it needs a log line from a
+real stall to justify it.
+
+4. NVK AT 2.150 s: WHAT SOURCE SAYS, WHAT TO CHECK ON THE DEVICE
+---------------------------------------------------------------
+The runtime log stops at 2.150 s with no crash_report.txt and no [exit] line.
+Two things follow from the code, and both are consistent with the early release
+above (a corrupted command stream is the most likely trigger):
+
+  * abort()/SIGSEGV are NOT silent here. switch_runtime's OnFatalSignal is
+    registered on SIGABRT and SIGSEGV in Initialize() (before the first frame),
+    writes crash_report.txt chunk by chunk through a raw fs session and flushes
+    it before ending the process. An NVK assert (abort) or a driver fault in the
+    render thread would therefore have left a crash_report.txt and an [exit]
+    line. Neither exists, so the process did not die through a signal this
+    module handles.
+  * That leaves termination from outside: the applet manager or the kernel
+    killing the process (e.g. a masked svc or an am-side error), or a fault
+    inside a context whose handler could not run (stack overflow in a thread
+    that is not the guest's, SD/file session gone). The port cannot observe
+    those; the console shows the am error dialog for them.
+
+To discriminate on hardware, after the next run collect, from the SD root:
+  sdmc:/switch/LostOdysseyRecomp/crash_report.txt   (present -> we died in a
+                                                     signal we handle; the
+                                                     pc/lr names the culprit)
+  sdmc:/switch/LostOdysseyRecomp/exit.log           (ends at "logs flushed" ->
+                                                     hang; absent -> killed)
+  sdmc:/switch/LostOdysseyRecomp/stderr.log         (ends mid-frame with no
+                                                     "WAIT_REG_MEM" line -> the
+                                                     GPU wait was not even the
+                                                     last thing logged)
+If crash_report.txt appears on a run whose stderr.log has no alias warning,
+the early release is exonerated and the next suspect is whatever pc the report
+names.
+
+EndProcessToHbmenu() and the exit path were not touched by this change.
