@@ -173,8 +173,33 @@ void WriteAddress(FILE* file, const char* name, uint64_t value)
         std::fprintf(file, "%-4s %016" PRIx64 "\n", name, value);
 }
 
+extern "C" void __nx_win_exit(void) __attribute__((weak));
+
+// Under kaiHEN title takeover this NRO runs inside the donor game, and
+// ISelfController::Exit (serviceDispatch on the SelfController session, command
+// 0) tells the applet manager to end *that game*: the console showed the HOME
+// menu with hbmenu gone (2026-11-16, runtime-1794932712369211.log). nx-hbloader
+// and kaiHEN catch the end of the process itself and return straight to hbmenu,
+// so every exit path here flushes the logs, closes the window the way libnx does
+// and calls svcExitProcess() - no applet Exit request anywhere.
+[[noreturn]] void EndProcessToHbmenu()
+{
+    os::logger::DrainForExit(); // lines still queued for the log writer
+    // Not fflush(nullptr): it locks every open file, and a crashed thread may
+    // still hold one of those locks.
+    std::fflush(stdout);
+    std::fflush(stderr);
+    if (&__nx_win_exit)
+        __nx_win_exit();
+    svcExitProcess();
+    __builtin_unreachable();
+}
+
 [[noreturn]] void ExitWithLog()
 {
+#if defined(__SWITCH2__)
+    EndProcessToHbmenu();
+#else
     os::logger::DrainForExit(); // lines still queued for the log writer
     // Not fflush(nullptr): it locks every open file, and a crashed thread may
     // still hold one of those locks.
@@ -187,6 +212,7 @@ void WriteAddress(FILE* file, const char* name, uint64_t value)
     std::exit(1);
     svcExitProcess(); // only if exit() itself gave up
     __builtin_unreachable();
+#endif
 }
 
 // A failed allocation (NVK, the guest's host heap, a std::vector) aborts through
@@ -918,9 +944,6 @@ void AllowExit()
     appletUnlockExit();
 }
 
-extern "C" void __nx_win_exit(void) __attribute__((weak));
-
-
 void ExitNow()
 {
     // An application must tell the applet manager it is leaving
@@ -945,6 +968,12 @@ void ExitNow()
     std::fflush(stdout);
     std::fflush(stderr);
     mark("exit: logs flushed\n");
+#if defined(__SWITCH2__)
+    // No applet Exit request (see EndProcessToHbmenu): under kaiHEN title
+    // takeover it ends the donor game and drops hbmenu.
+    mark("exit: ending the process (hbmenu, no applet Exit request)\n");
+    EndProcessToHbmenu();
+#else
     // libnx closes the default window (vi layer and display) before it sends Exit. Without it the Exit request
     // never returned (exit.log of 2026-10-27 ends at "logs flushed"): close it as libnx does. The renderer has
     // already destroyed its swap chain (video: shutdown stage=window-stop).
@@ -991,6 +1020,7 @@ void ExitNow()
     mark("exit: ending the process directly (svcExitProcess)\n");
     svcExitProcess();
     __builtin_unreachable();
+#endif
 }
 
 #if defined(__SWITCH2__)
@@ -1006,31 +1036,13 @@ bool g_exitWatchStarted = false;
 constexpr uint64_t kExitWatchPollNs = 100'000'000ull; // 100 ms
 constexpr auto kExitWatchHold = std::chrono::milliseconds(1500);
 
-// The applet Exit request on its own thread, then the end of the process even if
-// the reply never comes: ExitNow waits up to 100 s for that reply, which a
-// frozen title cannot afford when the player wants hbmenu back. Draining the
-// logs first keeps the last lines on the card.
+// Draining the logs first keeps the last lines on the card. No applet Exit
+// request: that ends the donor game the takeover runs in, which left the console
+// on the HOME menu with hbmenu gone; ending the process is what nx-hbloader and
+// kaiHEN turn into a return to hbmenu (EndProcessToHbmenu).
 [[noreturn]] void ExitToHbmenu()
 {
-    os::logger::DrainForExit();
-    std::fflush(stdout);
-    std::fflush(stderr);
-    if (&__nx_win_exit) // libnx closes the vi layer and display before Exit
-        __nx_win_exit();
-    appletUnlockExit();
-    static std::atomic<bool> answered{false};
-    static Thread requestThread;
-    if (R_SUCCEEDED(threadCreate(&requestThread, [](void*) {
-            serviceDispatch(appletGetServiceSession_SelfController(), 0); // Exit
-            answered.store(true, std::memory_order_release);
-            for (;;)
-                svcSleepThread(UINT64_MAX);
-        }, nullptr, nullptr, 0x4000, 0x2C, -2)) && R_SUCCEEDED(threadStart(&requestThread)))
-    {
-        for (int poll = 0; poll < 20 && !answered.load(std::memory_order_acquire); ++poll)
-            svcSleepThread(int64_t(kExitWatchPollNs));
-    }
-    svcExitProcess();
+    EndProcessToHbmenu();
 }
 
 void ExitWatchdogMain(void*)
@@ -1063,7 +1075,8 @@ void ExitWatchdogMain(void*)
         // stderr here: this file does not include os/logger.h (libnx's Mutex and
         // Event typedefs collide with the runtime's), and stderr goes to
         // stderr.log and the network log.
-        std::fprintf(stderr, "[watchdog] L+R+Plus+Minus held for 1.5 s, leaving to the HOME menu\n");
+        std::fprintf(stderr, "[watchdog] L+R+Plus+Minus held for 1.5 s, ending the process for hbmenu "
+                             "(no applet Exit request: that ends the donor game)\n");
         ExitToHbmenu();
     }
 }

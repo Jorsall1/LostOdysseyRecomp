@@ -1,0 +1,183 @@
+Lost Odyssey Recomp - Switch 2 (kaiHEN title takeover)
+Fix report: return to hbmenu on exit, and the loading-screen deadlock
+=====================================================================
+
+Build     : switch2-ouncevk, devkitA64 (devkitpro/switch2), -j20
+Result    : cmake --build build -j20 -> BUILD_EXIT=0 (warnings only, all pre-existing)
+NRO       : build/LostOdysseyRecomp/LostOdysseyRecomp.nro
+            copied to /mnt/c/Users/Jorda/Desktop/LostOdysseyRecomp.nro
+            86,020,529 bytes
+            md5 026285f9869b39455f52bd55cb91c36c (both copies identical)
+Headers   : none touched. All changes are in .cpp files.
+
+Evidence read: runtime-1794932712369211.log (thread dump at 7.308 s) and stderr.log.
+
+
+=====================================================================
+DISCOVERY 1 - THE EXIT REQUEST CLOSED THE DONOR GAME
+=====================================================================
+
+What happened
+-------------
+stderr.log: "[watchdog] L+R+Plus+Minus held for 1.5 s, leaving to the HOME menu".
+That is exactly what happened: the console went to the HOME menu and hbmenu was
+gone, because the exit path sent
+
+    serviceDispatch(appletGetServiceSession_SelfController(), 0);   // ISelfController::Exit
+
+Under kaiHEN title takeover this NRO is a guest of the donor game that is already
+running. ISelfController::Exit asks the Horizon applet manager (am) to terminate
+*that game*, so am ended the donor title and left the console on the HOME menu.
+
+What changed (os/switch/switch_runtime.cpp)
+-------------------------------------------
+New single exit path, used by every exit:
+
+    [[noreturn]] void EndProcessToHbmenu()
+    {
+        os::logger::DrainForExit();
+        std::fflush(stdout);
+        std::fflush(stderr);
+        if (&__nx_win_exit)      // weak: libnx closes the vi layer and display
+            __nx_win_exit();
+        svcExitProcess();        // nx-hbloader / kaiHEN catch this -> hbmenu
+        __builtin_unreachable();
+    }
+
+  * ExitToHbmenu() (the L+R+Plus+Minus watchdog) is now just that call. The
+    helper thread that sent SelfController cmd 0 and the 2 s reply wait are gone.
+  * ExitNow() (in-game Quit, ShowError on Switch 2) keeps its exit.log marks,
+    the PGO save and RestoreApmForExit(), then - under __SWITCH2__ - marks
+    "exit: ending the process (hbmenu, no applet Exit request)" and calls
+    EndProcessToHbmenu(). The applet Exit request, appletUnlockExit() and the
+    100 s reply loop are no longer compiled for __SWITCH2__.
+  * ExitWithLog() (crash exit, out-of-memory, second fault) uses
+    EndProcessToHbmenu() under __SWITCH2__. The old std::exit(1) teardown is kept
+    for the other platforms, where it is what returns to hbmenu.
+  * The watchdog message now says: "ending the process for hbmenu (no applet Exit
+    request: that ends the donor game)".
+
+A plain Switch 1 build is unchanged: the am Exit request and the 100 s wait are
+still there, because on that platform they are what puts the console back on
+hbmenu after a title quit.
+
+
+=====================================================================
+DISCOVERY 2 - THE FENCE WAIT HELD THE GUEST HEAP LOCK
+=====================================================================
+
+The two threads in the dump
+---------------------------
+  tid=0x2970640d [Guest Main] pcr=0x403000
+      KeDelayExecutionThread obj=0x0 lr=0x827cacfc
+      bt: 0x823224a8 0x82485c50 0x82485048 0x82484c24
+  tid=0x6cceea2  [Guest 82beca90] pcr=0x2144000
+      RtlEnterCriticalSection obj=0x510610 holder=0x403000 recursion=422
+      lr=0x823acd58, 5029 ms
+
+What the generated code says (LostOdysseyRecompLib/ppc)
+-------------------------------------------------------
+  * sub_82322478 (ppc_recomp.5.cpp) is the render command fence wait, and it is
+    exactly
+
+        r11 = [r31]
+        if (r11 <= r30) return;
+      loop:
+        r3 = 0;  call 0x827CA048      // FPlatformProcess::Sleep(0)
+        r11 = [r31];  if (r11 > r30) goto loop;
+
+    The 0x823224A8 in the dump is that call's return address, and 0x827CACFC is
+    inside the Sleep path that ends in KeDelayExecutionThread. So the parked
+    thread runs a pure Sleep(0) loop: it reads one guest word and nothing else.
+  * sub_823ACCB0 (ppc_recomp.11.cpp) is the heap allocator. At 0x823ACD58 it does
+        r3 = [r30 + 1408];  call __imp__RtlEnterCriticalSection
+    and 0x510610 - 1408 = 0x510090 is the heap object, i.e. 0x510610 is the
+    guest heap's critical section.
+
+The cycle
+---------
+  [Guest Main]  owns 0x510610 (recursion 422) and is asleep in the fence loop.
+  Rendering     needs 0x510610 to allocate while running the queued commands
+                that the fence counts down. It never gets it, so the fence value
+                never falls, so [Guest Main] never leaves the loop. Rendering
+                stops presenting and the loading screen freezes for good.
+
+Why the lock was still held does not matter for the remedy: a thread inside that
+loop owns a lock it cannot use. The wait loop touches no memory the lock
+protects, so the section can be handed over for the duration of the wait and
+taken back afterwards - what a condition variable does for a wait made inside a
+lock, done without touching the guest's own code.
+
+What changed (kernel/imports.cpp, cpu/poll_wait.cpp, cpu/guest_alloc_lock.cpp)
+-----------------------------------------------------------------------------
+New namespace GuestLockHold in kernel/imports.cpp (with the critical-section
+imports, no header changes):
+
+  Entered(cs) / Left(cs)
+      A per-thread list of the guest sections this thread has entered. Called
+      from RtlEnterCriticalSection, RtlTryEnterCriticalSection and
+      RtlLeaveCriticalSection, and from the native FScopeLock fast path
+      (sub_822958F8, cpu/guest_alloc_lock.cpp) which takes the section outside
+      the import bridge. Unbalanced entries are harmless: every handover
+      re-checks the section's OwningThread against this thread's PCR.
+
+  Park() / Unpark(thread)      -- wrapped around the original sub_82322478
+      Park arms the handover; Unpark takes back, innermost first, exactly what
+      was handed over and restores the recursion count the guest had stored.
+
+  Relieve(thread)              -- called from KeDelayExecutionThread when the
+      timeout is 0, i.e. from the Sleep(0) inside the fence loop, and only while
+      poll_wait::sharedValue.active is true (inside that loop, thread_local).
+      For each section this thread owns it releases the section only if
+        - another guest thread is actually asleep on it: its wait state is
+          "RtlEnterCriticalSection" with obj == this section (the same records
+          DumpGuestThreadStates prints), and
+        - it is not already handed over.
+      Release order is the one Leave uses (RecursionCount = 0, then
+      OwningThread = 0, then notify), so a waiter wakes into the normal path.
+
+  ResetThread()                -- at the guest thread boundary, next to
+      poll_wait::ResetThread(), so a longjmp out of a wait cannot leave the
+      tracking parked.
+
+Each handover logs once (first 8 only):
+
+    guest lock 0x510610 (recursion 422) handed over while the thread is parked
+    in a render fence wait: another guest thread was blocked on it
+
+Timing note: the handover happens on the wait iteration after the rendering
+thread starts blocking, not at Park, because only then is there a waiter to
+justify it. That is why Relieve lives in the Sleep(0) chokepoint and not in the
+fence hook itself.
+
+
+=====================================================================
+FILES CHANGED (4 .cpp files, +228 / -29)
+=====================================================================
+  kernel/imports.cpp               GuestLockHold (Entered/Left/Park/Relieve/
+                                   Unpark/ResetThread), Relieve call in
+                                   KeDelayExecutionThread, thread-boundary reset
+  cpu/poll_wait.cpp                Park/Unpark around sub_82322478
+  cpu/guest_alloc_lock.cpp         records the native allocator-lock entry
+  os/switch/switch_runtime.cpp     EndProcessToHbmenu: no SelfController Exit on
+                                   __SWITCH2__ (watchdog, ExitNow, ExitWithLog)
+
+
+=====================================================================
+WHAT TO CHECK ON THE CONSOLE
+=====================================================================
+1. L+R+Plus+Minus for 1.5 s while hung: the console must come back to *hbmenu*
+   with the donor game still alive. stderr.log shows
+   "[watchdog] ... ending the process for hbmenu (no applet Exit request ...)".
+2. The loading screen after xenon_snd.fpd: frames must keep presenting. In
+   runtime-*.log look for the handover line above (0x510610, recursion ~422).
+   If frames still stop and no handover line appears, the next dump's
+   "holder=<pcr> recursion=<n>" shows whether the blocked thread was waiting on
+   a section nobody owns, which is a different bug.
+3. Normal play: no repeated handover lines (they are capped at 8) and no
+   "render fence wait" warnings growing.
+
+Limits: there is no Switch 2 hardware in this session. Both changes are verified
+by reading the generated guest code, by the full build/link/package
+(BUILD_EXIT=0) and by static review only; the console run above is the
+confirmation. Nothing here was staged or committed.

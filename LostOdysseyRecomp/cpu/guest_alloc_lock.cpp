@@ -11,6 +11,14 @@
 
 extern "C" PPC_FUNC(__imp__sub_822958F8);
 
+// kernel/imports.cpp: this constructor takes the section outside the import
+// bridge, so it has to record the entry itself or a fence wait cannot hand the
+// section over (the matching RtlLeaveCriticalSection does pop it).
+namespace GuestLockHold
+{
+    void Entered(XRTL_CRITICAL_SECTION* section);
+}
+
 namespace
 {
     constexpr uint32_t kFailedTries = 0x83315FDC;
@@ -39,7 +47,12 @@ PPC_FUNC(sub_822958F8)
     PPC_STORE_U32(self, owner);
     auto* section = reinterpret_cast<XRTL_CRITICAL_SECTION*>(base + owner + 4);
     const uint32_t thread = ctx.r13.u32;
-    if (!GuestCriticalSection::TryEnter(section->RecursionCount, section->OwningThread, thread))
+    if (GuestCriticalSection::TryEnter(section->RecursionCount, section->OwningThread, thread))
+    {
+        GuestLockHold::Entered(section);
+        ctx.r3.u32 = self;
+        return;
+    }
     {
         uint32_t failed = 1;
         bool entered = false;
@@ -54,5 +67,6 @@ PPC_FUNC(sub_822958F8)
         if (!entered)
             GuestCriticalSection::Enter(section->RecursionCount, section->OwningThread, thread);
     }
+    GuestLockHold::Entered(section);
     ctx.r3.u32 = self;
 }

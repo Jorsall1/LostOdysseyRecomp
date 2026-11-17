@@ -239,6 +239,149 @@ void DumpGuestThreadStates()
 }
 
 // ---------------------------------------------------------------------------
+// Guest critical sections handed over while a thread is parked in a fence wait
+//
+// Switch 2 hardware (2026-11-16, runtime-1794932712369211.log): the thread in
+// FRenderCommandFence::Wait (sub_82322478: while (*fence > threshold) Sleep(0))
+// still owned the guest heap's critical section 0x510610 while the rendering
+// thread was asleep entering that same section at 0x823ACD58 (sub_823ACCB0, the
+// heap allocator). The rendering thread could never run the queued commands the
+// fence counts down, so the loading screen stopped for good.
+//
+// A thread inside that wait loop cannot touch the memory those sections protect,
+// so while it is parked the sections another guest thread is blocked on are
+// handed over, and the exact recursion depth is put back when the wait returns:
+// what a condition variable does for a wait made inside a lock, without touching
+// the guest's own code.
+namespace GuestLockHold
+{
+    struct Parked
+    {
+        XRTL_CRITICAL_SECTION* section;
+        int32_t recursion; // RecursionCount as the guest stored it (big endian)
+    };
+
+    namespace
+    {
+        // Sections this thread has entered and not left yet. Stale entries (a
+        // leave this file did not see) fail the owner check in Relieve below.
+        thread_local std::vector<XRTL_CRITICAL_SECTION*> t_held;
+        thread_local std::vector<Parked> t_parked;
+        thread_local int t_parkDepth = 0;
+        std::atomic<uint32_t> g_handoverLogs{0};
+
+        bool AnotherThreadBlockedOn(const XRTL_CRITICAL_SECTION* section, uint32_t self)
+        {
+            const uint32_t guest = g_memory.MapVirtual(section);
+            if (!guest)
+                return false;
+            std::lock_guard lock(g_waitStatesMutex);
+            for (const ThreadWaitState* state : g_waitStates)
+            {
+                if (state->pcr != self && state->object == guest &&
+                    std::strcmp(state->what, "RtlEnterCriticalSection") == 0)
+                    return true;
+            }
+            return false;
+        }
+
+        bool IsParked(const XRTL_CRITICAL_SECTION* section)
+        {
+            for (const Parked& parked : t_parked)
+                if (parked.section == section)
+                    return true;
+            return false;
+        }
+    }
+
+    void Entered(XRTL_CRITICAL_SECTION* section)
+    {
+        if (t_held.size() < 4096)
+            t_held.push_back(section);
+    }
+
+    void Left(XRTL_CRITICAL_SECTION* section)
+    {
+        for (size_t i = t_held.size(); i > 0; --i)
+        {
+            if (t_held[i - 1] == section)
+            {
+                t_held.erase(t_held.begin() + std::ptrdiff_t(i - 1));
+                return;
+            }
+        }
+    }
+
+    // The fence wait loop, around the original function.
+    void Park()
+    {
+        if (t_parkDepth++ == 0)
+            t_parked.clear();
+    }
+
+    // A Sleep(0) inside that loop: hand over the sections another guest thread
+    // is asleep on. The loop itself only reads its fence counter, so nothing it
+    // is doing depends on them.
+    void Relieve(uint32_t thread)
+    {
+        if (t_parkDepth == 0 || !poll_wait::sharedValue.active || t_parked.size() >= 16)
+            return;
+        const uint32_t encodedThread = GuestCriticalSection::Encode(thread);
+        for (auto it = t_held.rbegin(); it != t_held.rend(); ++it)
+        {
+            XRTL_CRITICAL_SECTION* section = *it;
+            os::AtomicRef<uint32_t> owner(section->OwningThread);
+            if (owner.load() != encodedThread || IsParked(section))
+                continue;
+            const int32_t recursion = section->RecursionCount;
+            if (GuestCriticalSection::Encode(uint32_t(recursion)) == 0)
+                continue;
+            if (!AnotherThreadBlockedOn(section, thread))
+                continue;
+            section->RecursionCount = 0; // the order Leave uses: depth, then owner
+            owner.store(0);
+            owner.notify_one();
+            t_parked.push_back({section, recursion});
+            if (g_handoverLogs.fetch_add(1, std::memory_order_relaxed) < 8)
+                LOG_WARNING("guest lock {:#x} (recursion {}) handed over while the thread is parked in a render "
+                            "fence wait: another guest thread was blocked on it", g_memory.MapVirtual(section),
+                            GuestCriticalSection::Encode(uint32_t(recursion)));
+        }
+    }
+
+    // The wait returned: take back what Relieve handed over, innermost first (so
+    // the entry order matches), with the depth it had.
+    void Unpark(uint32_t thread)
+    {
+        if (t_parkDepth == 0 || --t_parkDepth != 0)
+            return;
+        const uint32_t encodedThread = GuestCriticalSection::Encode(thread);
+        for (auto it = t_parked.rbegin(); it != t_parked.rend(); ++it)
+        {
+            XRTL_CRITICAL_SECTION* section = it->section;
+            os::AtomicRef<uint32_t> owner(section->OwningThread);
+            for (;;)
+            {
+                uint32_t expected = 0;
+                if (owner.compare_exchange_strong(expected, encodedThread) || expected == encodedThread)
+                    break;
+                owner.wait(expected);
+            }
+            section->RecursionCount = it->recursion;
+        }
+        t_parked.clear();
+    }
+
+    // Guest thread exit (ExTerminateThread longjmps out of the wait).
+    void ResetThread()
+    {
+        t_held.clear();
+        t_parked.clear();
+        t_parkDepth = 0;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // User APCs. Async file completion routines (ReadFileEx et al.) are queued on
 // the issuing thread and run the next time it performs an alertable wait, at
 // which point the wait returns STATUS_USER_APC. Mirrors xenia-canary
@@ -543,18 +686,26 @@ static void RtlEnterCriticalSection(XRTL_CRITICAL_SECTION* cs)
     // Switch: most entries are uncontended, so record the wait (watchdog, wait profile) only when
     // it can wait (#15).
     if (LO_PLATFORM_SWITCH && GuestCriticalSection::TryEnter(cs->RecursionCount, cs->OwningThread, thread))
+    {
+        GuestLockHold::Entered(cs);
         return;
+    }
     WaitScope scope("RtlEnterCriticalSection", g_memory.MapVirtual(cs));
     GuestCriticalSection::Enter(cs->RecursionCount, cs->OwningThread, thread);
+    GuestLockHold::Entered(cs);
 }
 
 static bool RtlTryEnterCriticalSection(XRTL_CRITICAL_SECTION* cs)
 {
-    return GuestCriticalSection::TryEnter(cs->RecursionCount, cs->OwningThread, g_ppcContext->r13.u32);
+    if (!GuestCriticalSection::TryEnter(cs->RecursionCount, cs->OwningThread, g_ppcContext->r13.u32))
+        return false;
+    GuestLockHold::Entered(cs);
+    return true;
 }
 
 static void RtlLeaveCriticalSection(XRTL_CRITICAL_SECTION* cs)
 {
+    GuestLockHold::Left(cs);
     GuestCriticalSection::Leave(cs->RecursionCount, cs->OwningThread);
 }
 
@@ -676,12 +827,14 @@ static void ExTerminateThread(uint32_t exitCode)
 void GuestThreadRunWithTerminateHook(void (*run)(void*), void* arg)
 {
     poll_wait::ResetThread();
+    GuestLockHold::ResetThread();
     jmp_buf jb;
     t_terminateJump = &jb;
     if (setjmp(jb) == 0)
         run(arg);
     t_terminateJump = nullptr;
     poll_wait::ResetThread();
+    GuestLockHold::ResetThread(); // a longjmp out of a fence wait leaves the wait parked
 }
 
 static std::shared_ptr<GuestThreadHandle> ThreadFromHandle(uint32_t handle)
@@ -794,6 +947,10 @@ static uint32_t KeDelayExecutionThread(uint32_t WaitMode, bool Alertable, be<int
         LOGFN_IMPL(Verbose, "sleep {} ms", timeout);
     if (timeout == 0)
     {
+        // The render fence loop (sub_82322478) is a Sleep(0) loop: this is where a
+        // thread waiting on it can hand over a guest lock the rendering thread is
+        // blocked on (GuestLockHold; nothing happens outside a fence wait).
+        GuestLockHold::Relieve(g_ppcContext ? g_ppcContext->r13.u32 : 0);
         if (!poll_wait::ZeroDelay())
             std::this_thread::yield();
     }

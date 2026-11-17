@@ -18,6 +18,19 @@ extern "C" PPC_FUNC(__imp__sub_823CF390);
 extern "C" PPC_FUNC(__imp__sub_823CF3F0);
 extern "C" PPC_FUNC(__imp__sub_82322478);
 
+// kernel/imports.cpp. A fence wait must not keep a guest critical section that
+// the rendering thread is asleep on: on Switch 2 hardware (2026-11-16) the
+// thread in this loop still owned 0x510610 (the heap allocator's) with
+// recursion 422 while the rendering thread sat in RtlEnterCriticalSection at
+// 0x823ACD58, so no queued command could run and the fence never fell. Park /
+// Relieve / Unpark hand such a section over for the wait and put the depth back
+// when it returns.
+namespace GuestLockHold
+{
+    void Park();
+    void Unpark(uint32_t thread);
+}
+
 // Retain the generated function, including register saves, return values and
 // query ordering. Only its repeated not-ready probes can pause on the host.
 // The scene renderer's reads of its occlusion queries (sub_823CE960). GetData only agrees once the
@@ -203,7 +216,9 @@ PPC_FUNC(sub_82322478)
 {
     if (g_fenceWaiters.fetch_add(1, std::memory_order_acq_rel) == 0)
         g_fenceWaitSinceMs.store(NowMs(), std::memory_order_release);
+    GuestLockHold::Park();
     poll_wait::RunScoped(poll_wait::Kind::SharedValue, [&] { __imp__sub_82322478(ctx, base); });
+    GuestLockHold::Unpark(uint32_t(ctx.r13.u32));
     if (g_fenceWaiters.fetch_sub(1, std::memory_order_acq_rel) == 1)
     {
         const uint64_t since = g_fenceWaitSinceMs.exchange(0, std::memory_order_acq_rel);
