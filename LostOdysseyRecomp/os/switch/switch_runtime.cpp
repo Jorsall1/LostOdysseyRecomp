@@ -232,8 +232,17 @@ void QuiesceAudio()
         // Another thread is already ending the process. Wait for it, but not
         // forever: if that teardown wedges, the watchdog (which ends here too)
         // must still take the console back to hbmenu instead of hanging with it.
+        // Ending a wedged teardown is not an excuse to end it worse than the
+        // normal exit does, though: the same two handover steps are repeated,
+        // because a process that ends with the applet exit lock still held makes
+        // am treat it as a fatal application error and drops kaiHEN's R -> hbmenu
+        // hook (2026-11-16 hardware), and a process that ends without a next load
+        // leaves the console on the HOME menu with hbmenu gone.
         for (int tenth = 0; tenth < 50; ++tenth)
             svcSleepThread(100'000'000ull);
+        if (envHasNextLoad())
+            envSetNextLoad("sdmc:/hbmenu.nro", "\"sdmc:/hbmenu.nro\"");
+        appletUnlockExit(); // a second unlock is harmless; the first entrant may not have reached it
         svcExitProcess();
         __builtin_unreachable();
     }
@@ -1140,6 +1149,23 @@ void ExitNow()
     svcExitProcess();
     __builtin_unreachable();
 #endif
+}
+
+// The forced end for the paths that used to call std::_Exit directly. libnx's
+// application teardown is skipped (guest threads may still be running and were
+// the reason those paths used _Exit), but the two handover steps are not: the
+// next load, so the loader returns to hbmenu, and the applet exit lock, because
+// ending the process with it held is what made am show its fatal application
+// error and drop kaiHEN's R -> hbmenu hook on 2026-11-16 hardware.
+void ForceExitWithoutTeardown()
+{
+    if (envHasNextLoad())
+        envSetNextLoad("sdmc:/hbmenu.nro", "\"sdmc:/hbmenu.nro\"");
+    appletUnlockExit();
+    std::fflush(stdout);
+    std::fflush(stderr);
+    svcExitProcess();
+    std::_Exit(EXIT_FAILURE); // only if svcExitProcess itself gave up
 }
 
 #if defined(__SWITCH2__)

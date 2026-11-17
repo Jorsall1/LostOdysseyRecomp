@@ -18,7 +18,7 @@ its callers and to the libnx/plume behaviour it depends on, cross-check the
 address model (guest virtual / A / C / E views, Backend::Heap) against
 kernel/memory.h and guest_address_space_layout.h, then build.
 
-VERDICT: no remaining blocker in the code that the port added. Five defects were
+VERDICT: no remaining blocker in the code that the port added. Six defects were
 found and are fixed (one of them a plausible repeat of the 1.983 s premature
 WAIT_REG_MEM release, one a real contract violation in the heap backend's page
 backing). Seven further issues are reported below without a change because they
@@ -115,9 +115,17 @@ are either deliberate trade-offs or cannot be verified without hardware.
   exists specifically to rescue a hang hung with it and the console had no way
   out but HOME.
 
-  Fix: wait 5 s for the first entrant, then svcExitProcess(). Exactly one thread
-  still performs the teardown, and a wedged teardown now degrades to a hard exit
-  instead of a permanently frozen console.
+  Fix: wait 5 s for the first entrant, then end the process - but not bare.
+  svcExitProcess() on its own would end with the applet exit lock still held,
+  which is the one thing the 2026-11-16 hardware run proved makes am show its
+  fatal-application-error dialog and drop kaiHEN's R -> hbmenu hook, and it
+  would leave no next load, so the console could land on the HOME menu with
+  hbmenu gone. The fallback therefore repeats the normal exit's two handover
+  steps first: envSetNextLoad("sdmc:/hbmenu.nro") when the loader supports it,
+  then appletUnlockExit() (a second unlock is harmless if the first entrant
+  already reached it), then svcExitProcess(). Exactly one thread still performs
+  the full teardown; a wedged teardown degrades to a hard exit that keeps
+  hbmenu, instead of a permanently frozen console.
 
 2.5 LOW - apu/audio.cpp: ResolveFrameView() could compute an A view from a
     pointer outside the guest window.
@@ -128,6 +136,41 @@ are either deliberate trade-offs or cannot be verified without hardware.
   landed under 0x20000000, the helper would test an unrelated guest page for
   audio. Added an explicit range check (null base, before base, or past the
   4 GiB window) that returns the submitted pointer unchanged.
+
+2.6 HIGH - main.cpp / os/switch_platform.h: two forced exits ended the process
+    with the applet exit lock still held.
+
+  Every quit that goes through the GPU owner (HOME -> X, the title's Quit, the
+  watchdog, a crash, ShowError) ends in EndProcessToHbmenu(), which sets the next
+  load and calls appletUnlockExit() before ending the process. The fallback at
+  the end of RunGuest did not:
+
+      gpu::video::RequestExit();
+      gpu::g_commandProcessor.Shutdown();
+      os::shaderlog::CloseForExit();
+      std::fflush(nullptr);
+      (discord_rpc::Shutdown(), std::_Exit(EXIT_SUCCESS));
+
+  Reaching that line means the guest main thread returned on its own, so the quit
+  action never ran: the applet exit lock taken in Initialize() is still held and
+  the process disappears with no next load. That is, line for line, the condition
+  the port's own comment records from 2026-11-16 hardware - "Ending the process
+  with exit still locked made am treat it as a fatal application error ... and
+  kaiHEN's R -> hbmenu hook stopped working" - plus the missing next load that
+  leaves the console on the HOME menu instead of in hbmenu.
+
+  Fix: new os::switch_platform::ForceExitWithoutTeardown(), the same forced end
+  those paths wanted (no libnx teardown, so guest threads that are still running
+  are not pulled out from under themselves) but with the handover performed:
+  envSetNextLoad when the loader supports it, appletUnlockExit, flushed
+  stdout/stderr, then svcExitProcess. main.cpp's fallback ends there on Switch
+  instead of calling _Exit directly.
+
+  video::FinishRequestedExit()'s "exit without an owner-thread shutdown request"
+  branch has the same shape and was deliberately left alone: it runs only when a
+  quit was requested without the owner thread's request, i.e. it is already a
+  logic error being reported, and routing it through the handover would change a
+  path no hardware run has ever taken. It is listed in section 3 instead.
 
 ===============================================================================
 3. FOUND, NOT CHANGED (deliberate or unverifiable here)
@@ -172,7 +215,15 @@ are either deliberate trade-offs or cannot be verified without hardware.
     documented loss. This is the one structural difference from the desktop hosts
     and the place to look next if data appears stale in a new subsystem.
 
-3.7 settings::Validate() forces the Switch 2 output to 2560x1440 docked and
+3.7 gpu/video.cpp FinishRequestedExit()'s "exit without an owner-thread shutdown
+    request" branch still ends with std::_Exit(EXIT_FAILURE) on Switch, so it too
+    leaves the applet exit lock held. Left alone deliberately: it runs only when
+    a quit was requested without the owner thread's request, i.e. it is already
+    reporting a logic error on a path no hardware run has taken, and changing it
+    would trade a known-wrong exit for an unknown one. If it ever appears in
+    stderr.log, it should be routed through ForceExitWithoutTeardown() as well.
+
+3.8 settings::Validate() forces the Switch 2 output to 2560x1440 docked and
     1920x1080 handheld, and gpu/video.cpp clamps resizes to kMaxWidth/kMaxHeight
     = 2560x1440. If a future firmware exposes a 4K docked surface, both must move
     together; today the 1440p request is what the display accepts or refuses
@@ -223,14 +274,20 @@ Only pre-existing warnings: kernel/xdm.h multi-character constants
 
     build/LostOdysseyRecomp/LostOdysseyRecomp.nro
       size 86,032,817 bytes (was 86,028,721)
-      md5  46b98e782e02d2d44cfcb9e45e793e24
+      md5  cc1256231827d61c51550c3a0c5f91ae   (the final link, including 2.6;
+            earlier builds of this round were 46b98e78... and 948b40ec...)
     aarch64-none-elf-nm -u .../LostOdysseyRecomp.elf -> 0 undefined symbols
 
-Files changed by this audit (4, all .cpp):
-    gpu/command_processor.cpp               +9  -1  (low view backed, include)
-    kernel/guest_address_space_switch.cpp   +20 -11 (heap C/E backing, diag line)
-    os/switch/switch_runtime.cpp            +9  -2  (bounded second-entrant wait)
-    apu/audio.cpp                           +6  -1  (guest-window range guard)
+Files changed by this audit (6):
+    gpu/command_processor.cpp             low guest view backed + include
+    kernel/guest_address_space_switch.cpp heap C/E backing, diag line removed
+    os/switch/switch_runtime.cpp          second-entrant bound + handover,
+                                          ForceExitWithoutTeardown
+    apu/audio.cpp                         guest-window range guard
+    os/switch_platform.h                  ForceExitWithoutTeardown declaration
+    main.cpp                              exit-lock fallback at the end of RunGuest
+  The first four were committed as 0027b5a8; the exit-path work after them (2.4's
+  handover steps, 2.6) is in the working tree, built and inspected.
 
 ===============================================================================
 6. LIMITATIONS

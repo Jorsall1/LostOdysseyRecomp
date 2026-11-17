@@ -334,6 +334,16 @@ static int RunGuest(uint32_t entry)
     // The GPU owner normally exits the process after cleanup. If it had
     // already stopped, still avoid global teardown while guest threads survive.
     os::shaderlog::CloseForExit();
+#if LO_PLATFORM_SWITCH
+    // A normal quit ends the process in the GPU owner's shutdown
+    // (video::FinishRequestedExit -> ExitNow), and that is the path that releases
+    // the applet exit lock. Reaching this line means it never ran - the guest main
+    // thread returned on its own - so the lock is still held, and a process that
+    // ends with it held is exactly what made am report a fatal application error
+    // and drop kaiHEN's R -> hbmenu hook on 2026-11-16. Guest threads may still be
+    // alive, so libnx's teardown is still skipped; only the handover is done.
+    os::switch_platform::ForceExitWithoutTeardown();
+#endif
     std::fflush(nullptr);
     (discord_rpc::Shutdown(), std::_Exit(EXIT_SUCCESS));
 }

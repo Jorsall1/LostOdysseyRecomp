@@ -111,5 +111,12 @@ namespace os::switch_platform
     // teardown): quitting through std::_Exit unmounted the SD card while game
     // threads were still reading it, and one faulted in lseek.
     [[noreturn]] void ExitNow();
+    // The same forced end, for the paths that used to call std::_Exit directly
+    // (the guest main thread returning, a quit without a GPU shutdown request).
+    // The handover is still performed - next load set, applet exit lock released
+    // - because a process that disappears with the lock held makes am report a
+    // fatal application error and drop kaiHEN's R -> hbmenu hook, and one that
+    // leaves no next load strands the console on the HOME menu.
+    [[noreturn]] void ForceExitWithoutTeardown();
 }
 #endif
