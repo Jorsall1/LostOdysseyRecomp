@@ -1,0 +1,147 @@
+Lost Odyssey Recomp - Switch 2 (kaiHEN title takeover, branch switch2-ouncevk)
+WAIT_REG_MEM premature release + fatal-signal exit, 2026-11-17 (round after the 15:43:20 run)
+
+===============================================================================
+1. WHAT THE 15:43:20 LOG SHOWED
+===============================================================================
+runtime-1794948200370456.log, 1.983 s:
+
+  [warn] WAIT_REG_MEM 0x10002: A window held 0x0, low guest view holds 0x0
+         and matches ref 0x0 mask 0xffffffff; using and copying the low view
+
+Both views held 0x0, and ref was 0x0 with mask 0xffffffff. The wait was
+released at 1.983 s on a frame where the original condition had NOT been met.
+Consequence: the CPU wrote on into the command ring while NVK was still reading
+it, and NVK faulted at 2.15 s.
+
+Why it fired: the round-1 helper WaitRegMemMatches() replaced the WAIT_REG_MEM
+condition switch with its own table (op 0 -> false, 1 <, 2 <=, 3 ==, 4 !=,
+5 >=, 6 >, default true). It was called unconditionally, not only when the two
+memory views disagreed, so on every early frame (both views 0x0) it produced a
+second, independent verdict on the same operands. Any difference between that
+table and the original switch in the op-encoding (EQUAL / NOTEQUAL / GREATER
+ordering, op 0 and op 7 handling) turned into a released wait that the original
+switch had refused. The log line also printed `value` AFTER it had been
+overwritten with the low view, so it reported "A window held 0x0" for an A
+window that actually held the stalled 0x4.
+
+===============================================================================
+2. FIX 1 - gpu/command_processor.cpp (WAIT_REG_MEM)
+===============================================================================
+* WaitRegMemMatches() is deleted entirely (grep for the name: no references).
+* The original condition switch is restored EXACTLY as it was before round 1
+  (verified: `git diff --numstat` for the file is now 63 insertions, 0
+  deletions - the switch is byte-for-byte the committed version):
+
+      bool matched = false;
+      switch (waitInfo & 7)
+      {
+      case 0: matched = false; break;
+      case 1: matched = (value & mask) < ref; break;
+      case 2: matched = (value & mask) <= ref; break;
+      case 3: matched = (value & mask) == ref; break;
+      case 4: matched = (value & mask) != ref; break;
+      case 5: matched = (value & mask) >= ref; break;
+      case 6: matched = (value & mask) > ref; break;
+      case 7: matched = true; break;
+      }
+
+* The alias fallback now runs only after that switch has already refused the A
+  window (`!matched`), only for memory waits (`isMemory`), and only when the two
+  blocks actually disagree:
+
+      const uint32_t aWindowValue = value;            // kept for the log
+      lowValue = GpuSwap(*low, pollRegAddr & 3);      // 0x00000000 + wordAddress
+      if (lowValue == aWindowValue) { /* no fallback */ }
+      else { same original switch, applied to lowValue; if it passes, copy }
+      ...
+
+  The comparison is therefore the SAME condition, evaluated on the other view,
+  and it is only reached when A != low. On frames 0..6483 (0 == 0) the block
+  does nothing at all: no extra read of the low block changes a decision, no
+  copy, no log line.
+* Log line now reports the A-window value it actually had (`aWindowValue`), so
+  the 116.749 s case reads "A window held 0x4, low guest view holds 0x0".
+* The copy into the A window (`TranslatePhysical(wordAddress)`) is unchanged and
+  still only happens when the guest's own write is the one that satisfies the
+  wait - that is the repair of the 0x00010000 / 0xA0010000 split, and it is the
+  only reason this block exists.
+* Everything else in the poll loop is untouched: self-wait bookkeeping, the 5 s
+  and 30 s warnings, occlusion servicing, overlay pumping, the sync epochs.
+
+===============================================================================
+3. FIX 2 - os/switch/switch_runtime.cpp (fatal signals)
+===============================================================================
+The 2.15 s NVK death left stderr.log ending mid-driver with no [exit] line:
+Mesa/NVK abort() (SIGABRT) and native faults do not always pass through
+__libnx_exception_handler, so EndProcessToHbmenu() never ran, no next load was
+set, and the console lost hbmenu.
+
+* New handler `OnFatalSignal(int sig)` (anonymous namespace, right after
+  EndProcessToHbmenu):
+    - one-shot guard (`std::atomic<int> reported`) so a second fault does not
+      re-enter the exit;
+    - one line built with snprintf into a stack buffer:
+        "=== Lost Odyssey Recomp fatal signal %d (SIGABRT|SIGSEGV), unix time
+         %llu; ending the process so hbmenu comes back";
+    - written with write(2, ...) to stderr (reaches StderrWrite: stderr.log and
+      the network log) and appended to crash_report.txt and crash.log through
+      os::switch_platform::RawAppend, which flushes to the card;
+    - then EndProcessToHbmenu(): audio quiesce, log drain, envSetNextLoad(
+      "sdmc:/hbmenu.nro"), appletUnlockExit(), std::exit(0).
+* Registered in Initialize() immediately after appletLockExit() and
+  appletHook(...), so the exit lock is always held when the handler runs and is
+  released exactly once:
+        std::signal(SIGABRT, OnFatalSignal);
+        std::signal(SIGSEGV, OnFatalSignal);
+* Includes added to the .cpp only: <csignal>, <unistd.h>.
+
+No .h / .hpp file was touched (git status: only the two .cpp files), so the
+renderer and the rest of the precompiled objects stay cached.
+
+===============================================================================
+4. BUILD AND ARTIFACT
+===============================================================================
+export DEVKITPRO=/opt/devkitpro && source /opt/devkitpro/switch2vars.sh \
+  && cmake --build build -j20
+  -> [100%] Built target LostOdysseyRecomp, BUILD_EXIT=0
+  (only pre-existing kernel/xdm.h -Wmultichar warnings)
+
+build/LostOdysseyRecomp/LostOdysseyRecomp.nro
+  -> /mnt/c/Users/Jorda/Desktop/LostOdysseyRecomp.nro
+  size 86,028,721 bytes
+  md5  4f0c78918590b2ad3daa1b6baa56e034
+
+Verified in the binary:
+  * "WaitRegMemMatches" - no references anywhere in the source tree;
+  * "fatal signal %d" string present once in LostOdysseyRecomp.elf.
+
+===============================================================================
+5. WHAT THE NEXT HARDWARE RUN SHOULD SHOW
+===============================================================================
+1. No "[warn] ... A window held 0x0, low guest view holds 0x0" line: equal views
+   are silent by construction now. If any alias line appears it must read
+   "A window held 0x4, low guest view holds 0x0" (disagreeing values).
+2. NVK surviving past 2.15 s and the loading bar leaving 100 %.
+3. If NVK still dies: crash_report.txt now starts with "fatal signal ..." and,
+   if the exit ran, stderr.log has "[exit] next load sdmc:/hbmenu.nro: set"
+   followed by "[exit] leaving through libnx's application exit ...", and the
+   console should return to hbmenu with kaiHEN's R hook intact.
+
+===============================================================================
+6. LIMITATIONS
+===============================================================================
+* Still no Switch 2 hardware here: both changes are verified by build, by
+  source diff and by binary strings, not by a run.
+* The signal handler is not async-signal-safe by the letter of POSIX (snprintf,
+  the file session and the exit teardown all take locks). If the fault happens
+  while the faulting thread holds one of those locks, the handler can block
+  instead of leaving; in that case the L+R+Plus+Minus watchdog is still the way
+  out. A stack-overflow SIGSEGV cannot be handled usefully at all, because the
+  handler runs on the faulted stack.
+* SIGABRT from abort() is the case this is aimed at (Mesa asserts); whether a
+  hardware fault is delivered as SIGSEGV depends on libnx's exception path
+  raising the signal, which this build cannot confirm without a run.
+* The alias repair remains an assumption about the guest keeping a masked
+  physical address as its own pointer; it is now provably inert unless the two
+  memory blocks disagree.

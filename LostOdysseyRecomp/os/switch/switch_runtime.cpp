@@ -7,10 +7,12 @@
 #include <os/switch_platform.h>
 #include <os/switch_cpu_profiler.h>
 #include <switch.h>
+#include <switch/runtime/env.h>
 #include <sys/iosupport.h>
 #include <atomic>
 #include <chrono>
 #include <cinttypes>
+#include <csignal>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
@@ -22,6 +24,7 @@
 #include <cstdlib>
 #include <malloc.h>
 #include <system_error>
+#include <unistd.h>
 
 #ifdef LO_SWITCH_PGO_GEN
 namespace os::pgo { void StartAutoSave(); void SaveOnExit(); } // os/switch/pgo_switch.cpp: training builds only
@@ -239,6 +242,21 @@ void QuiesceAudio()
     // here first is the one thing a normal homebrew exit never does, and after
     // the HOME -> X run at 14:47:32 kaiHEN's R -> hbmenu hook no longer fired.
     //
+    // Chain-load hbmenu into this same process when the loader supports it
+    // (nx-hbloader / kaiHEN): envSetNextLoad leaves the loader's exit path set
+    // to sdmc:/hbmenu.nro, so L+R+Plus+Minus comes back to hbmenu without the
+    // donor title being closed - and, on 2026-11-17 hardware, without kaiHEN
+    // dropping its R hook the way it did when the process simply ended.
+    // Without loader support the call is skipped and the exit is the ordinary
+    // libnx one below.
+    if (envHasNextLoad())
+    {
+        const Result nextLoad = envSetNextLoad("sdmc:/hbmenu.nro", "\"sdmc:/hbmenu.nro\"");
+        std::fprintf(stderr, "[exit] next load sdmc:/hbmenu.nro: %s (0x%x)\n",
+                     R_SUCCEEDED(nextLoad) ? "set" : "refused", unsigned(nextLoad));
+    }
+    else
+        std::fprintf(stderr, "[exit] loader has no next-load support; leaving through the ordinary exit\n");
     // The exit lock is released before anything else so am's 15 s
     // forced-termination timer can never start while the teardown runs
     // (libnx: appletUnlockExit must be used before main returns).
@@ -248,6 +266,40 @@ void QuiesceAudio()
     std::exit(0);              // __libnx_exit: __appExit (appletExit), __nx_win_exit, svcExitProcess
     svcExitProcess();          // only if exit() itself gave up
     __builtin_unreachable();
+}
+
+// A native fault or a C library abort() in NVK / Mesa does not always reach
+// __libnx_exception_handler, which is where the crash report is written and
+// where every other fatal path leaves for hbmenu. The 15:43:20 run on
+// 2026-11-17 ended at 2.15 s with stderr.log stopping mid-driver and no [exit]
+// line at all: the process was gone without a next load, so the console lost
+// hbmenu. Both signals now leave through the same exit as the watchdog and the
+// title's Quit: next load, exit lock released, libnx's application exit.
+//
+// Deliberately does not allocate and does not use stdio before the line is out:
+// the faulting thread may hold a stdio or logger lock. write(2) reaches
+// StderrWrite (the file plus the network log) without taking stdout's lock.
+void OnFatalSignal(int sig)
+{
+    static std::atomic<int> reported{0};
+    if (reported.exchange(sig, std::memory_order_acq_rel) == 0)
+    {
+        char line[256];
+        const int length = std::snprintf(line, sizeof(line),
+            "\n=== Lost Odyssey Recomp fatal signal %d (%s), unix time %llu; ending the process so hbmenu comes back\n",
+            sig, sig == SIGABRT ? "SIGABRT" : sig == SIGSEGV ? "SIGSEGV" : "signal",
+            (unsigned long long)std::time(nullptr));
+        if (length > 0)
+        {
+            const size_t size = std::min(size_t(length), sizeof(line) - 1);
+            const ssize_t written = write(STDERR_FILENO, line, size);
+            (void)written;
+            // Flushed straight to the card, in case the exit below cannot run.
+            os::switch_platform::RawAppend("crash_report.txt", line, size);
+            os::switch_platform::RawAppend("crash.log", line, size);
+        }
+    }
+    EndProcessToHbmenu();
 }
 
 [[noreturn]] void ExitWithLog()
@@ -989,6 +1041,11 @@ void Initialize(const std::filesystem::path& dataRoot)
     }
     appletLockExit();
     appletHook(&g_operationModeHook, OnAppletEvent, nullptr);
+    // NVK's asserts abort() and a driver fault can skip __libnx_exception_handler
+    // (see OnFatalSignal). Registered after the exit lock is taken, so the exit
+    // below always finds the lock held and releases it exactly once.
+    std::signal(SIGABRT, OnFatalSignal);
+    std::signal(SIGSEGV, OnFatalSignal);
 #if defined(__SWITCH2__)
     StartExitWatchdog();
 #endif

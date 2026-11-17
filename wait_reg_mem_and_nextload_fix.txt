@@ -1,0 +1,168 @@
+Lost Odyssey Recomp - Switch 2 (kaiHEN 20261116, title takeover)
+Report: the WAIT_REG_MEM view deadlock (0x10002) and the envSetNextLoad
+        chain-load back into hbmenu
+==========================================================================
+
+Build   : branch switch2-ouncevk, devkitA64 (devkitpro/switch2), -j20
+Result  : cmake --build build -j20 -> BUILD_EXIT=0
+NRO     : build/LostOdysseyRecomp/LostOdysseyRecomp.nro
+          copied to /mnt/c/Users/Jorda/Desktop/LostOdysseyRecomp.nro
+          86,028,721 bytes, md5 e49f57e74f325302e58a3af76444c734
+Headers : none touched. .cpp only.
+
+Evidence used: runtime-1794946351365393.log (stderr.log) - at 116.749 s and
+143.253 s:
+    [warn] WAIT_REG_MEM stalled 5s (mem 0x10002 ref 0x0 mask 0xffffffff
+           value 0x4), still waiting
+and no [load] line at all.
+
+
+=====================================================================
+1. WHY THE LOADER PROBE STAYED SILENT, AND WHAT THE REAL STALL IS
+=====================================================================
+The probe added last round sits on the pending list in sub_82485030 (the
+subsystem the 2026-11-17 dump pointed at). It never fired, in either
+direction. That is itself the answer for that subsystem: the list is empty
+every frame, cursor == count, so the loading screen is NOT waiting on a
+pending-object job whose slot 288 keeps answering "busy". The loading hold is
+somewhere else entirely - and the log names it: the command processor is
+blocked for 5 s (then 30 s retries) on a memory wait that can never complete.
+
+What the stalled line says, operand by operand:
+
+  mem 0x10002   pollRegAddr from the PM4 packet. Because WAIT_REG_MEM here is
+                a memory wait (waitInfo & 0x10), this is a *physical* address
+                whose low two bits are the endian-swap mode (2 = word swap on
+                this side of a 4-byte word). So the word is physical 0x10000.
+  ref 0x0       the guest wants the word to become 0.
+  mask 0xffffffff  compare the whole word.
+  value 0x4     what 0xA0010000 currently holds, as this emulator reads it.
+
+So: physical 0x10000 is the physical address of a pool buffer at 0xA0010000.
+MmGetPhysicalAddress (kernel/imports.cpp:1120) is exactly
+
+    uint32_t physical = address & 0x1FFFFFFF;      // + 0x1000 for the E view
+    return physical;
+
+so the D3D runtime hands 0x10000 to the GPU in the packet stream. The title's
+own code then keeps using that value as a pointer - it is the same buffer, and
+on the hardware 0x00010000 and 0xA0010000 are the same bytes. The guest's
+plain store of 0 therefore lands at guest offset 0x00010000 while
+TranslatePhysical (command_processor.cpp:310)
+
+    return g_memory.Translate(0xA0000000u + (physicalAddress & 0x1FFFFFFF));
+
+reads 0xA0010000. Under Backend::Heap those are two different host blocks, so
+the GPU polls a stale 4 forever while the guest has already written 0. On the
+desktop hosts the A window is the same memory at offset 0 and both views agree,
+which is why this only appears on the Switch 2 build.
+
+Why the value is 4 and why it is this word: 0x10000 is the first 64 KiB of the
+title's physical pool, which is where D3D puts the swap/scratch writeback words
+(REG_SCRATCH_ADDR writeback goes to TranslatePhysical(scratchAddr + reg*4), the
+same A view; VdSwap writes frontPhysical into the XE_SWAP packet). It is the
+first thing after the loading screen that both sides touch by physical address,
+so it is the first place the two views can disagree.
+
+FIX (gpu/command_processor.cpp, PM4_WAIT_REG_MEM poll loop)
+-----------------------------------------------------------
+  * The condition switch is now WaitRegMemMatches(op, value, ref, mask), one
+    helper used by both the poll and the new check, so the two cannot drift.
+  * When the A-window value does not satisfy the wait, the same word is read
+    through the guest's low view (g_memory.Translate(wordAddress)) and tested
+    with the same predicate. If only the low view satisfies it, that is the
+    view the guest wrote:
+        - the word is copied into the A window (so from here on both views
+          agree, exactly as the hardware aliases them),
+        - the wait completes with the low value,
+        - and one line is logged (at most 8 times):
+            WAIT_REG_MEM 0x10002: A window held 0x4, low guest view holds 0x0
+            and matches ref 0x0 mask 0xffffffff; using and copying the low
+            view (separate 0x0 and 0xa0000000 blocks under Backend::Heap)
+  * It reads and never invents: a wait only completes early when the value it
+    was asking for is genuinely present in the other view. A guest that really
+    is not done still stalls as before, and the 5 s / 30 s warnings still print.
+  * No behavioural change on the desktop hosts: there the two views are the
+    same bytes, so the low value can only match when the A value matches and
+    the new branch never runs.
+
+Related, already in this branch from the previous build: the audio submit path
+reads a frame the same way (base + pointer, no Translate). apu/audio.cpp now
+prefers the A window while no frame has carried a sample and logs
+"audio: submitted frame at 0x... is empty; its audio is at 0x... in the A
+window". That is the same masked-physical-address class of bug in the opposite
+direction (the title wrote the pool view, the import was handed the low one),
+which is why it produced peak=0 for the whole loading screen rather than a
+stall.
+
+
+=====================================================================
+2. hbmenu BACK INTO THE SAME PROCESS (envSetNextLoad)
+=====================================================================
+os/switch/switch_runtime.cpp, EndProcessToHbmenu(), now does this before the
+teardown:
+
+    if (envHasNextLoad())
+    {
+        const Result nextLoad = envSetNextLoad("sdmc:/hbmenu.nro",
+                                               "\"sdmc:/hbmenu.nro\"");
+        fprintf(stderr, "[exit] next load sdmc:/hbmenu.nro: %s (0x%x)\n",
+                R_SUCCEEDED(nextLoad) ? "set" : "refused", nextLoad);
+    }
+    else
+        fprintf(stderr, "[exit] loader has no next-load support; leaving "
+                        "through the ordinary exit\n");
+    appletUnlockExit();
+    std::exit(0);
+
+  * envSetNextLoad writes the "next load" path into the applet's environment,
+    so nx-hbloader / kaiHEN starts sdmc:/hbmenu.nro through the loader's own
+    exit path instead of just ending the process. L+R+Plus+Minus (1.5 s) then
+    comes back to hbmenu without the donor title being closed by am - the run
+    that dropped kaiHEN's R hook (exit_code=0 at 111.765 s, applet type 0).
+  * The call is gated on envHasNextLoad() (libnx runtime/env.h): a loader that
+    does not advertise next-load support returns false there and this build
+    falls back to the ordinary libnx exit, so nothing regresses on a plain
+    hbmenu/loader setup.
+  * The Result is logged either way, so stderr says which path was taken.
+  * Still no ISelfController::Exit, still appletUnlockExit() before the process
+    ends, still std::exit(0) so libnx's __appExit -> appletExit -> __nx_win_exit
+    -> svcExitProcess runs as one teardown (see loading_exit_fix.txt).
+
+What to check on the next run:
+    [exit] next load sdmc:/hbmenu.nro: set (0x0)   -> chain-load path
+    [exit] loader has no next-load support ...      -> plain exit path
+If "set" appears and R still does not open hbmenu afterwards, the loader
+accepted the request but did not act on it, which points at kaiHEN's loader
+version rather than at this title.
+
+
+=====================================================================
+FILES CHANGED THIS ROUND
+=====================================================================
+  gpu/command_processor.cpp
+      WaitRegMemMatches helper; WAIT_REG_MEM now falls back to (and copies
+      from) the guest's low view of the same physical word when only that view
+      satisfies the wait, with a throttled log line.
+  os/switch/switch_runtime.cpp
+      #include <switch/runtime/env.h>; envSetNextLoad("sdmc:/hbmenu.nro") gated
+      on envHasNextLoad(), with the result logged, before appletUnlockExit()
+      and std::exit(0).
+  (unchanged from the previous build: the audio view resolution in
+   apu/audio.cpp, the [load] probe in ppc_recomp_24.cpp, the single-terminator
+   exit and the 15 s guest-thread dump.)
+
+
+=====================================================================
+LIMITS
+=====================================================================
+No Switch 2 hardware here. Everything above is static: the two views are
+provably separate under Backend::Heap in this tree, MmGetPhysicalAddress
+provably returns the masked value the packet carries, and TranslatePhysical
+provably reads only the A window - so the 5 s stall on "mem 0x10002 ref 0x0
+value 0x4" is that mismatch, and the fix completes exactly that wait when the
+guest's own write is visible in the other view. What is not proven without the
+console is whether 0x10000 is the only word the loading screen is stuck on;
+the new log line answers that on the next run (it names each address it
+resolved through the low view, up to 8).
+Nothing is staged or committed.

@@ -1536,6 +1536,69 @@ namespace gpu
                 case 6: matched = (value & mask) > ref; break;
                 case 7: matched = true; break;
                 }
+                if (!matched && isMemory)
+                {
+                    // Switch 2 (Backend::Heap), hardware 2026-11-17: the poll above
+                    // went through the A window, 0xA0000000 + physical.
+                    // "WAIT_REG_MEM stalled 5s (mem 0x10002 ref 0x0 mask
+                    // 0xffffffff value 0x4)" is the same offset read in two
+                    // different host blocks: the guest keeps a buffer's
+                    // *physical* address as its own pointer (0x00010000 for a
+                    // pool buffer at 0xA0010000, low two bits being the endian
+                    // swap mode), so its plain store clears 0x00010000 while
+                    // this wait polls 0xA0010000 and never sees 0. On the
+                    // desktop hosts and on the hardware the two views alias.
+                    //
+                    // Only when the two views actually disagree: an equal read
+                    // is the ordinary case (0 == 0 on every early frame) and
+                    // must reach exactly the decision above, nothing more. This
+                    // is a pure alias repair, never a second opinion about the
+                    // wait: at 15:43:20 an unconditional re-test with a
+                    // different op table released a wait in 1.983 s that the
+                    // switch above had refused, and the CPU then overwrote the
+                    // ring NVK was reading (NVK died at 2.15 s).
+                    const uint32_t wordAddress = pollRegAddr & ~3u;
+                    const uint32_t aWindowValue = value;
+                    auto* low = reinterpret_cast<volatile uint32_t*>(g_memory.Translate(wordAddress));
+                    if (low)
+                    {
+                        const uint32_t lowValue = GpuSwap(*low, pollRegAddr & 3);
+                        if (lowValue == aWindowValue)
+                            { /* the two blocks agree: no fallback, the A window was the answer */ }
+                        else
+                        {
+                            // The same condition as the switch above, applied to
+                            // the other view of the same word.
+                            bool lowMatched = false;
+                            switch (waitInfo & 7)
+                            {
+                            case 0: lowMatched = false; break;
+                            case 1: lowMatched = (lowValue & mask) < ref; break;
+                            case 2: lowMatched = (lowValue & mask) <= ref; break;
+                            case 3: lowMatched = (lowValue & mask) == ref; break;
+                            case 4: lowMatched = (lowValue & mask) != ref; break;
+                            case 5: lowMatched = (lowValue & mask) >= ref; break;
+                            case 6: lowMatched = (lowValue & mask) > ref; break;
+                            case 7: lowMatched = true; break;
+                            }
+                            if (lowMatched)
+                            {
+                                // The guest wrote this word through its own
+                                // (unaliased) pointer: copy it into the A window
+                                // so the two views agree from here on.
+                                *reinterpret_cast<volatile uint32_t*>(TranslatePhysical(wordAddress)) = *low;
+                                value = lowValue;
+                                matched = true;
+                                static std::atomic<uint32_t> aliasLogged{0};
+                                if (aliasLogged.fetch_add(1, std::memory_order_relaxed) < 8)
+                                    LOG_WARNING("WAIT_REG_MEM {:#x}: A window held {:#x}, low guest view holds {:#x} and "
+                                                "matches ref {:#x} mask {:#x}; using and copying the low view "
+                                                "(separate 0x0 and 0xa0000000 blocks under Backend::Heap)",
+                                        pollRegAddr, aWindowValue, lowValue, ref, mask);
+                            }
+                        }
+                    }
+                }
                 if (selfWait && (!matched || value != selfValue))
                 {
                     selfWait = false;
