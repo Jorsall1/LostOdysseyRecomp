@@ -1,0 +1,124 @@
+Crash report, per-line log flush, and the syscalls right after "thread placement"
+==================================================================================
+Switch 2 (kaiHEN 20261116, title takeover), build of 2026-11-16 23:09.
+
+What the 22:22:52 boot proved
+-----------------------------
+Heap backend, XEX load (0x82000000, entry 0x827ca440), NVK init, 1280x720
+swapchain, portable_vk.lospv (28,687 records), shader trimming: all fine.
+stderr.log then ended on
+
+    thread placement: the process may use cores 0x3f
+
+and the process died without a crash report, taking hbmenu with it. That line
+comes from os::switch_cpu_profiler::Start(). stderr is unbuffered there, so the
+boot got past the profiler and died before the next stderr line:
+`[boot] starting guest at ...`. Between those two points the boot runs four
+things: the profiler's watchdog/sampler threads, heap_census::Start(), the
+"switch: ... MemorySummary()" LOG_INFO, then the guest thread.
+
+1. crash_report.txt (was crash.log, and empty)
+----------------------------------------------
+os/switch/switch_runtime.cpp, `__SWITCH2__` only:
+
+  * New AppendCrashReport(): writes through the raw fsp-srv session with
+    FsWriteOption_Flush, so the card has the text before the call returns; if
+    that session is unavailable it falls back to fopen + _IONBF + fflush +
+    fclose. Every chunk is also appended to crash.log, so the log-collection
+    tools keep working.
+  * New WriteSwitch2CrashReport(), called first in __libnx_exception_handler:
+      - exception type: ESR EC decoded to a name (data abort from the same EL,
+        illegal execution state, SP alignment fault, BRK, SVC, ...);
+      - pc / lr / sp / fp / x0-x28, each with `image+<offset>` (offset from
+        _start, which links at 0, the NRO base) and `elf+<offset>` (offset from
+        the module base svcQueryMemory reports) where inside the module;
+      - FAR, ESR, error_desc, pstate, _start and module ranges;
+      - process memory used/total and the heap limit (svcGetInfo only, no
+        mallinfo: the faulting thread may still hold the heap lock);
+      - the register block is written to the card BEFORE the backtrace and the
+        thread dump, so a lock left held by the crash cannot cost the report;
+      - backtrace from fp, then the other threads' stacks (DumpThreads);
+      - ends in "=== end of crash report" and exit(1).
+  * ExitWithLog() now flushes stdout/stderr (not fflush(nullptr): it locks every
+    open file) and calls exit(1) instead of svcExitProcess(), so the applet
+    teardown runs and the console returns to hbmenu instead of the loader seeing
+    a vanished process.
+  * std::set_new_handler(OutOfMemoryHandler): a failed allocation (NVK, host
+    heap, a std::vector) now writes "out of memory (new_handler)" with process
+    memory to crash_report.txt and exits(1) instead of aborting silently.
+  * OnTerminate (std::terminate) writes crash_report.txt as well.
+  * A second fault during reporting appends "second fault while reporting a
+    crash" and exits.
+
+2. Runtime log flushed on every line (`__SWITCH2__`)
+----------------------------------------------------
+os/logger.h: the log stays queued for the writer thread everywhere else, but on
+Switch 2 every Log() line is drained (fwrite + fflush) before it returns, so
+runtime-*.log always ends on the last line the process executed. The writer
+thread is not started in that mode. LO_SWITCH_SYNC_LOG=0 in env.txt restores the
+queued writer if SD latency matters more than the last line.
+
+Cost: one SD write per log line. That is the point of the change (the crash
+window is now closed); turn it off with the env switch once boot is stable.
+
+3. Boot-path syscalls removed (the "clear issue" found by inspection)
+---------------------------------------------------------------------
+The two things that ran immediately after the last log line used syscalls the
+donor title's NPDM masks:
+
+  * MemorySummary() called svcGetInfo(InfoType_ResourceLimit) and
+    svcGetResourceLimitCurrentValue/LimitValue. That summary is evaluated by the
+    very next LOG_INFO after "thread placement". A masked svc* does not return
+    an error under kaiHEN, it terminates the process - which matches a death
+    with no exception and therefore no crash report. On `__SWITCH2__` those
+    calls are gone (the summary keeps heap/process memory, drops the thread
+    counts). Verified: switch_runtime.o has no unresolved resource-limit symbol
+    (svcGetInfo, svcQueryMemory, svcExitProcess, svcSetThreadCoreMask from the
+    guest affinity helpers and the rest of the file remain).
+  * The profiler pinned its watchdog and sampler with svcSetThreadCoreMask;
+    those two calls are now skipped on `__SWITCH2__` (threadCreate already uses
+    ideal core -2, any core). Verified: cpu_profiler_switch.o has 1 call site
+    left, the opt-in LO_THREAD_CORES rule, down from 3.
+
+Neither change is proven to be the killer - nothing can be, offline - but both
+remove a process-killing syscall from the exact stretch of boot that died, and
+the crash report now covers everything else. Expect the crash report to say
+whether the fault is in host code (profiler/census/fmt/NVK) or in the guest.
+
+New stderr markers (unbuffered) in main.cpp isolate the stages:
+    [boot] profiler started; heap census and memory summary next
+    [boot] memory summary done
+    [boot] starting guest at 0x827ca440
+If the next boot ends on the first, the fault is in the profiler threads or the
+heap census; on the second, in MemorySummary or the memory monitor thread; on
+the third, in the guest start itself.
+
+What is still open
+------------------
+  * No hardware here: everything above is statically verified (ELF strings,
+    undefined-symbol check, successful build), not run on a console.
+  * Backend::Heap still gives A/C/E distinct ranges instead of hardware aliases;
+    documented tradeoff from the previous session.
+  * If the report shows a guest data abort, the address will be inside the
+    4 GiB heap block by construction (heap memory cannot fault) - so a guest
+    fault would point at the host stack, a thread stack, or the profiler, not at
+    guest addressing.
+  * crash_report.txt is written next to crash.log and is not yet part of the
+    session archive list in main.cpp (crash.log still gets the same text).
+
+Files changed
+-------------
+  LostOdysseyRecomp/os/switch/switch_runtime.cpp   (report path, exit(1), new_handler, MemorySummary)
+  LostOdysseyRecomp/os/logger.h                    (per-line flush on __SWITCH2__)
+  LostOdysseyRecomp/os/switch/cpu_profiler_switch.cpp (no svcSetThreadCoreMask on __SWITCH2__)
+  LostOdysseyRecomp/main.cpp                       (unbuffered [boot] stage markers)
+
+Build and artifact
+------------------
+  export DEVKITPRO=/opt/devkitpro && source /opt/devkitpro/switch2vars.sh && cmake --build build -j20
+  BUILD_EXIT=0, [100%] Built target LostOdysseyRecomp, no new warnings in the touched files.
+  /mnt/c/Users/Jorda/Desktop/LostOdysseyRecomp.nro
+  86,016,433 bytes, md5 dcc62b9ac4786bebd26d09965b4404a8 (same as build/LostOdysseyRecomp/)
+  ELF strings present: "crash_report.txt", "data abort from the same EL",
+  "illegal execution state", "[boot] profiler started", "[boot] memory summary done",
+  "[boot] starting guest at", "out of memory (new_handler)", "LO_SWITCH_SYNC_LOG".

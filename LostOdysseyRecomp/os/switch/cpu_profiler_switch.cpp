@@ -1105,7 +1105,12 @@ void os::switch_cpu_profiler::Start(bool sampler)
     // The hang watchdog: above the sampler and every game thread.
     if (R_SUCCEEDED(threadCreate(&g_watchdogThread, WatchdogThread, nullptr, nullptr, 0x10000, 0x1C, -2)))
     {
+#if !defined(__SWITCH2__)
+        // A masked svcSetThreadCoreMask ends the process on Switch 2 (kaiHEN's
+        // donor NPDM masks several svc*), and threadCreate with ideal core -2
+        // already leaves the thread free to run on any core.
         svcSetThreadCoreMask(g_watchdogThread.handle, -1, 0x7);
+#endif
         threadStart(&g_watchdogThread);
     }
     else
@@ -1116,7 +1121,9 @@ void os::switch_cpu_profiler::Start(bool sampler)
     // Above every thread it samples (the audio pump is 0x20), so a sample is never late behind them.
     if (R_SUCCEEDED(threadCreate(&g_samplerThread, SamplerThread, nullptr, nullptr, 0x10000, 0x1E, -2)))
     {
-        svcSetThreadCoreMask(g_samplerThread.handle, -1, 0x7);
+#if !defined(__SWITCH2__)
+        svcSetThreadCoreMask(g_samplerThread.handle, -1, 0x7); // see the watchdog above: masked on Switch 2
+#endif
         if (R_SUCCEEDED(threadStart(&g_samplerThread)))
         {
             g_samplerStarted = true;

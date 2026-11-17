@@ -244,10 +244,14 @@ static int RunGuest(uint32_t entry)
             std::filesystem::exists(std::filesystem::path(LO_SWITCH_DATA_ROOT) / "cpu-profile", ec);
         os::switch_cpu_profiler::Start(sampler);
         LOG_INFO("switch: CPU profiler sampler {}", sampler ? "on" : "off");
+        // Unbuffered stderr, so the boot log names the stage it reached even if
+        // the process is gone before the runtime log (or a crash report) lands.
+        std::fprintf(stderr, "[boot] profiler started; heap census and memory summary next\n");
     }
     os::heap_census::Start(); // LO_SWITCH_HEAP_CENSUS builds: LO_HEAP_CENSUS=1
     LOG_INFO("switch: {} mode, guest memory committed {} MiB, {}", os::switch_platform::IsDocked() ? "docked" : "handheld",
              GuestAddressSpace::CommittedBytes() >> 20, os::switch_platform::MemorySummary());
+    std::fprintf(stderr, "[boot] memory summary done\n");
     // Opt-in game file reads every 10 s (LO_IO_PROFILE=1) distinguish slow SD
     // reads from other loading waits. LO_WAIT_PROFILE=1 logs guest waits;
     // LO_LOAD_PROFILE=1 adds thread dumps at 8, 20, 45 and 90 s of a load.
@@ -307,6 +311,7 @@ static int RunGuest(uint32_t entry)
     discord_rpc::Initialize([](const char* message) { LOG_NOTICE("discord: {}", message); });
 
     LOG_INFO("starting guest at {:#x}", entry);
+    std::fprintf(stderr, "[boot] starting guest at %#x\n", entry);
     os::SetCurrentThreadName("Guest Main");
     os::scheduling::PreferPerformanceCores(true);
 #if LO_PLATFORM_SWITCH

@@ -93,6 +93,18 @@ namespace os::logger
     inline std::condition_variable g_writerWake;
     inline bool g_writerStarted = false;       // under g_mutex
     inline constexpr size_t kWriterWakeBytes = 128 * 1024;
+#if defined(__SWITCH2__)
+    // Switch 2 writes every line to the card before Log() returns: the exact line
+    // before a crash is never still queued (the boot that ended after "thread
+    // placement" left no runtime-log line saying where). Set LO_SWITCH_SYNC_LOG=0
+    // in env.txt to go back to the queued writer when SD latency matters more.
+    inline const bool g_syncLog = [] {
+        const char* value = getenv("LO_SWITCH_SYNC_LOG");
+        return !value || value[0] != '0';
+    }();
+#else
+    inline const bool g_syncLog = false;
+#endif
 
     // Writes everything queued so far. Lock order: g_writeMutex, then g_mutex.
     inline void DrainPending()
@@ -157,10 +169,12 @@ namespace os::logger
         if (g_file)
         {
             g_pending += line;
-            if (!g_writerStarted)
+            if (!g_writerStarted && !g_syncLog)
                 StartWriter();
-            if (type == LogType::Error || type == LogType::Warning)
+            if (g_syncLog || type == LogType::Error || type == LogType::Warning)
             {
+                // Switch 2 (g_syncLog): every line, so the last line before a
+                // crash is on the card. Elsewhere only warnings and errors are.
                 lock.unlock();
                 DrainPending();
             }

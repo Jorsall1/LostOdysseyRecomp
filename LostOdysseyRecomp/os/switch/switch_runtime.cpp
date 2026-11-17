@@ -16,6 +16,7 @@
 #include <ctime>
 #include <cxxabi.h>
 #include <exception>
+#include <new>
 #include <typeinfo>
 #include <cstdlib>
 #include <malloc.h>
@@ -79,6 +80,30 @@ ssize_t StderrWrite(struct _reent*, void*, const char* data, size_t size)
 }
 
 char g_crashLogPath[512] = "sdmc:/switch/LostOdysseyRecomp/crash.log";
+// The report the player is asked for when the game dies on the console. The
+// same text still goes to crash.log, which the log-collection tools read.
+char g_crashReportPath[512] = "sdmc:/switch/LostOdysseyRecomp/crash_report.txt";
+
+// Writes one chunk of a crash report to the card and does not return before the
+// card has it: the raw file session writes with FsWriteOption_Flush, so no
+// stdio buffer stands between the text and the file. The stdio fallback (when
+// that session is unavailable) is unbuffered and flushed as well.
+void AppendCrashReport(const char* text, size_t size)
+{
+    if (!text || size == 0)
+        return;
+    if (!os::switch_platform::RawAppend("crash_report.txt", text, size))
+    {
+        if (FILE* file = std::fopen(g_crashReportPath, "a"))
+        {
+            std::setvbuf(file, nullptr, _IONBF, 0);
+            std::fwrite(text, 1, size, file);
+            std::fflush(file);
+            std::fclose(file);
+        }
+    }
+    os::switch_platform::RawAppend("crash.log", text, size); // the old name keeps working
+}
 
 // RawAppend's own file system session (see switch_platform.h). The requests are libnx's fs.c ones,
 // sent directly on this session.
@@ -150,9 +175,37 @@ void WriteAddress(FILE* file, const char* name, uint64_t value)
 [[noreturn]] void ExitWithLog()
 {
     os::logger::DrainForExit(); // lines still queued for the log writer
-    std::fflush(nullptr);
-    svcExitProcess();
+    // Not fflush(nullptr): it locks every open file, and a crashed thread may
+    // still hold one of those locks.
+    std::fflush(stdout);
+    std::fflush(stderr);
+    // The report is already on the card (AppendCrashReport). exit(1) then runs
+    // the atexit teardown (log drain, session archive) and libnx's own, so the
+    // console goes back to hbmenu instead of the loader seeing a vanished
+    // process, which is what took the menu down with the game.
+    std::exit(1);
+    svcExitProcess(); // only if exit() itself gave up
     __builtin_unreachable();
+}
+
+// A failed allocation (NVK, the guest's host heap, a std::vector) aborts through
+// std::terminate, which says nothing about running out of memory. Report it.
+void OutOfMemoryHandler()
+{
+    u64 used = 0, total = 0;
+    svcGetInfo(&used, InfoType_UsedMemorySize, CUR_PROCESS_HANDLE, 0);
+    svcGetInfo(&total, InfoType_TotalMemorySize, CUR_PROCESS_HANDLE, 0);
+    char text[384];
+    const int length = std::snprintf(text, sizeof(text),
+        "\n=== Lost Odyssey Recomp out of memory (new_handler)\nunix time %llu\n"
+        "memory: process %llu of %llu MiB (heap limit %llu MiB)\n=== end of crash report\n",
+        (unsigned long long)std::time(nullptr), (unsigned long long)(used >> 20),
+        (unsigned long long)(total >> 20), (unsigned long long)(size_t(fake_heap_end - fake_heap_start) >> 20));
+    if (length > 0)
+        AppendCrashReport(text, std::min(size_t(length), sizeof(text) - 1));
+    os::logger::DrainForExit();
+    std::fflush(stderr);
+    std::_Exit(1); // exit() would allocate on the way out
 }
 
 void WriteAddress(FILE* file, const char* name, uint64_t value);
@@ -178,7 +231,7 @@ void WriteBacktrace(FILE* file, uintptr_t frame)
 
 void OnTerminate()
 {
-    if (FILE* file = std::fopen(g_crashLogPath, "a"))
+    if (FILE* file = std::fopen(g_crashReportPath, "a"))
     {
         const std::time_t now = std::time(nullptr);
         std::fprintf(file, "\n=== std::terminate, %s", std::ctime(&now));
@@ -208,8 +261,147 @@ void OnTerminate()
 }
 }
 
+#if defined(__SWITCH2__)
+// _start is libnx's crt0 entry, the NRO's first instruction: crash addresses are
+// reported relative to it, the offset addr2line and tools/switch read.
+extern "C" void _start(void) __attribute__((weak));
+
+namespace
+{
+uintptr_t CrashImageBase()
+{
+    const uintptr_t start = reinterpret_cast<uintptr_t>(&_start);
+    return start ? start : g_moduleBase;
+}
+
+// ESR_ELx.EC: the exception class the fault was taken for.
+const char* ExceptionClassName(uint32_t esr)
+{
+    switch ((esr >> 26) & 0x3f)
+    {
+    case 0x00: return "unknown";
+    case 0x01: return "trapped WF*";
+    case 0x07: return "trapped SIMD/FP access";
+    case 0x0E: return "illegal execution state";
+    case 0x11: return "SVC from AArch32";
+    case 0x15: return "SVC from AArch64";
+    case 0x18: return "trapped MSR/MRS/System";
+    case 0x1A: return "trapped HVC";
+    case 0x1C: return "trapped SMC";
+    case 0x20: return "instruction abort from a lower EL";
+    case 0x21: return "instruction abort from the same EL";
+    case 0x22: return "PC alignment fault";
+    case 0x24: return "data abort from a lower EL";
+    case 0x25: return "data abort from the same EL";
+    case 0x26: return "SP alignment fault";
+    case 0x2C: return "trapped floating-point exception";
+    case 0x2F: return "SError";
+    case 0x30: return "breakpoint from a lower EL";
+    case 0x31: return "breakpoint from the same EL";
+    case 0x32: return "software step from a lower EL";
+    case 0x33: return "software step from the same EL";
+    case 0x34: return "watchpoint from a lower EL";
+    case 0x35: return "watchpoint from the same EL";
+    case 0x38: return "BKPT from AArch32";
+    case 0x3C: return "BRK from AArch64";
+    default: return "other";
+    }
+}
+
+// The Switch 2 crash report: what faulted, where, and with the logs flushed, then
+// exit(1). The registers go to the card first, because the backtrace and the
+// thread dump take locks (svcQueryMemory per frame, every profiler slot) that the
+// crash can have left held; a report with just the registers already names the
+// fault. Nothing here allocates.
+[[noreturn]] void WriteSwitch2CrashReport(ThreadExceptionDump* ctx)
+{
+    if (g_crashDepth.fetch_add(1) != 0)
+    {
+        // A second fault: in this handler, or another thread while the first is
+        // being reported (they share the exception stack).
+        static const char second[] =
+            "=== second fault while reporting a crash, report incomplete\n=== end of crash report\n";
+        AppendCrashReport(second, sizeof(second) - 1);
+        svcExitProcess();
+    }
+
+    g_crashLength = 0;
+    char thread[48] = "(unnamed)";
+    os::switch_cpu_profiler::TryGetCurrentThreadName(thread, sizeof(thread));
+    u64 seconds = 0;
+    timeGetCurrentTime(TimeType_Default, &seconds);
+    const uintptr_t image = CrashImageBase();
+    CrashAppend("\n=== Lost Odyssey Recomp crash report, unix time %llu, thread %s\n",
+        (unsigned long long)seconds, thread);
+    CrashAppend("exception: %s (ESR EC %#x), error_desc %#x, esr %#x, far %016llx, pstate %#x\n",
+        ExceptionClassName(ctx->esr), (ctx->esr >> 26) & 0x3f, ctx->error_desc, ctx->esr,
+        (unsigned long long)ctx->far.x, ctx->pstate);
+    CrashAppend("image %016llx (_start), module %016llx-%016llx\n", (unsigned long long)image,
+        (unsigned long long)g_moduleBase, (unsigned long long)g_moduleEnd);
+    auto address = [image](const char* name, uint64_t value) {
+        if (value >= g_moduleBase && value < g_moduleEnd)
+            CrashAppend("%-4s %016llx  (image+%#llx elf+%#llx)\n", name, (unsigned long long)value,
+                (unsigned long long)(value - image), (unsigned long long)(value - g_moduleBase));
+        else if (value >= image)
+            CrashAppend("%-4s %016llx  (image+%#llx)\n", name, (unsigned long long)value,
+                (unsigned long long)(value - image));
+        else
+            CrashAppend("%-4s %016llx\n", name, (unsigned long long)value);
+    };
+    address("pc", ctx->pc.x);
+    address("lr", ctx->lr.x);
+    address("sp", ctx->sp.x);
+    address("fp", ctx->fp.x);
+    for (int i = 0; i < 29; ++i)
+    {
+        char name[8];
+        std::snprintf(name, sizeof(name), "x%d", i);
+        address(name, ctx->cpu_gprs[i].x);
+    }
+    u64 used = 0, total = 0;
+    svcGetInfo(&used, InfoType_UsedMemorySize, CUR_PROCESS_HANDLE, 0);
+    svcGetInfo(&total, InfoType_TotalMemorySize, CUR_PROCESS_HANDLE, 0);
+    CrashAppend("memory: process %llu of %llu MiB, heap limit %llu MiB\n",
+        (unsigned long long)(used >> 20), (unsigned long long)(total >> 20),
+        (unsigned long long)(size_t(fake_heap_end - fake_heap_start) >> 20));
+
+    AppendCrashReport(g_crashText, g_crashLength);
+    g_crashLength = 0;
+
+    CrashAppend("backtrace:\n");
+    uintptr_t frame = ctx->fp.x;
+    for (int depth = 0; depth < 32 && frame && (frame & 7) == 0; ++depth)
+    {
+        MemoryInfo info{};
+        u32 page = 0;
+        if (R_FAILED(svcQueryMemory(&info, &page, frame)) || !(info.perm & Perm_R))
+            break;
+        const auto* record = reinterpret_cast<const uintptr_t*>(frame);
+        address("  at", record[1]);
+        if (record[0] <= frame)
+            break;
+        frame = record[0];
+    }
+    AppendCrashReport(g_crashText, g_crashLength);
+
+    size_t size = 0;
+    const char* threads = os::switch_cpu_profiler::DumpThreads("other threads at the crash:\n", size, "crash_report.txt");
+    AppendCrashReport(threads, size);
+    static const char done[] = "=== end of crash report\n";
+    AppendCrashReport(done, sizeof(done) - 1);
+
+    ExitWithLog(); // flushes the logs, then exit(1)
+}
+}
+#endif
+
 extern "C" void __libnx_exception_handler(ThreadExceptionDump* ctx)
 {
+#if defined(__SWITCH2__)
+    // Switch 2 writes crash_report.txt, flushed chunk by chunk, and ends with
+    // exit(1). Everything below is the older path for the other platforms.
+    WriteSwitch2CrashReport(ctx);
+#endif
     // Runs on __nx_exception_stack. Nothing here allocates or uses stdio until the report is on the
     // card: a crash with an empty crash.log (Uhra, round 6) means the old fopen/fprintf path got stuck.
     if (g_crashDepth.fetch_add(1) != 0)
@@ -628,6 +820,7 @@ void Initialize(const std::filesystem::path& dataRoot)
     std::error_code ec;
     std::filesystem::create_directories(dataRoot, ec);
     std::snprintf(g_crashLogPath, sizeof(g_crashLogPath), "%s", (dataRoot / "crash.log").c_str());
+    std::snprintf(g_crashReportPath, sizeof(g_crashReportPath), "%s", (dataRoot / "crash_report.txt").c_str());
     {
         const std::string root = dataRoot.string();
         std::snprintf(g_rawRoot, sizeof(g_rawRoot), "%s", root.compare(0, 5, "sdmc:") == 0 ? root.c_str() + 5 : root.c_str());
@@ -637,6 +830,7 @@ void Initialize(const std::filesystem::path& dataRoot)
     }
     CaptureModuleRange();
     std::set_terminate(OnTerminate);
+    std::set_new_handler(OutOfMemoryHandler); // a failed allocation reports itself
 
     // Horizon has no console behind stderr: keep the renderer's and the NVK
     // driver's own diagnostics (UnleashedRecomp-NX does the same), and copy
@@ -838,9 +1032,18 @@ void SetMemorySummaryExtra(std::string (*extra)())
 
 std::string MemorySummary()
 {
-    u64 used = 0, total = 0, threadsUsed = 0, threadsLimit = 0;
+    u64 used = 0, total = 0;
     svcGetInfo(&used, InfoType_UsedMemorySize, CUR_PROCESS_HANDLE, 0);
     svcGetInfo(&total, InfoType_TotalMemorySize, CUR_PROCESS_HANDLE, 0);
+    char threads[48] = "";
+#if !defined(__SWITCH2__)
+    // kaiHEN's donor NPDM masks the resource-limit syscalls (svcGetInfo with
+    // InfoType_ResourceLimit and svcGetResourceLimit*), and a masked svc* ends
+    // the process instead of returning an error. This summary is the first thing
+    // that runs after "thread placement: the process may use cores ...", the
+    // last line of the 22:22:52 boot: one masked call there kills the boot with
+    // no exception to report. Switch 2 keeps the thread counts out.
+    u64 threadsUsed = 0, threadsLimit = 0;
     Handle limit = INVALID_HANDLE;
     if (R_SUCCEEDED(svcGetInfo(reinterpret_cast<u64*>(&limit), InfoType_ResourceLimit, INVALID_HANDLE, 0)) && limit != INVALID_HANDLE)
     {
@@ -851,17 +1054,19 @@ std::string MemorySummary()
             threadsLimit = u64(maximum);
         svcCloseHandle(limit);
     }
+    std::snprintf(threads, sizeof(threads), ", threads %llu/%llu",
+        static_cast<unsigned long long>(threadsUsed), static_cast<unsigned long long>(threadsLimit));
+#endif
     // The heap is where nearly everything lives (guest memory chunks, NVK
     // buffers, thread stacks); UsedMemorySize does not count it for us.
     const struct mallinfo heap = mallinfo();
     // libnx gives newlib's heap [fake_heap_start, fake_heap_end); the arena can grow up to that.
     const size_t heapLimit = size_t(fake_heap_end - fake_heap_start);
     char text[224];
-    std::snprintf(text, sizeof(text), "heap in use %llu MiB (arena %llu of %llu MiB), process %llu/%llu MiB, threads %llu/%llu",
+    std::snprintf(text, sizeof(text), "heap in use %llu MiB (arena %llu of %llu MiB), process %llu/%llu MiB%s",
         static_cast<unsigned long long>(size_t(heap.uordblks) >> 20), static_cast<unsigned long long>(size_t(heap.arena) >> 20),
         static_cast<unsigned long long>(heapLimit >> 20),
-        static_cast<unsigned long long>(used >> 20), static_cast<unsigned long long>(total >> 20),
-        static_cast<unsigned long long>(threadsUsed), static_cast<unsigned long long>(threadsLimit));
+        static_cast<unsigned long long>(used >> 20), static_cast<unsigned long long>(total >> 20), threads);
     if (const auto extra = g_memorySummaryExtra.load(std::memory_order_acquire))
         return text + extra();
     return text;
