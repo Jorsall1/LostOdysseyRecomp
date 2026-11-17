@@ -1,0 +1,247 @@
+Lost Odyssey Recomp - Switch 2 4 GiB guest window: virtmemFindAslr fix
+======================================================================
+
+Build: 19:53, BUILD_EXIT=0
+  build/LostOdysseyRecomp/LostOdysseyRecomp.nro   85,971,377 bytes
+  sha256 9538b70cb1b7ffffb1e90f6016ae0bb3519671f1ef3cae739ea644b2822f2273
+  copied to /mnt/c/Users/jorda/Desktop/LostOdysseyRecomp.nro (same hash)
+
+
+1. WHAT THE FAILURE WAS
+-----------------------
+kaiHEN 20261116, title takeover: the runtime reaches Memory (a static object
+constructed before main), logs
+
+  [error] failed to initialize the 4 GiB guest address space:
+          operation=reserve any address view=-1 address=0x0
+          size=0x100000000 offset=0x0
+  [error] guest address space: Horizon result=0x... api=virtmemFindAslr
+
+from the single virtmemFindAslr(0x100000000, 0x200000) call in
+kernel/guest_address_space_switch.cpp. On the tested NRO that call returned
+NULL (0), so Allocate() bailed out before any syscall was tried. main.cpp then
+opened the Horizon error applet, which ends in "The software was closed because
+an error occurred" and unloads kaiHEN.
+
+
+2. LIBOUNCE'S virtmem, DISASSEMBLED
+-----------------------------------
+Symbols come from /opt/devkitpro/libounce/lib/libounce.a:virtmem.o
+(kernel/virtmem.c; the object matches switchbrew/libnx master). The headers
+live in libounce/include/switch/kernel/virtmem.h (the path
+switch/runtime/util/virtmem.h does not exist in this libounce).
+
+    virtmemSetup()
+      g_AliasRegion = svcGetInfo(InfoType_AliasRegionAddress 2, Size 3)
+                      minus InfoType_AliasRegionExtraSize 28 (if available)
+      g_HeapRegion  = svcGetInfo(InfoType_HeapRegionAddress 4, Size 5)
+      g_AslrRegion  = svcGetInfo(InfoType_AslrRegionAddress 12, Size 13)
+      g_StackRegion = svcGetInfo(InfoType_StackRegionAddress 14, Size 15)
+      every other kernel (not 1.0.0) takes these real values; the hardcoded
+      {0x200000,0x100000000} / {0x8000000,0x1000000000} fallback is only for
+      the 1.0.0 "legacy" detection, which needs svcGetInfo(12/13) to fail.
+
+    _memregionFindRandom(region, size, guard)        <- virtmemFindAslr
+      size  = (size  + 0xFFF) & ~0xFFF
+      guard = (guard + 0xFFF) & ~0xFFF
+      if (size > region.end - region.start) return NULL;     <-- size gate
+      repeat at most 0x200 (512) times:
+        cur = region.start + (rng % ((regionSize - size) >> 12)) * 0x1000
+        reject if cur..cur+size overlaps g_AliasRegion
+        reject if cur..cur+size overlaps g_HeapRegion
+        reject if svcQueryMemory(cur - guard) is not one Unmapped block that
+               covers cur + size + guard
+        reject if cur..cur+size (+guard) overlaps any VirtmemReservation
+        otherwise return cur
+      return NULL
+
+    virtmemFindCodeMemory(size, guard)
+      same _memregionFindRandom, on g_StackRegion only when g_IsLegacyKernel,
+      otherwise on g_AslrRegion -- i.e. on every modern kernel it searches the
+      same region as virtmemFindAslr. It is not a second, larger pool.
+
+    virtmemAddReservation(mem, size)
+      mallocs a 32-byte node {start = mem, end = mem + size} and pushes it on
+      g_Reservations. It checks no overlaps and maps nothing: it only keeps
+      later virtmemFind* calls away from the range. Both it and the Find*
+      functions return NULL unless virtmemLock() is held by the calling thread.
+
+Why a 4 GiB request fails on Switch 2, therefore, is one of exactly two things:
+
+  (a) the code/ASLR region the kernel reports (InfoType 12/13) is smaller than
+      4 GiB, so _memregionFindRandom returns NULL on the size gate without
+      looking at a single address; or
+  (b) the region is big enough, but it contains no single free 4 GiB slice --
+      everything is split by the alias region, the heap region, the process's
+      own code/heap/stacks, or existing reservations -- so 512 random tries
+      miss.
+
+Either way the failure says nothing about the rest of the process's address
+space: virtmem never looks outside that one region, and it never accepts a
+window assembled from several fragments. Switch 2's larger layout (and
+InfoType 12/13 reporting the *code alias* region, kern_svc_info.cpp's
+GetAliasCodeRegionStart/Size) is exactly the case it cannot express.
+
+That matters because the window needs no code-alias region at all:
+svcMapProcessMemory's destination only has to be Free/unmapped VA (the kernel's
+MapMemory requires dst memory state Free); only svcMapProcessCodeMemory (0x77,
+used for the 2 MiB chunk sources) requires the alias-code region. So the guest
+window may live anywhere that is currently unmapped.
+
+Also relevant to reading the old log: the recorded error code distinguishes the
+two failure sites. result=0x0 is the window reservation above;
+result=0xffffffff is the later "backend: none" path, where both syscall probes
+were refused. The tested log did not include the "guest memory: ..." lines that
+say which one it was -- the new build logs all of them (section 3.1).
+
+
+3. WHAT CHANGED
+---------------
+3.1 LostOdysseyRecomp/kernel/guest_address_space_switch.cpp  (__SWITCH2__ only)
+
+The svcGetInfo report now logs all three requested regions (plus two more that
+the placement code needs), each with its own result code and end address:
+
+    guest memory: switch 2: hints 0x73=.. 0x74=.. ...
+    guest memory: switch 2: total=0x.. (rc 0x0) used=0x.. (rc 0x0)
+    guest memory: switch 2: aslr region=0x..+0x.. end=0x.. (address rc 0x0, size rc 0x0)
+    guest memory: switch 2: alias region=0x..+0x.. end=0x.. (address rc 0x0, size rc 0x0)
+    guest memory: switch 2: heap region=0x..+0x.. end=0x.. (address rc 0x0, size rc 0x0)
+    guest memory: switch 2: stack region=0x..+0x.. end=0x.. (address rc 0x0, size rc 0x0)
+    guest memory: switch 2: address space size=0x.. (rc 0x0), window needs 4096 MiB contiguous
+    guest memory: switch 2: newlib heap .. MiB in use, .. MiB arena
+    guest memory: switch 2: own process handle env=0x.. resolved=0x..
+
+The window is then reserved by ReserveWindow(), which tries, in order, and
+logs every step:
+
+  1. virtmemFindAslr(0x100000000, 0x200000)          (the old call)
+  2. virtmemFindCodeMemory(0x100000000, 0x200000)    (same region, kept as a probe)
+  3. a scan of the kernel-reported aslr/code region (InfoType 12/13)
+  4. a scan of the alias region (InfoType 2/3)
+  5. a scan of the whole process address space, up to
+     max(reported region ends, InfoType_AddressSpaceSize 36), capped at 1 TiB
+
+Steps 3-5 walk the range block by block with svcQueryMemory (one call per
+memory block, not per page) and take the first page-aligned Unmapped run of
+4 GiB that overlaps none of the ranges that must stay available: the heap
+region (newlib heap growth), the stack region (thread stacks), and, outside
+the region being scanned, the alias region (kernel/nvmap aliases) and the
+code/ASLR region (2 MiB code-memory sources). The chosen range is registered
+with virtmemAddReservation() under virtmemLock(), so libnx's own later
+allocations avoid it; without the reservation the window would still be usable
+by the kernel, but libnx could hand the same VA to a stack or code mapping.
+
+Log on a healthy run, for example:
+
+    guest memory: window: virtmemFindAslr(0x100000000, 0x200000) returned 0x0 (reservation 0x0)
+    guest memory: window: aslr-code 0x8000000-0x80000000 has no 4096 MiB run (largest unmapped 1904 MiB at 0x8510000)
+    guest memory: window: alias 0x100000000-0x280000000 has no 4096 MiB run (...)
+    guest memory: window: address space run 0x280000000-0x380000000 reserved
+    guest memory: window: reserved 4096 MiB at 0x280000000
+    guest memory: probe process memory: code=0x... view=0x... code=0x0 perm=0x0 map=0x0
+    guest memory: probe process memory: usable
+    guest memory: backend: process memory (0x77/0x74)
+
+(the numbers above are illustrative; the real ones come from the kernel)
+
+The diagnostics string grew from 2048 to 4096 bytes so the placement lines are
+not truncated before the failure report.
+
+3.2 LostOdysseyRecomp/main.cpp  (__SWITCH2__ only)
+
+The collected diagnostics are written to the runtime log as soon as the log
+file exists (Memory is a static object, so its lines are collected before
+logging starts). Every session's state/logs/runtime-*.log now contains the
+region lines above, not only sessions that fail:
+
+    guest memory: switch 2: aslr region=... | alias region=... | heap region=...
+
+The failure branch keeps its LOG_ERROR("guest address space: ...") lines and
+still passes the diagnostics to ShowError -- but ShowError no longer opens a
+dialog on Switch 2 (3.3), so that call now only writes them to stderr and then
+ends the process.
+
+3.3 LostOdysseyRecomp/os/switch/switch_runtime.cpp
+
+    void ShowError(summary, details)      (main.cpp's only fatal-error call)
+      prints "fatal: <summary>" and the details to stderr; on __SWITCH2__
+      it does NOT call errorApplicationCreate/errorApplicationShow (the error
+      applet is what produced "The software was closed because an error
+      occurred" and unloaded kaiHEN). It calls ExitNow() instead:
+
+        os::logger::DrainForExit();   // queued runtime-log lines
+        fflush(stdout); fflush(stderr);
+        __nx_win_exit();              // no-op: no window was created yet
+        appletUnlockExit();  SelfController::Exit  (on its own thread, <=10 s)
+        svcExitProcess();
+
+      That is the same path as the in-game Quit, which is known to return to
+      hbmenu. The fatal text plus the flushed runtime log are the report.
+      Switch 1 builds keep the system dialog. No main.cpp call site had to
+      change: both fatal paths there (missing default.xex, guest memory) go
+      through ShowError.
+
+      os::switch_platform::ShowError is also used by the rest of the Switch
+      code, so a fatal error after startup no longer risks the exploit either.
+
+
+4. BUILD
+--------
+    source /opt/devkitpro/switch2vars.sh && cmake --build build -j3
+    BUILD_EXIT=0, "Linking CXX executable LostOdysseyRecomp.elf",
+    "Packaging LostOdysseyRecomp.nro", "[100%] Built target LostOdysseyRecomp"
+
+guest_address_space_switch.cpp, main.cpp and switch_runtime.cpp compile with no
+new warnings (only the pre-existing xdm.h multi-character constants and the
+main.cpp u8path deprecation warnings). gpu/renderer.cpp was already stale in
+the build tree and rebuilt once with no changes of its own.
+
+Static checks on build/LostOdysseyRecomp/LostOdysseyRecomp.elf:
+    "switch 2: %s region=%#llx+%#llx end=%#llx (address rc %#x, size rc %#x)"   present
+    "window: virtmemFindAslr/CodeMemory(%#zx, %#zx) returned %p"                present
+    "window: %s run %#llx-%#llx reserved" / "has no %#zx MiB run"                present
+    "switch 2: address space size=..."                                          present
+    os::switch_platform::ShowError disassembly: fprintf, then
+        bl os::switch_platform::ExitNow -- no errorApplicationCreate/Show
+    GuestAddressSpace::Allocate / DiagnosticsText                               present
+    NRO packaging: 85,971,377 bytes, sha256 9538b70c...2f2273
+
+
+5. NEXT BOOT - WHAT TO READ (state/logs/runtime-*.log, or stderr.log)
+---------------------------------------------------------------------
+1. Early lines: the five region lines say what the kernel actually reports.
+   If "aslr region" is smaller than 0x100000000, that alone explains the old
+   NULL (it can never fit the window) and the window should come from the
+   alias or address-space scan instead.
+2. "window: <strategy> run 0x...-0x... reserved" names the strategy that
+   worked. "address space" is the expected one on a layout whose free 4 GiB is
+   not inside InfoType 12/13.
+3. "backend: process memory (0x77/0x74)" means the chunk mappings work. If it
+   says "backend: none", the printed 0x77/0x74 and 0x15/0x51 result codes are
+   the answer: kaiHEN is not granting the syscalls for this title, and no
+   address-space change can help.
+4. If the window still cannot be placed, the log gives each range's largest
+   unmapped run and its address; that is the exact size of the largest
+   reserved-free hole the process has, so the remaining options (a smaller
+   guest window, or moving the newlib heap) can be judged from it.
+5. A fatal boot now ends with "fatal: ..." in stderr.log and the runtime log,
+   then exit.log gets the usual "exit: started / logs flushed / window closed /
+   applet Exit result 0x0 / ending the process directly" marks, and the
+   console returns to hbmenu. A visible Horizon crash dialog would mean the
+   path was not the one above - report it with the log.
+
+NOTES / LIMITATIONS
+-------------------
+- Verified by build, packaging and static inspection only. Nothing here was
+  run on Switch 2 hardware: the scan/placement order is reasoned from the
+  kernel's region definitions and svcMapProcessMemory's Free-destination rule,
+  not observed.
+- Placing the window in the alias region (strategy 4) or in generic address
+  space (5) is legal for svcMapProcessMemory but reduces the VA left for
+  kernel/nvmap aliases; the log says when that happened, so a later renderer
+  failure caused by it is attributable.
+- The guest window's 4 GiB requirement itself was not changed; this makes the
+  reservation find any free 4 GiB the process has, and reports precisely when
+  there is none.
+- Nothing was committed to git. mem_fix.txt (previous session) is unchanged.

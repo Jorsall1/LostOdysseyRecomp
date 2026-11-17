@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <iterator>
 #include <mutex>
 
 // Nintendo Switch backend (Horizon OS, libnx). Ported from UnleashedRecomp-NX
@@ -75,7 +76,7 @@ bool s_storeAliasGapLogged = false;
 // One line (separated by " | ") for the log and the error dialog: nothing else
 // exists during Memory's construction, so a failed boot reports the kernel's
 // answers from here.
-char s_diagnostics[2048];
+char s_diagnostics[4096];
 size_t s_diagnosticLength = 0;
 
 void Diag(const char* format, ...)
@@ -110,6 +111,235 @@ bool ProcessMemorySyscallsAvailable()
 #endif
 
 #if defined(__SWITCH2__)
+// One svcGetInfo region with the result of each query: a region the kernel
+// refuses, or one smaller than the guest window, is part of the answer when
+// virtmemFindAslr returns NULL.
+struct InfoRegion
+{
+    u64 address;
+    u64 size;
+    Result addressResult;
+    Result sizeResult;
+
+    bool Valid() const { return R_SUCCEEDED(addressResult) && R_SUCCEEDED(sizeResult) && size != 0; }
+    u64 End() const { return address + size; }
+};
+
+InfoRegion QueryInfoRegion(InfoType addressType, InfoType sizeType)
+{
+    InfoRegion region{};
+    region.addressResult = svcGetInfo(&region.address, addressType, CUR_PROCESS_HANDLE, 0);
+    region.sizeResult = svcGetInfo(&region.size, sizeType, CUR_PROCESS_HANDLE, 0);
+    return region;
+}
+
+// libnx's virtmem.c builds its tables from exactly these InfoTypes: alias 2/3,
+// heap 4/5, aslr 12/13, stack 14/15. Keeping the values lets the reservation
+// code check the same layout the kernel reports instead of libnx's copy.
+InfoRegion s_aslrRegion{};
+InfoRegion s_aliasRegion{};
+InfoRegion s_heapRegion{};
+InfoRegion s_stackRegion{};
+u64 s_addressSpaceSize = 0;         // InfoType_AddressSpaceSize (23.0.0+), 0 when unavailable
+Result s_addressSpaceResult = 1;    // 1: not queried
+
+void LogInfoRegion(const char* name, const InfoRegion& region)
+{
+    Diag("switch 2: %s region=%#llx+%#llx end=%#llx (address rc %#x, size rc %#x)", name,
+        (unsigned long long)region.address, (unsigned long long)region.size, (unsigned long long)region.End(),
+        uint32_t(region.addressResult), uint32_t(region.sizeResult));
+}
+
+// A half-open address range the window must not use.
+struct ExcludeRange
+{
+    u64 start;
+    u64 end;
+};
+
+ExcludeRange RegionExclude(const InfoRegion& region)
+{
+    return region.Valid() ? ExcludeRange{ region.address, region.End() } : ExcludeRange{ 0, 0 };
+}
+
+u64 PageAlign(u64 value)
+{
+    return (value + kPage - 1) & ~u64(kPage - 1);
+}
+
+struct GapSearch
+{
+    u64 address;    // 0: no run of the wanted size
+    u64 largest;    // largest unmapped run seen, for the log when address is 0
+    u64 largestAt;
+};
+
+// Walks [start, end) block by block with svcQueryMemory and returns the first
+// page-aligned unmapped run of at least size bytes that overlaps none of
+// excluded. svcQueryMemory reports a whole block per call, so this costs one
+// call per memory block; the walk does not depend on libnx's virtmem table,
+// whose random placement cannot find a 4 GiB run in a region assembled from
+// several separate fragments.
+GapSearch FindGap(u64 start, u64 end, u64 size, const ExcludeRange* excluded, size_t excludedCount)
+{
+    GapSearch result{};
+    u64 cursor = std::max(PageAlign(start), u64(kPage));
+    while (cursor < end && cursor + size > cursor)
+    {
+        MemoryInfo info{};
+        u32 pageInfo = 0;
+        if (R_FAILED(svcQueryMemory(&info, &pageInfo, cursor)))
+            break;
+        const u64 blockEnd = info.addr + info.size;
+        if (info.size == 0 || blockEnd <= cursor)
+            break;
+        if (info.type == MemType_Unmapped)
+        {
+            const u64 limit = std::min<u64>(blockEnd, end);
+            const u64 from = std::max(PageAlign(cursor), PageAlign(start));
+            if (limit > from && limit - from > result.largest)
+            {
+                result.largest = limit - from;
+                result.largestAt = from;
+            }
+            u64 candidate = from;
+            while (candidate + size <= limit)
+            {
+                u64 advance = 0;
+                for (size_t i = 0; i < excludedCount; ++i)
+                    if (candidate < excluded[i].end && excluded[i].start < candidate + size)
+                        advance = std::max(advance, excluded[i].end);
+                if (advance == 0)
+                {
+                    result.address = candidate;
+                    return result;
+                }
+                candidate = PageAlign(advance);
+            }
+        }
+        cursor = blockEnd;
+    }
+    return result;
+}
+
+VirtmemReservation* AddReservation(u64 address, size_t size)
+{
+    virtmemLock();
+    VirtmemReservation* const reservation = virtmemAddReservation(reinterpret_cast<void*>(address), size);
+    virtmemUnlock();
+    return reservation;
+}
+
+// Reserves the first free run of region and, useless as it would be without
+// libnx knowing, records it in libnx's reservation list. Returns 0 when the
+// region has no run of size bytes; reason goes to the log either way.
+u64 ReserveGap(const char* name, const InfoRegion& region, size_t size, const ExcludeRange* excluded,
+    size_t excludedCount, VirtmemReservation*& reservation)
+{
+    if (!region.Valid())
+    {
+        Diag("window: no %s to scan (address rc %#x, size rc %#x)", name, uint32_t(region.addressResult),
+            uint32_t(region.sizeResult));
+        return 0;
+    }
+    const GapSearch gap = FindGap(region.address, region.End(), size, excluded, excludedCount);
+    if (gap.address == 0)
+    {
+        Diag("window: %s %#llx-%#llx has no %#zx MiB run (largest unmapped %#llx MiB at %#llx)", name,
+            (unsigned long long)region.address, (unsigned long long)region.End(), size >> 20,
+            (unsigned long long)(gap.largest >> 20), (unsigned long long)gap.largestAt);
+        return 0;
+    }
+    reservation = AddReservation(gap.address, size);
+    if (!reservation)
+    {
+        Diag("window: %s run %#llx-%#llx not reserved", name, (unsigned long long)gap.address,
+            (unsigned long long)(gap.address + size));
+        return 0;
+    }
+    Diag("window: %s run %#llx-%#llx reserved", name, (unsigned long long)gap.address,
+        (unsigned long long)(gap.address + size));
+    return gap.address;
+}
+
+u64 AddressSpaceLimit()
+{
+    u64 limit = std::max(std::max(s_aslrRegion.End(), s_aliasRegion.End()),
+        std::max(s_heapRegion.End(), s_stackRegion.End()));
+    if (R_SUCCEEDED(s_addressSpaceResult) && s_addressSpaceSize > limit)
+        limit = s_addressSpaceSize;
+    if (limit < 0x10000)
+        limit = 0x8000000000ull; // 39-bit user space: the narrowest Horizon has
+    return std::min<u64>(limit, 0x10000000000ull); // one walk is cheap, but a bogus answer must not run forever
+}
+
+// Reserves the 4 GiB window. libnx's virtmem only searches the code/ASLR region
+// and only accepts a random slice of it, so a layout where the free 4 GiB sits
+// elsewhere (Switch 2) always gets NULL from it. Each step is logged with its
+// outcome, so a failed boot reports exactly which placements the kernel's own
+// layout allowed.
+uint8_t* ReserveWindow(size_t size, size_t guard, VirtmemReservation*& reservation)
+{
+    reservation = nullptr;
+    {
+        virtmemLock();
+        void* const base = virtmemFindAslr(size, guard);
+        reservation = base ? virtmemAddReservation(base, size) : nullptr;
+        virtmemUnlock();
+        if (base && reservation)
+        {
+            Diag("window: virtmemFindAslr(%#zx, %#zx) placed %#zx MiB at %p", size, guard, size >> 20, base);
+            return static_cast<uint8_t*>(base);
+        }
+        Diag("window: virtmemFindAslr(%#zx, %#zx) returned %p (reservation %p)", size, guard, base,
+            static_cast<void*>(reservation));
+        reservation = nullptr;
+    }
+    {
+        virtmemLock();
+        void* const base = virtmemFindCodeMemory(size, guard);
+        reservation = base ? virtmemAddReservation(base, size) : nullptr;
+        virtmemUnlock();
+        if (base && reservation)
+        {
+            Diag("window: virtmemFindCodeMemory(%#zx, %#zx) placed %#zx MiB at %p", size, guard, size >> 20, base);
+            return static_cast<uint8_t*>(base);
+        }
+        Diag("window: virtmemFindCodeMemory(%#zx, %#zx) returned %p (reservation %p)", size, guard, base,
+            static_cast<void*>(reservation));
+        reservation = nullptr;
+    }
+
+    const ExcludeRange alias = RegionExclude(s_aliasRegion);
+    const ExcludeRange heap = RegionExclude(s_heapRegion);
+    const ExcludeRange stack = RegionExclude(s_stackRegion);
+    const ExcludeRange code = RegionExclude(s_aslrRegion);
+    // The window is only address space (svcMapProcessMemory fills it later, at
+    // any unmapped address), but the heap, the thread stacks and the kernel's
+    // alias region must stay available for the rest of the process.
+    const ExcludeRange keepCode[] = { alias, heap, stack };
+    const ExcludeRange keepAlias[] = { code, heap, stack };
+    const ExcludeRange keep[] = { alias, heap, stack };
+
+    u64 address = ReserveGap("aslr-code", s_aslrRegion, size, keepCode, std::size(keepCode), reservation);
+    if (!address)
+        address = ReserveGap("alias", s_aliasRegion, size, keepAlias, std::size(keepAlias), reservation);
+    if (!address)
+    {
+        // Last resort: every address the process can reach, in one walk. On
+        // Switch 2 the free 4 GiB can sit in the gap between two regions.
+        const u64 limit = AddressSpaceLimit();
+        if (limit > kPage)
+        {
+            const InfoRegion anywhere{ u64(kPage), limit - kPage, 0, 0 };
+            address = ReserveGap("address space", anywhere, size, keep, std::size(keep), reservation);
+        }
+        else
+            Diag("window: no address space limit to scan");
+    }
+    return reinterpret_cast<uint8_t*>(address);
+}
+
 // Everything the failure report needs, gathered before anything can log it.
 void LogFacts()
 {
@@ -119,25 +349,27 @@ void LogFacts()
         int(envIsSyscallHinted(kSvcUnmapProcessCodeMemory)), int(envIsSyscallHinted(kSvcCreateTransferMemory)),
         int(envIsSyscallHinted(kSvcMapTransferMemory)), int(envIsSyscallHinted(kSvcUnmapTransferMemory)));
 
-    u64 total = 0, used = 0, aslr = 0, aslrSize = 0, heap = 0, heapSize = 0, alias = 0, aliasSize = 0;
+    u64 total = 0, used = 0;
     const Result rcTotal = svcGetInfo(&total, InfoType_TotalMemorySize, CUR_PROCESS_HANDLE, 0);
     const Result rcUsed = svcGetInfo(&used, InfoType_UsedMemorySize, CUR_PROCESS_HANDLE, 0);
-    const Result rcAslr = svcGetInfo(&aslr, InfoType_AslrRegionAddress, CUR_PROCESS_HANDLE, 0);
-    const Result rcAslrSize = svcGetInfo(&aslrSize, InfoType_AslrRegionSize, CUR_PROCESS_HANDLE, 0);
-    svcGetInfo(&heap, InfoType_HeapRegionAddress, CUR_PROCESS_HANDLE, 0);
-    svcGetInfo(&heapSize, InfoType_HeapRegionSize, CUR_PROCESS_HANDLE, 0);
-    svcGetInfo(&alias, InfoType_AliasRegionAddress, CUR_PROCESS_HANDLE, 0);
-    svcGetInfo(&aliasSize, InfoType_AliasRegionSize, CUR_PROCESS_HANDLE, 0);
-    Diag("switch 2: total=%#llx (rc %#x) used=%#llx (rc %#x)", (unsigned long long)total, rcTotal,
-        (unsigned long long)used, rcUsed);
-    Diag("switch 2: aslr=%#llx+%#llx (rc %#x/%#x) heap-region=%#llx+%#llx alias=%#llx+%#llx",
-        (unsigned long long)aslr, (unsigned long long)aslrSize, rcAslr, rcAslrSize, (unsigned long long)heap,
-        (unsigned long long)heapSize, (unsigned long long)alias, (unsigned long long)aliasSize);
+    Diag("switch 2: total=%#llx (rc %#x) used=%#llx (rc %#x)", (unsigned long long)total, uint32_t(rcTotal),
+        (unsigned long long)used, uint32_t(rcUsed));
+
+    s_aslrRegion = QueryInfoRegion(InfoType_AslrRegionAddress, InfoType_AslrRegionSize);
+    s_aliasRegion = QueryInfoRegion(InfoType_AliasRegionAddress, InfoType_AliasRegionSize);
+    s_heapRegion = QueryInfoRegion(InfoType_HeapRegionAddress, InfoType_HeapRegionSize);
+    s_stackRegion = QueryInfoRegion(InfoType_StackRegionAddress, InfoType_StackRegionSize);
+    s_addressSpaceResult = svcGetInfo(&s_addressSpaceSize, InfoType_AddressSpaceSize, CUR_PROCESS_HANDLE, 0);
+    LogInfoRegion("aslr", s_aslrRegion);
+    LogInfoRegion("alias", s_aliasRegion);
+    LogInfoRegion("heap", s_heapRegion);
+    LogInfoRegion("stack", s_stackRegion);
+    Diag("switch 2: address space size=%#llx (rc %#x), window needs %#zx MiB contiguous",
+        (unsigned long long)s_addressSpaceSize, uint32_t(s_addressSpaceResult), kSize >> 20);
 
     const struct mallinfo memory = mallinfo();
-    Diag("switch 2: newlib heap %llu MiB in use, %llu MiB arena, window needs %#zx MiB contiguous",
-        (unsigned long long)(size_t(memory.uordblks) >> 20), (unsigned long long)(size_t(memory.arena) >> 20),
-        kSize >> 20);
+    Diag("switch 2: newlib heap %llu MiB in use, %llu MiB arena", (unsigned long long)(size_t(memory.uordblks) >> 20),
+        (unsigned long long)(size_t(memory.arena) >> 20));
 }
 
 // Probes the process-memory pair on a scratch page: map 4 KiB of real heap into
@@ -450,11 +682,15 @@ uint8_t* Allocate()
     s_backend = Backend::ProcessMemory;
 #endif
 
+#if defined(__SWITCH2__)
+    s_base = ReserveWindow(kSize, kChunk, s_reservation);
+#else
     virtmemLock();
     s_base = static_cast<uint8_t*>(virtmemFindAslr(kSize, kChunk));
     if (s_base)
         s_reservation = virtmemAddReservation(s_base, kSize);
     virtmemUnlock();
+#endif
     if (!s_base || !s_reservation)
     {
         Diag("window: %#zx MiB at %p not reserved (reservation %p)", kSize >> 20, s_base, s_reservation);

@@ -792,9 +792,19 @@ void ExitNow()
 void ShowError(const std::string& summary, const std::string& details)
 {
     std::fprintf(stderr, "fatal: %s\n%s\n", summary.c_str(), details.c_str());
+#if defined(__SWITCH2__)
+    // Under kaiHEN's title takeover the system error applet cannot be shown: it
+    // ends in "The software was closed because an error occurred", which unloads
+    // the exploit. Leave the way a normal quit does instead - ExitNow flushes
+    // stderr and the runtime log, asks the applet manager to exit and ends the
+    // process - so the console returns to hbmenu with the session log on the SD
+    // card. The fatal line above and the runtime log are the report.
+    ExitNow();
+#else
     ErrorApplicationConfig config{};
     if (R_SUCCEEDED(errorApplicationCreate(&config, summary.c_str(), details.c_str())))
         errorApplicationShow(&config);
+#endif
 }
 
 bool IsDocked()

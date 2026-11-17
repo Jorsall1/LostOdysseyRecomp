@@ -526,6 +526,14 @@ int main(int argc, char* argv[])
         }
         else LOG_WARNING("could not open log file: {}", FileSystem::PathUtf8(logPath));
     }
+#if defined(__SWITCH2__)
+    // The kernel's memory-region report and the window placement are collected
+    // during static construction (Memory), before this log file exists; write
+    // them now so every session's runtime log says what the address space
+    // looked like, not only the sessions that failed to reserve the window.
+    if (const char* const diagnostics = GuestAddressSpace::DiagnosticsText(); diagnostics && *diagnostics)
+        LOG_NOTICE("guest memory: {}", diagnostics);
+#endif
     if (compactGameData)
         return CompactGameDataCommand(FindGameRoot(executableDirectory, explicitGamePath).root);
     InstallCrashHandler();
