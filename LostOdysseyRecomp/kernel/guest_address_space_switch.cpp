@@ -11,6 +11,10 @@
 #include <iterator>
 #include <mutex>
 #include <sys/stat.h>
+#if defined(__SWITCH2__) && __has_include(<switch/fsdev.h>)
+#include <switch/fsdev.h>
+#define LO_EARLY_LOG_FSDEV 1
+#endif
 
 // Nintendo Switch backend (Horizon OS, libnx). Ported from UnleashedRecomp-NX
 // (kernel/memory.cpp) and extended with the Xbox 360 physical aliases.
@@ -69,6 +73,9 @@ std::mutex s_mutex;
 // committed together with A and never on their own.
 bool s_committed[kChunkCount]{};
 size_t s_committedBytes = 0;
+// How many of the first commits are traced in early_boot.log (see Commit).
+constexpr int kEarlyChunkLogs = 8;
+int s_earlyChunkLogs = 0;
 // Code-memory source (ProcessMemory) or transfer-memory handle (TransferMemory)
 // of each committed chunk, under s_mutex, to map a view again (EnsureBacked).
 uintptr_t s_source[kChunkCount]{};
@@ -108,13 +115,29 @@ void OpenEarlyLog()
 {
     if (s_earlyLog)
         return;
+    // This runs from __libc_init_array, before main() and before any of the
+    // process's own setup: nothing has touched the SD card yet, so "sdmc:/..."
+    // is not necessarily mounted and fopen() would fail with ENODEV, leaving a
+    // boot with no log at all (which is what the console showed). Mount it here
+    // the way homebrew does in userAppInit(); fsdevMountSdmc() is skipped when
+    // sdmc: is already mounted, so the normal path is unchanged.
+    uint32_t mountResult = 0;
+#ifdef LO_EARLY_LOG_FSDEV
+    if (!fsdevGetDeviceFileSystem("sdmc"))
+        mountResult = uint32_t(fsdevMountSdmc());
+#endif
     mkdir("sdmc:/switch/LostOdysseyRecomp", 0777); // EEXIST is the normal case.
     s_earlyLog = std::fopen("sdmc:/switch/LostOdysseyRecomp/early_boot.log", "w");
     if (!s_earlyLog)
+    {
+        // Still no file: at least say so on stderr, which the parent keeps.
+        std::fprintf(stderr, "early boot: sdmc:/switch/LostOdysseyRecomp/early_boot.log unavailable "
+                             "(sdmc mount rc %#x)\n", mountResult);
         return;
+    }
     std::setvbuf(s_earlyLog, nullptr, _IONBF, 0);
-    EarlyLog("early boot: %s opened before guest allocation (window %#zx MiB)",
-        "sdmc:/switch/LostOdysseyRecomp/early_boot.log", kSize >> 20);
+    EarlyLog("early boot: %s opened before guest allocation (window %#zx MiB, sdmc mount rc %#x)",
+        "sdmc:/switch/LostOdysseyRecomp/early_boot.log", kSize >> 20, mountResult);
 }
 
 void Diag(const char* format, ...)
@@ -669,7 +692,11 @@ bool MapView(size_t windowOffset, uintptr_t source, size_t sourceOffset, size_t 
         rc = svcMapProcessMemory(s_base + windowOffset, s_process, source + sourceOffset, length);
     }
     if (R_FAILED(rc))
+    {
+        EarlyLog("map: view %d window %#zx source offset %#zx length %#zx failed: rc %#x", view, windowOffset,
+            sourceOffset, length, uint32_t(rc));
         RecordFailure(FailureOperation::MapView, rc, view, s_base + windowOffset, length, chunkOffset);
+    }
     return R_SUCCEEDED(rc);
 }
 
@@ -835,6 +862,15 @@ uint8_t* Allocate()
         s_reservation = virtmemAddReservation(s_base, kSize);
     virtmemUnlock();
 #endif
+#ifdef __SWITCH2__
+    // svcMapProcessMemory needs a page-aligned destination and the guest null
+    // page has to stay unmapped: a scan answer that is neither is not usable.
+    if (s_base && (uintptr_t(s_base) < 0x10000 || (uintptr_t(s_base) & (kPage - 1)) != 0))
+    {
+        Diag("window: refusing unusable placement %p (unaligned or inside the null page guard)", s_base);
+        s_base = nullptr;
+    }
+#endif
     if (!s_base || !s_reservation)
     {
         Diag("window: %#zx MiB at %p not reserved (reservation %p)", kSize >> 20, s_base, s_reservation);
@@ -915,7 +951,18 @@ bool Commit(uint32_t address, uint32_t size)
             length -= kPage;
         }
         uintptr_t source = 0;
-        if (!MapChunk(offset, length, source))
+        const bool mapped = MapChunk(offset, length, source);
+        // Only the first chunks are logged: they are the ones mapped during
+        // __libc_init_array, where a failed placement turns into a boot with no
+        // log. Logging every chunk for the whole run would cost an SD write per
+        // 2 MiB of guest memory.
+        if (s_earlyChunkLogs < kEarlyChunkLogs)
+        {
+            ++s_earlyChunkLogs;
+            EarlyLog("commit: chunk %zu offset %#zx length %#zx -> %s (source %#llx)", size_t(chunk), offset, length,
+                mapped ? "mapped" : "failed", (unsigned long long)source);
+        }
+        if (!mapped)
             return false;
         s_source[chunk] = source;
         __atomic_store_n(&s_committed[chunk], true, __ATOMIC_RELEASE); // read without the lock by EnsureBacked

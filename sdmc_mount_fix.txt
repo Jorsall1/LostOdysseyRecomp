@@ -1,0 +1,114 @@
+Switch 2: mount sdmc before the pre-main early log, and harden the pre-main path
+==============================================================================
+File changed: LostOdysseyRecomp/kernel/guest_address_space_switch.cpp
+Headers changed: none (gpu/renderer.cpp was not edited; it had been left stale in
+the build tree by the previous build and relinked once here)
+
+Build: BUILD_EXIT=0 -> build/LostOdysseyRecomp/LostOdysseyRecomp.nro
+Copied to /mnt/c/Users/Jorda/Desktop/LostOdysseyRecomp.nro
+
+
+1. ROOT CAUSE 1 - sdmc: was not mounted during __libc_init_array
+---------------------------------------------------------------
+Memory g_memory is a static object, so GuestAddressSpace::Allocate() runs from
+__libc_init_array, long before main() and before anything in this process had
+touched the SD card. Nothing in the tree ever calls fsdevMountSdmc() (grep over
+LostOdysseyRecomp/ finds only path strings), so at that point "sdmc:/..." could
+not be opened, fopen() returned NULL, and the whole early_boot.log trace was a
+silent no-op. That is exactly the "no log at all" symptom on the console: the
+diagnostic existed but could never create its file.
+
+Fix (OpenEarlyLog, __SWITCH2__ only, via __has_include(<switch/fsdev.h>)):
+    if (!fsdevGetDeviceFileSystem("sdmc"))
+        mountResult = uint32_t(fsdevMountSdmc());
+    mkdir("sdmc:/switch/LostOdysseyRecomp", 0777);
+    s_earlyLog = fopen("sdmc:/switch/LostOdysseyRecomp/early_boot.log", "w");
+    setvbuf(s_earlyLog, nullptr, _IONBF, 0);   // + fflush after every line
+The already-mounted case is skipped, so the mount is idempotent and does not
+disturb the later runtime setup. If the mount or the open still fails, the
+mount result code is printed to stderr instead of failing silently, and the
+first line written to the file records the mount rc, so the next boot says
+whether sdmc: was the problem.
+
+Unchanged from the previous build: the file is opened unbuffered, and EarlyLog()
+writes, appends a newline and fflush()es every single line, so the step that
+kills the boot is already on the card. Diag() still mirrors every line into it.
+
+
+2. ROOT CAUSE 2 - what `git diff 7e4749a0 HEAD` added to static init
+-------------------------------------------------------------------
+Reviewed the whole diff of the pre-main path. Unchanged since 7e4749a0 (the
+15:50 build that reached main): OwnProcessHandle() (threadCreate + the
+self-session handle copy), LogFacts()'svcGetInfo calls, virtmemLock()/
+virtmemFindAslr()/virtmemFindCodeMemory()/virtmemAddReservation(), and both
+syscall probes (0x77/0x73/0x74 and 0x15/0x51/0x52). Everything new is the
+region report plus the gap search:
+
+  * QueryInfoRegion() for aslr/alias/heap/stack (+ InfoType_AddressSpaceSize),
+  * FindGap()/ReserveGap()/AddressSpaceLimit(): an svcQueryMemory walk of the
+    aslr region, the alias region, and finally the whole process address space,
+    taking the first page-aligned 4 GiB Unmapped run and reserving it with
+    virtmemAddReservation().
+
+No fault can be proven from source, and it cannot be reproduced here, but that
+walk is the only new thing that runs pre-main and it is also the only thing that
+can hand Allocate() an *unusable* 4 GiB placement (the kernel allows
+svcMapProcessMemory at any Free VA, including addresses a scan can legitimately
+report but the process must not own). Hardening added:
+
+  * kMaxScanBlocks = 4096 per walk (non-zero rc, zero-size or non-advancing
+    block, and address wrap-around all break the walk with a log line), plus the
+    exclusion-advance guard: the scan cannot loop.
+  * A placement below 0x10000 or not page-aligned is now rejected and turned
+    into a clean failure instead of being used as the window: the guest null
+    page must stay unmapped and svcMapProcessMemory needs a page-aligned
+    destination.
+  * Allocate() still returns nullptr on every failure path (no abort, no
+    ShowError from static init); main() reports it after the runtime log exists.
+
+3. NEW PRE-MAIN TRACE POINTS (so the next boot pinpoints the crash)
+------------------------------------------------------------------
+  * "commit: chunk <n> offset <o> length <l> -> mapped|failed (source <s>)"
+    for the first 8 chunks only (kEarlyChunkLogs). Those are exactly the chunks
+    Commit() maps during __libc_init_array: low pages, the XEX image, the top of
+    the virtual view. Logging every chunk for the whole run would cost one SD
+    write per 2 MiB of guest memory, hence the 8-chunk cap.
+  * "map: view <0-3> window <w> source offset <so> length <l> failed: rc <r>"
+    whenever a view mapping fails, i.e. the A/C/E alias that could not be placed.
+  * Existing per-step lines are unchanged: OwnProcessHandle, every svcGetInfo,
+    every virtmemLock, every svcQueryMemory block, and each probe step.
+
+4. BUILD AND ARTIFACT
+---------------------
+    export DEVKITPRO=/opt/devkitpro
+    source /opt/devkitpro/switch2vars.sh
+    cmake --build build -j20
+    BUILD_EXIT=0, "Linking CXX executable LostOdysseyRecomp.elf",
+    "Packaging LostOdysseyRecomp.nro", "[100%] Built target LostOdysseyRecomp"
+
+The only warnings are the pre-existing ones (plume's VK_USE_PLATFORM_VI_NN
+redefine and main.cpp's u8path deprecation); this file compiled clean.
+The NRO was copied to the Desktop if both md5sums matched (see below).
+
+5. NEXT BOOT
+------------
+sdmc:/switch/LostOdysseyRecomp/early_boot.log now exists from the first
+statement of Allocate(), truncated ("w") on every boot and flushed per line.
+Read the last line before the console returns to hbmenu:
+  * "early boot: ... opened ... sdmc mount rc 0x0" - mount worked, the trace is
+    real; the last line names the exact failing step.
+  * "early boot: ... unavailable (sdmc mount rc 0x...)" would mean the fs
+    service itself is not up yet at static-init time: in that case the fix is to
+    latch the failure and write the same trace once main() can open the file,
+    not to move the window logic.
+  * "window: address space run ... reserved" then no "commit: chunk 0" line -
+    the crash is in the first mapping; "commit: chunk N -> failed" into the
+    runtime log means the window placement is legal but unusable there.
+
+LIMITATIONS
+-----------
+Verified by build, packaging and static inspection (the mount call and every new
+string are present in the ELF). Not run on Switch 2 hardware: the actual fault
+was not reproduced here, so this build's log is the instrument that identifies
+it. If the console still dies with no early_boot.log, the next step is the
+latch-and-replay path described above.
