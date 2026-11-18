@@ -1698,6 +1698,7 @@ void ExitWatchdogMain(void*)
                 DumpGuestThreadStates();
                 DumpHangWatch();
                 DumpGuestHotStacks();
+                DumpGuestAliasUsage(); // heap backend: C/E are not aliases of A (the main Switch 1 difference)
                 DumpFenceWaiters();
                 movie::LogNativeMovieState();
                 std::fprintf(stderr, "[watchdog] movie diagnostics %d done\n", movieDumps);
