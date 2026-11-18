@@ -1,0 +1,72 @@
+================================================================================
+LostOdysseyRecomp - Nintendo Switch 2 port
+Summary - TURN 21: loading hang root cause found and fixed (heap lock leak)
+================================================================================
+NRO md5 59378749cf3c00e8ac0b06675ae09ce3 (Desktop copy matches).
+ELF: build/hangfix_turn21_59378749.elf. kaiHEN fix (5cde9314) untouched.
+
+LOG FILES
+  * The app-folder files (stderr.log, exit.log, early_boot.log) were written
+    as usual; the FTP client showed a stale listing until reconnected.
+    exit.log: "HOME -> X: closing the game for the system" (clean).
+
+WHAT THE TURN-20 DUMP SHOWED (runtime-1795013568446298.log, 17.4 s)
+  * fence wait open 13654 ms, Guest Main, counter@0x500d30 = 0, threshold 0:
+    the wait condition was already met.
+  * Events: enqueue (write 0x7109b0 -> 0x7109c0), wait begin, execute of
+    command 0x7109b0 254 ms later (counter -> 0). No "wait end".
+  * Ring: write == read == 0x7109c0, so the rendering thread consumed it.
+  * So Guest Main left the guest loop and is stuck AFTER it, in
+    GuestLockHold::Unpark: waiting to take back heap lock 0x510610, which it
+    had handed over at 3.7 s (recursion 422) and never got back.
+  * Full host stack of Guest Main (22 frames) is in that log, from
+    sub_82322478 up through 0x82485C18, 0x82485030, 0x82484BE8, 0x8270B548,
+    0x82730000, 0x82476980, 0x825D5418, 0x828F9068, 0x82821C18, 0x827C9070,
+    0x827C9710, 0x827CA440 (guest entry).
+
+ROOT CAUSE
+  * The heap's critical section (*(heap + 1408) = 0x510610) is taken in a
+    __try and released in a __finally. MSVC emits the __finally as a funclet
+    that reads the parent's non-volatile registers (lock-taken flag, heap
+    pointer). The recompiler makes r12..r31 C++ locals initialized to 0 in
+    every function, so the funclet always sees "not taken" / null heap and
+    never unlocks.
+  * Funclets (normal-path entries called by the parent):
+      0x823AD544 <- sub_823ACCB0 (allocator; large-block and failure paths)
+      0x823AE0BC <- sub_823ADE28
+      0x827CD7BC <- sub_827CCF80 (has NO normal unlock of its own: every call
+                    leaked one level)
+    Their exception-path siblings 0x823AD51C, 0x823AE094, 0x827CD79C load
+    the registers from the parent frame, which shows where MSVC spills them.
+  * Effect: the heap lock's recursion grew (422 on Guest Main), any other
+    thread needing the heap blocked forever (the 2026-11-16 deadlock), the
+    GuestLockHold workaround handed it over, the receiving thread leaked it
+    too, and Guest Main waited forever in Unpark. The screen kept presenting
+    because the rendering thread still drew the loading wheel.
+
+FIX
+  cpu/guest_seh_finally.cpp (new; picked up by the source glob)
+    * PPC_FUNC overrides of sub_823AD544, sub_823AE0BC, sub_827CD7BC. At the
+      call r1 equals the parent's r31 (each parent: addi r31,r1,-N;
+      stwu r1,-N(r1); no stwux). Read the flag/heap slots and unlock through
+      __imp__RtlLeaveCriticalSection with the funclet's own return address:
+        823AD544: flag +104, heap +128, lr 0x823AD570
+        823AE0BC: flag +84,  heap +100, lr 0x823AE0E8
+        827CD7BC: flag +96,  heap +84,  lr 0x827CD7E8
+    * Checked: every write of the flag register in each parent is mirrored to
+      its slot, and the normal unlock clears the flag before the funclet runs
+      (no double unlock).
+    * Logs the first 4 unlocks: "SEH finally 0x...: unlocking heap section".
+    * LO_SEH_FINALLY_FIX=0 restores the generated funclets.
+  Diagnostics from turns 18-20 kept for now.
+
+RISK / FOLLOW-UP
+  * Other __finally funclets in the game have the same register problem;
+    only these six touch a critical section. Others may skip other cleanup
+    (frees, counters). A wider fix belongs in the recompiler (pass the
+    parent frame registers to funclets), not hand-written overrides.
+  * GuestLockHold's handover should now rarely fire; if the hang is gone,
+    consider removing it.
+TEST
+  Same env.txt. Boot to the loading screen and see whether it finishes.
+  Send state/logs/runtime-*.log and stderr.log either way.
