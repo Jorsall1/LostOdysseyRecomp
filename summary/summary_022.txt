@@ -1,0 +1,37 @@
+================================================================================
+LostOdysseyRecomp - Nintendo Switch 2 port
+Summary - TURN 22: SEH finally fix confirmed on hardware (title screen reached)
+================================================================================
+Build tested: NRO md5 59378749 (commit b16aec41). No code changes this turn.
+
+USER REPORT
+  Booted past the loading screen to the title screen, with sound; opened
+  Settings; closed with HOME -> X. No crash, no hang.
+
+LOG READ (runtime-1795016757444245.log, stderr.log, exit.log, early_boot.log)
+  * exit.log: "HOME -> X: closing the game for the system" (clean). The log
+    ends at "video: shutdown stage=gpu-reset begin", the same as earlier clean
+    HOME -> X exits (the system ends the process there).
+  * No crash, fatal, exception or out-of-memory lines. Every [warn] line is
+    from the turn 18-20 diagnostics (hang watch, hot stacks, fence dump).
+  * The fix runs from the start: "SEH finally 0x827cd7e8: unlocking heap
+    section 0x510610" at 1.998 s. No "guest lock ... handed over" line at all:
+    the heap lock no longer leaks, so the GuestLockHold workaround never fired.
+  * Fence waits now finish: "render fence wait 1.8 s" ended normally at
+    73.9 s (that frame is the HOME menu suspend, present_ms 1771).
+  * Audio: peak 0.047 (was 0 in every hung run).
+  * Performance: 58-60 fps on the title screen. 48 hitches; most are at
+    57-72 s (Settings, draws=145, ~33 ms frames), while texture-specialised
+    pipeline variants were still compiling (building=1837, compile_ms=31516).
+    Background pipeline preparation finished at 40.9 s (3446 recipes, 0
+    failed). Expected to settle once the variants are cached.
+  * Cosmetic bug in my fence dump: "fence wait open 18446744073709551615 ms"
+    when a wait starts between reading the clock and the slot (unsigned
+    underflow). Harmless; goes away when the diagnostics are removed.
+
+NEXT
+  * Remove LO_KERNEL_TRACE=1 from env.txt for normal play (large log, slower).
+  * Play further (new game, first map, a battle, save/load) and send logs.
+  * Once stable: remove the turn 18-20 hang diagnostics (watch, hot stacks,
+    alias scan, fence dump, per-wait unwind) and consider removing
+    GuestLockHold. Long term: fix __finally funclets in the recompiler.
