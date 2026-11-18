@@ -1,0 +1,66 @@
+================================================================================
+LostOdysseyRecomp - Nintendo Switch 2 port
+Summary - TURN 19: turn-18 hang log read; combo removed; host-stack diagnostic
+================================================================================
+NRO md5 5518b47048c2171ab1cd9da04881dcf6 (Desktop copy matches). Commit 70976b37.
+ELF kept for addr2line: build/hangdiag_turn19_5518b470.elf
+kaiHEN fix (5cde9314) untouched.
+
+LOG READ ("lo project": runtime-1795010246437574.log, stderr.log, early_boot.log,
+exit.log; env LO_GUEST_AFFINITY=1 LO_KERNEL_TRACE=1)
+  * Same hang. Last kernel activity 4.009 s (MmAllocatePhysicalMemoryEx on
+    tfb20 = rendering thread). HOME -> X exit at 124 s was clean.
+  * C/E alias views: "C and E hold no data" at 15 s and 40 s. The alias theory
+    (summary_014) is ruled out.
+  * "loading screen begin" once at 2.299 s (caller lr 0x827c7060), no end.
+    Correction to summary_018: *(0x83318040) is GIsThreadedRendering, so
+    sub_82485920/sub_82485A08 are Start/StopRenderingThread, not a loading
+    screen flag. One begin and no end is normal.
+  * Watched objects: 0x55e3c4 waited once at 2.011 s, never signaled (idle D3D
+    worker, as suspected). 0x832e0140 is set by the Audio Driver every ~15 ms
+    (healthy). 0x56d850: 10 s timed waits, never signaled. The five
+    NtWaitForSingleObjectEx threads at lr 0x822c5358 (0x7c0009e0 ... 0x7c004160)
+    had 0 operations: idle worker-pool threads.
+  * Hot stacks (15 s and 40 s identical):
+      Guest Main 100% at 0x82485c50 0x82485048 0x82484c24 = inside
+        FRenderCommandFence::Wait (sub_82322478) from FlushRenderingCommands
+        (sub_82485C18) from sub_82485030, from sub_82484BE8.
+      rendering thread tfb20 99% at 0x827b6304 0x827b549c 0x823b6554: idle
+        loop, drawing the wheel and waiting on the GPU in D3D's kick
+        (sub_823CDEF8 -> sub_827B6278 -> sub_82290AA8). Queue reads empty.
+      t6341: sub_82B632C0, a sound/stream update loop with Sleep(1).
+  * Static reading:
+      - sub_82484BE8 is vtable slot 2 (Tick) of vtable 0x82003568; it ticks a
+        list of children. sub_82485030 is slot 2 of vtable 0x820013C8. So
+        Guest Main is in some outer loop that ticks a list each frame. Its
+        callers are invisible to the guest walk.
+      - Why the guest walk stops: functions that save LR with __savegprlr
+        (bl 0x82b7a6dc/ec) never store it in the recompiled code, so
+        [caller_r1 - 8] holds no return address.
+
+CHANGES
+  cpu/poll_wait.cpp
+    * MaybeLogFenceWaiterStack(): at 12 s, 20 s and 30 s after the first fence
+      wait, the thread entering sub_82322478 runs _Unwind_Backtrace (the ELF
+      has .eh_frame FDEs for every recompiled function) and logs
+      "fence waiter host stack N at S s: pcr= lr= frames= (guest fn+host
+      offset): 0xGUEST+0xOFFSET ...". GUEST is the nearest PPCFuncMappings
+      entry below the host PC; OFFSET is from _start, for
+      aarch64-none-elf-addr2line -f -e build/hangdiag_turn19_5518b470.elf.
+      Guest Main is pcr=0x403000.
+  os/switch/switch_runtime.cpp
+    * Removed the L+R+Plus+Minus quit combo from the watchdog thread (pad
+      setup, hold timer, PushQuit, 4 s grace, ExitToHbmenu). The thread keeps
+      HOME -> X polling and the 15 s / 40 s diagnostics.
+    * L+R still opens the debug menu (hid/hid.cpp chord), which has Quit to
+      hbmenu.
+  debug/menu_overlay.cpp, settings/menu.cpp
+    * Fallback text "hold L + R + Plus + Minus" changed to "press HOME and
+      close the game" (English, zh-CN, es, zh-TW).
+
+TEST
+  Same env.txt. Boot, wait at the loading screen for at least 45 s, then
+  HOME -> X. Send runtime-*.log and stderr.log. Grep "fence waiter host stack".
+NEXT
+  Symbolize the stack with the saved ELF, find Guest Main's outer loop and
+  the condition it waits on, then read that code.
