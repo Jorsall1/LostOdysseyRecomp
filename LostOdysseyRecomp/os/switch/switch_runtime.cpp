@@ -156,6 +156,24 @@ Mutex g_rawMutex;
 
 Result RawInitialize()
 {
+#if defined(__SWITCH2__)
+    // Under kaiHEN, smGetService("fsp-srv") returns libounce's override: a
+    // clone of HEN's own FS proxy root. Every clone shares one FS object, so
+    // SetCurrentProcess on it re-identifies HEN's root as this process (kaiHEN
+    // hen/README.md: libounce never sends it for that reason). Once this
+    // process ended, HEN's next "@Sdcard:/kaihen/bin/game/exefs.nsp" open ran
+    // under a dead process ID and failed, so holding R started the stock game
+    // until a reboot: every LO exit (Quit, HOME -> X, crash) "killed kaiHEN".
+    // A separate SD card file system object from libnx's fs session needs no
+    // identity change, and libnx's fsdev unmount does not close it.
+    FsFileSystem sd{};
+    const Result rc = fsOpenSdCardFileSystem(&sd);
+    if (R_FAILED(rc))
+        return rc;
+    g_rawSd = sd.s;
+    g_rawReady = true;
+    return 0;
+#else
     Result rc = smGetService(&g_rawFs, "fsp-srv");
     if (R_FAILED(rc))
         return rc;
@@ -170,6 +188,7 @@ Result RawInitialize()
     }
     g_rawReady = true;
     return 0;
+#endif
 }
 
 // The crash report is built here: the handler must not allocate.

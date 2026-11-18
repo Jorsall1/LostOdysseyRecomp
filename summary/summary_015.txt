@@ -1,0 +1,34 @@
+================================================================================
+LostOdysseyRecomp - Nintendo Switch 2 port
+Summary - TURN 15: is the exit fixed? How does UnleashedRecomp-NX2 exit?
+================================================================================
+No source files changed.
+
+UR-NX2 EXIT (read from /tmp/ur2)
+  * App::Exit() (app.cpp:24) = Config::Save(); std::_Exit(0). It is called from
+    ui/game_window.cpp:91 on SDL's quit event, i.e. on whichever thread pumps
+    SDL events, with every game thread still running.
+  * No appletLockExit, no next load, no main-thread handoff, no thread
+    cleanup. Its docs: "closing from HOME kills the process".
+  * Against kaiHEN's loader rules (ounce-hbloader clean_main.cpp) that is the
+    same situation as LO before turn 7: __nx_exit on a non-main thread, plus
+    dozens of running threads. Either is enough for the loader to end the
+    donor game. So UR-NX2 does not solve quit-to-hbmenu; it avoids it, and
+    HOME -> X is its exit.
+  * Its HOME -> X works cleanly because it never holds the exit lock. That is
+    what the turn-11 change makes LO do.
+
+LO EXIT STATUS (as told to the user)
+  * NOT confirmed fixed. The 99dfdcc9 build (turn 13) is untested.
+  * Each failure so far is explained by a logged stage:
+      - turn 7: wrong thread;
+      - turn 10: pre-paused threads the loader could not pause;
+      - turn 13: the unregistered watchdog/APM threads ran after HID and the
+        applet were closed.
+    exit.log now records every stage up to std::_Exit, plus each survivor's
+    pc/lr.
+  * Rough odds for the debug-menu Quit returning to hbmenu: about 60-70%.
+    HOME -> X closing cleanly: high, since it is the same as every homebrew.
+  * Fallback if Quit still fails: stop offering Quit to hbmenu, and use the
+    UR-NX2 / stock-homebrew model. Quit = release the lock and end the
+    process (as HOME -> X), then relaunch the donor with R.

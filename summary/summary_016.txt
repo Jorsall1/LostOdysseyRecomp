@@ -1,0 +1,47 @@
+================================================================================
+LostOdysseyRecomp - Nintendo Switch 2 port
+Summary - TURN 16: HOME -> X "killed kaiHEN" again; root cause found at BOOT
+================================================================================
+LOGS ("lo project": runtime-1795003050370953.log, stderr.log, exit.log, early_boot.log)
+  * Loading hang as before: the wheel at 60 fps, draws=3, until HOME at ~54 s
+    (hitch 1575 ms = suspended). Pipeline prebuild finished at 39.7 s. Same
+    hang as summary_010/014 (C-view aliasing on Backend::Heap); not addressed.
+  * HOME -> X worked as designed from turn 11: watchdog "HOME -> X ... releasing
+    the exit lock", exit.log "closing the game for the system (log closed, exit
+    lock released)". No "still running 3 s after the unlock" line, so the
+    system ended the process itself (no svcExitProcess fallback). At the same
+    time SDL's quit started the GPU owner shutdown (gpu-reset begin, 56.016 s).
+  * kaiHEN was still lost afterwards. So the exit mechanics were never the
+    cause: Quit to hbmenu, HOME -> X and crashes all lost the R hook.
+ROOT CAUSE (kaiHEN source, /tmp/kaihen @ 9aa3716)
+  * hen/README.md: libounce installs a clone of HEN's FS proxy root as the
+    fsp-srv override and never sends SetCurrentProcess on it, "which would
+    change the process identity that FS uses for every holder of the root".
+  * LO's RawInitialize (switch_runtime.cpp, inherited from Switch 1, commit
+    757b88e6) did smGetService("fsp-srv") -> that override (verified:
+    smGetServiceWrapper returns the override handle, own_handle=0), then sent
+    SetCurrentProcess (cmd 1, in_send_pid). HEN's own root then carried LO's
+    process ID.
+  * hen/source/game_arm.cpp: each armed launch opens
+    "@Sdcard:/kaihen/bin/game/exefs.nsp" through that root
+    (package_->open). With LO's process gone the open fails, restoreGate(rc,
+    WaitProcess) lets the stock game load: "R starts the game normally" until a
+    reboot gives HEN a fresh root. Matches every reported hook loss.
+FIX (os/switch/switch_runtime.cpp, RawInitialize, __SWITCH2__ only)
+  * fsOpenSdCardFileSystem() on libnx's fs session (a separate IFileSystem
+    object, as fsdevMountSdmc does), g_rawSd = sd.s. No sm lookup, no
+    SetCurrentProcess. RawAppend unchanged. Switch 1 path unchanged.
+  * Verified in the ELF: Initialize calls fsOpenSdCardFileSystem inline; no
+    other SetCurrentProcess in LO (SDL hits are GDK-only files).
+  NRO md5 fc076893a395f4b33b2e99d6b62ffc71 (Desktop copy matches). Build OK.
+  Not committed.
+USER STEPS
+  * kaiHEN must be rebooted/re-run once: HEN's root is still bound to the dead
+    process ID from the last run.
+  * Then: start LO, HOME -> X, hold R on the donor game -> hbmenu expected.
+    Also try the debug-menu Quit; send exit.log, stderr.log,
+    sdmc:/kaihen/nro-cleanup.txt.
+OPEN
+  * The loading hang (C-view coherence work, summary_014 items 1-4).
+  * Turn 13's RunExit thread-ending changes are still untested; the earlier
+    "donor game closed" Quit failures may also have been partly this bug.
