@@ -158,6 +158,34 @@ namespace
     }
 }
 
+namespace
+{
+    // Render command ring (FRingBuffer at 0x8336A7A4, read by sub_82485CD8):
+    // +0 start, +8 write pointer, +12 wrap/end, +20 read pointer, +24 alignment.
+    constexpr uint32_t kRenderRing = 0x8336A7A4;
+
+    struct FenceEvent
+    {
+        uint64_t ms = 0;
+        const char* what = nullptr;
+        uint32_t a = 0, b = 0, c = 0, d = 0, pcr = 0;
+    };
+    struct EventRing
+    {
+        static constexpr size_t kSize = 32;
+        FenceEvent events[kSize];
+        uint32_t next = 0;
+        std::mutex mutex;
+        void Add(const char* what, uint32_t a, uint32_t b, uint32_t c, uint32_t d, uint32_t pcr)
+        {
+            std::lock_guard lock(mutex);
+            events[next++ % kSize] = {NowMs(), what, a, b, c, d, pcr};
+        }
+    };
+    EventRing g_fenceEvents;   // enqueue / execute / wait begin / wait end
+    EventRing g_commandEvents; // every queued command the rendering thread runs
+}
+
 bool render_fence::LoadBoost()
 {
     static const bool on = [] {
@@ -180,6 +208,14 @@ uint32_t render_fence::LoadBoostVblankHz()
 void render_fence::CommandBegin(uint32_t command)
 {
     t_commandExecute = 0;
+    if (command >= 0x10000 && command < 0x7C000000)
+    {
+        // Every queued command, for DumpFenceWaiters: command, vtable, execute, read pointer.
+        uint8_t* const base = g_memory.base;
+        const uint32_t vtable = PPC_LOAD_U32(command);
+        const uint32_t execute = vtable >= 0x82000000 && vtable < 0x84000000 ? PPC_LOAD_U32(vtable + 4) : 0;
+        g_commandEvents.Add("command", command, vtable, execute, PPC_LOAD_U32(kRenderRing + 20), 0);
+    }
     if (!g_fenceWaitSinceMs.load(std::memory_order_relaxed) || command < 0x10000)
         return;
     uint8_t* const base = g_memory.base;
@@ -252,31 +288,140 @@ namespace
         return it == sorted.begin() ? 0 : std::prev(it)->second;
     }
 
-    // Three traces: 12 s, 20 s and 30 s after the first fence wait.
-    void MaybeLogFenceWaiterStack(const PPCContext& ctx)
+    std::string FormatHostTrace(const HostTrace& trace)
     {
-        static const uint64_t first = NowMs();
-        static std::atomic<int> taken{0};
-        constexpr uint64_t kAtMs[] = {12000, 20000, 30000};
-        const int index = taken.load(std::memory_order_relaxed);
-        if (index >= int(std::size(kAtMs)) || NowMs() - first < kAtMs[index])
-            return;
-        int expected = index;
-        if (!taken.compare_exchange_strong(expected, index + 1, std::memory_order_acq_rel))
-            return;
-        HostTrace trace;
-        _Unwind_Backtrace(CollectHostFrame, &trace);
         const uintptr_t start = reinterpret_cast<uintptr_t>(&_start);
         std::string line;
         for (int i = 0; i < trace.count; ++i)
         {
             const uintptr_t pc = trace.pcs[i];
-            const uint32_t guest = GuestFunctionAt(pc - 1);
-            line += fmt::format(" {:#x}+{:#x}", guest, pc - start);
+            line += fmt::format(" {:#x}+{:#x}", GuestFunctionAt(pc - 1), pc - start);
         }
-        LOG_WARNING("fence waiter host stack {} at {} s: pcr={:#x} lr={:#x} frames={} (guest fn+host offset):{}",
-            index + 1, (NowMs() - first) / 1000, ctx.r13.u32, uint32_t(ctx.lr), trace.count, line);
+        return line;
     }
+
+    // Turn 19 log (runtime-1795012123454119): no stack line at 12/20/30 s,
+    // because Guest Main entered ONE fence wait at about 3.7 s and never left
+    // it (the trace was taken on entry only). So each wait now records its
+    // host stack on entry, and the watchdog's dump (DumpFenceWaiters) prints
+    // every wait still open, with the fence counter it polls, plus the last
+    // fence enqueues, fence executions and queued commands on the rendering
+    // thread, and the render command ring's pointers.
+    struct FenceWaiter
+    {
+        bool active = false;
+        uint64_t sinceMs = 0;
+        uint32_t counter = 0, threshold = 0, startValue = 0, pcr = 0, lr = 0;
+        HostTrace trace;
+    };
+    constexpr size_t kFenceWaiterSlots = 4;
+    FenceWaiter g_fenceWaiterSlots[kFenceWaiterSlots];
+    std::mutex g_fenceWaiterMutex;
+
+
+    int OpenFenceWaiter(const PPCContext& ctx, uint8_t* base)
+    {
+        FenceWaiter w;
+        w.active = true;
+        w.sinceMs = NowMs();
+        w.counter = ctx.r3.u32;
+        w.threshold = ctx.r4.u32;
+        w.startValue = w.counter >= 0x10000 && w.counter < 0xFFFF0000u ? PPC_LOAD_U32(w.counter) : 0;
+        w.pcr = ctx.r13.u32;
+        w.lr = uint32_t(ctx.lr);
+        _Unwind_Backtrace(CollectHostFrame, &w.trace);
+        g_fenceEvents.Add("wait begin", w.counter, w.startValue, w.threshold, w.lr, w.pcr);
+        std::lock_guard lock(g_fenceWaiterMutex);
+        for (size_t i = 0; i < kFenceWaiterSlots; ++i)
+            if (!g_fenceWaiterSlots[i].active)
+            {
+                g_fenceWaiterSlots[i] = w;
+                return int(i);
+            }
+        return -1;
+    }
+
+    void CloseFenceWaiter(int slot, uint32_t counter, uint32_t pcr, uint8_t* base)
+    {
+        uint64_t since = 0;
+        {
+            std::lock_guard lock(g_fenceWaiterMutex);
+            if (slot >= 0)
+            {
+                since = g_fenceWaiterSlots[slot].sinceMs;
+                g_fenceWaiterSlots[slot].active = false;
+            }
+        }
+        const uint32_t value = counter >= 0x10000 && counter < 0xFFFF0000u ? PPC_LOAD_U32(counter) : 0;
+        g_fenceEvents.Add("wait end", counter, value, uint32_t(since ? NowMs() - since : 0), 0, pcr);
+    }
+}
+
+void DumpFenceWaiters()
+{
+    uint8_t* const base = g_memory.base;
+    const uint64_t now = NowMs();
+    LOG_WARNING("render command ring 0x{:x}: start={:#x} write={:#x} end={:#x} read={:#x} +16={:#x} +24={:#x} "
+                "threaded rendering={}",
+        kRenderRing, PPC_LOAD_U32(kRenderRing + 0), PPC_LOAD_U32(kRenderRing + 8), PPC_LOAD_U32(kRenderRing + 12),
+        PPC_LOAD_U32(kRenderRing + 20), PPC_LOAD_U32(kRenderRing + 16), PPC_LOAD_U32(kRenderRing + 24),
+        PPC_LOAD_U32(0x83318040));
+    {
+        std::lock_guard lock(g_fenceWaiterMutex);
+        bool any = false;
+        for (const auto& w : g_fenceWaiterSlots)
+        {
+            if (!w.active)
+                continue;
+            any = true;
+            const uint32_t value = w.counter >= 0x10000 && w.counter < 0xFFFF0000u ? PPC_LOAD_U32(w.counter) : 0;
+            LOG_WARNING("fence wait open {} ms: pcr={:#x} lr={:#x} counter@{:#x} = {} (was {} on entry, waits for <= {}) "
+                        "host stack {} frames (guest fn+host offset):{}",
+                now - w.sinceMs, w.pcr, w.lr, w.counter, value, w.startValue, w.threshold, w.trace.count,
+                FormatHostTrace(w.trace));
+        }
+        if (!any)
+            LOG_WARNING("fence wait open: none");
+    }
+    for (EventRing* ring : {&g_fenceEvents, &g_commandEvents})
+    {
+        std::lock_guard lock(ring->mutex);
+        LOG_WARNING("last {} (newest last, {} total):", ring == &g_fenceEvents ? "fence events" : "rendering thread commands",
+            ring->next);
+        const uint32_t count = std::min<uint32_t>(ring->next, EventRing::kSize);
+        for (uint32_t i = ring->next - count; i != ring->next; ++i)
+        {
+            const FenceEvent& e = ring->events[i % EventRing::kSize];
+            LOG_WARNING("  -{} ms {} a={:#x} b={:#x} c={:#x} d={:#x} pcr={:#x}", now - e.ms, e.what ? e.what : "?", e.a,
+                e.b, e.c, e.d, e.pcr);
+        }
+    }
+}
+
+// Fence enqueue (sub_822D6BB0, r3 = &counter): counter += 1, then an 8-byte
+// command {vtable 0x8200112C, &counter} on the ring when threaded rendering is
+// on (else counter -= 1 at once). Logged: counter, write pointer before and
+// after, read pointer, counter after.
+extern "C" PPC_FUNC(__imp__sub_822D6BB0);
+PPC_FUNC(sub_822D6BB0)
+{
+    const uint32_t counter = ctx.r3.u32, pcr = ctx.r13.u32;
+    const uint32_t writeBefore = PPC_LOAD_U32(kRenderRing + 8);
+    __imp__sub_822D6BB0(ctx, base);
+    g_fenceEvents.Add("enqueue", counter, writeBefore, PPC_LOAD_U32(kRenderRing + 8),
+        counter >= 0x10000 ? PPC_LOAD_U32(counter) : 0, pcr);
+}
+
+// Fence command execute (vtable 0x8200112C slot 1, rendering thread): atomic
+// decrement of *(this + 4). Logged: command, counter, counter after, read pointer.
+extern "C" PPC_FUNC(__imp__sub_823B6650);
+PPC_FUNC(sub_823B6650)
+{
+    const uint32_t command = ctx.r3.u32, pcr = ctx.r13.u32;
+    const uint32_t counter = command >= 0x10000 ? PPC_LOAD_U32(command + 4) : 0;
+    __imp__sub_823B6650(ctx, base);
+    g_fenceEvents.Add("execute", command, counter, counter >= 0x10000 ? PPC_LOAD_U32(counter) : 0,
+        PPC_LOAD_U32(kRenderRing + 20), pcr);
 }
 
 // FRenderCommandFence::Wait: this guest loop repeatedly invokes Sleep(0) while
@@ -285,12 +430,14 @@ namespace
 // destructors here.
 PPC_FUNC(sub_82322478)
 {
-    MaybeLogFenceWaiterStack(ctx);
+    const uint32_t fenceCounter = ctx.r3.u32, fencePcr = ctx.r13.u32;
+    const int fenceSlot = OpenFenceWaiter(ctx, base);
     if (g_fenceWaiters.fetch_add(1, std::memory_order_acq_rel) == 0)
         g_fenceWaitSinceMs.store(NowMs(), std::memory_order_release);
     GuestLockHold::Park();
     poll_wait::RunScoped(poll_wait::Kind::SharedValue, [&] { __imp__sub_82322478(ctx, base); });
     GuestLockHold::Unpark(uint32_t(ctx.r13.u32));
+    CloseFenceWaiter(fenceSlot, fenceCounter, fencePcr, base);
     if (g_fenceWaiters.fetch_sub(1, std::memory_order_acq_rel) == 1)
     {
         const uint64_t since = g_fenceWaitSinceMs.exchange(0, std::memory_order_acq_rel);

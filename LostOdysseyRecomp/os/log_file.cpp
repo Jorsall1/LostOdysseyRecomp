@@ -248,11 +248,10 @@ namespace os::logger
                     return a.timestamp.size() > b.timestamp.size();
                 return a.timestamp > b.timestamp;
             });
-            // Current always consumes one slot, even after a wall-clock reset. The Switch keeps ten sessions: a
-            // player who crashes, starts again and crashes again still has the first crash, and a benchmark's
-            // repeated runs stay on the card until they are copied off.
+            // Current always consumes one slot, even after a wall-clock reset. The Switch keeps only the current
+            // session: state/logs holds one runtime-<digits>.log and its shader log, replaced every launch.
 #if LO_PLATFORM_SWITCH
-            constexpr size_t kKeptOthers = 9;
+            constexpr size_t kKeptOthers = 0;
 #else
             constexpr size_t kKeptOthers = 2;
 #endif

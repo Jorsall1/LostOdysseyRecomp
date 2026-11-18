@@ -20,7 +20,7 @@ namespace os::logger
     // Never recurse or remove non-regular files. Busy/inaccessible old logs are
     // left for a later launch, so the directory may temporarily contain more.
     // Custom LO_LOG_FILE sinks must not opt in to this best-effort cleanup.
-    // The Switch keeps nine other sessions instead of two.
+    // The Switch keeps no other session (only the current one).
     void PruneDefaultLogs(const std::filesystem::path& currentLog) noexcept;
 
     // Before PruneDefaultLogs: moves files the previous session left elsewhere (source, name prefix) into the logs

@@ -72,6 +72,7 @@ void DumpGuestThreadStates();                         // kernel/imports.cpp: wha
 void DumpHangWatch();                                 // kernel/imports.cpp: the watched objects and their state
 void DumpGuestHotStacks();                            // kernel/imports.cpp: stacks of the threads not blocked
 void DumpGuestAliasUsage();                           // kernel/imports.cpp: what the C/E views hold
+void DumpFenceWaiters();                              // cpu/poll_wait.cpp: open render fence waits, ring, last events
 
 namespace os::switch_platform
 {
@@ -1440,7 +1441,13 @@ void Initialize(const std::filesystem::path& dataRoot)
     // Horizon has no console behind stderr: keep the renderer's and the NVK
     // driver's own diagnostics (UnleashedRecomp-NX does the same), and copy
     // them to the network log.
-    std::filesystem::rename(dataRoot / "stderr.log", dataRoot / "stderr.previous.log", ec);
+    // One copy of each log, overwritten every launch: the previous session's
+    // reports are removed here, before anything of this session can append to
+    // them (crash/hang/exit/crash_report append through RawAppend), and
+    // stderr.log and early_boot.log are opened with "w".
+    for (const char* stale : {"stderr.previous.log", "crash.log", "crash_report.txt", "hang.log", "exit.log",
+                              "cpu-samples.bin"})
+        std::filesystem::remove(dataRoot / stale, ec);
     g_stderrFile = std::fopen((dataRoot / "stderr.log").c_str(), "w");
     if (g_stderrFile)
         std::setvbuf(g_stderrFile, nullptr, _IONBF, 0);
@@ -1670,6 +1677,7 @@ void ExitWatchdogMain(void*)
                 DumpHangWatch();
                 DumpGuestHotStacks();
                 DumpGuestAliasUsage();
+                DumpFenceWaiters();
                 std::fprintf(stderr, "[watchdog] guest diagnostics %d done\n", guestDumps);
             }
         }
