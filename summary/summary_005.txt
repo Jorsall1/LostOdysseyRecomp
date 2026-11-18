@@ -1,0 +1,55 @@
+================================================================================
+LostOdysseyRecomp - Nintendo Switch 2 port
+Summary - TURN 5: LB+RB "Quit to hbmenu" row, and a playability assessment
+================================================================================
+FILES MODIFIED
+--------------------------------------------------------------------------------
+debug/menu_overlay.cpp (Switch 2 only, #if defined(__SWITCH2__)):
+  * File-scope declaration settings::quit_action::PushQuit() (the header
+    quit_action_hook.h carries guest PPC templates, so it is not included).
+  * kOverviewLastRow = 8 on Switch 2 (7 on Switch 1, 6 elsewhere).
+  * New Overview row 8 "Quit to hbmenu" (EN / zh-CN / ES), drawn under the
+    Debug Server row at contentY + 8*rowH + 6. The help lines move to
+    contentY + 9*rowH + 22 (ends ~y=580, above the footer line at y=592).
+  * Confirm only (Left/Right ignored). It closes the overlay first, because the
+    overlay pauses guest threads, then calls PushQuit(). That is the same path
+    as Settings > Gameplay > Quit to hbmenu (SDL_EVENT_QUIT -> GPU owner
+    cleanup -> EndProcessToHbmenu). If PushQuit fails, the overlay reopens and
+    shows a status line pointing to L + R + Plus + Minus.
+  * Help text on the row: unsaved progress is lost; use L+R+Plus+Minus if frozen.
+Build: OK. Only debug/menu_overlay.o recompiled.
+  Desktop NRO md5 6857e1806cd6aad8929c1e69b86ab036 (matches build/).
+  Supersedes the summary_004 NRO (fdab6440...). NOT tested on hardware.
+
+--------------------------------------------------------------------------------
+LOG DIAGNOSIS (runtime-1794961768357653.log, the only hardware log on disk)
+--------------------------------------------------------------------------------
+  * map=- on 825 renderer lines, battle=0 throughout, loading=0 on every
+    perf: line. The debug reset line at 484.410 s reads pending_map=0
+    title=0x0. => THE RUN NEVER LOADED A MAP OR STARTED GAMEPLAY.
+  * draws=3 per frame for most of the 60 fps window. The peak was 1,200 draws,
+    on a few frames. "212 s locked at 60 fps" was measured on menu/loading
+    screens, NOT gameplay. It says nothing about field or battle performance.
+  * Settings were saved at 235-236 s, so the user was in the settings menu.
+  * 14 WAIT_REG_MEM stalls (216.997 s .. 583.089 s): the priority-inversion
+    hang fixed in 842caa50 (summary_003).
+  * Audio: "peak=" in "audio frames submitted" is the LAST frame's peak only,
+    so peak=0 at exit is not proof of silence over the whole run. But the
+    comment in apu/audio.cpp (ResolveFrameView) records that the same day's
+    run had peak 0 for the whole loading screen, i.e. a silent mix read from
+    the wrong heap view. The A-window fallback was added after that run and
+    has not been verified on hardware either.
+  * Why Plus+Minus (and LB+RB) do nothing during a GPU stall: no frames are
+    presented, so the host menus can't draw. The settings menu's input also
+    goes through stalled guest controller reads. Only the HID watchdog
+    (L+R+Plus+Minus held 1.5 s, own thread) works during a hang.
+
+--------------------------------------------------------------------------------
+NEXT HARDWARE RUN SHOULD ANSWER
+--------------------------------------------------------------------------------
+  1. Is there no WAIT_REG_MEM stall? Does the game get from the title screen to
+     New Game, with map= becoming non-"-"?
+  2. Does audio have peak > 0 during the title music?
+  3. In the first field map: fps, draws, gpu_ms and hitches on the perf: lines.
+  4. Do all three exits work (Settings row, LB+RB row, L+R+Plus+Minus) with no
+     error dialog, and does hbmenu come back?

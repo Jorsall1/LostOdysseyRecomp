@@ -1,0 +1,51 @@
+================================================================================
+LostOdysseyRecomp - Nintendo Switch 2 port
+Summary - TURN 11: HOME -> X ("Please wait", then an error, then kaiHEN needs a reboot)
+================================================================================
+CAUSE (from the code; not tested on hardware)
+  * LO holds appletLockExit() from Initialize(). On HOME -> X the system
+    sends AppletMessage_ExitRequest and waits for the lock ("Please wait").
+  * LO answered by treating it like Quit to hbmenu (watchdog PushQuit -> GPU
+    owner -> EndProcessToHbmenu -> back to the loader -> hbmenu). The process
+    therefore stayed alive while the system waited for it to end. That ended
+    in a forced end treated as an application error. The repo's notes record
+    that an error-end drops kaiHEN's R -> hbmenu hook (hence the reboot).
+  * Ordinary homebrew never hold the exit lock, so the system ends them at
+    once on HOME -> X. RetroArch-S2 takes the lock but releases it in its
+    deinit.
+
+FIX (os/switch/switch_runtime.cpp)
+  * OnAppletEvent sets g_homeCloseRequested on AppletHookType_OnExitRequest
+    (the hook runs on whichever thread took the message: SDL's pump or the
+    watchdog).
+  * New CloseForHomeMenu():
+      - g_suppressGuestIo, then an exit.log mark;
+      - os::logger::CloseForExit() (bounded);
+      - appletUnlockExit(); the system then ends the process itself, as it
+        does for any homebrew;
+      - fallback after 3 s: svcExitProcess. Here that is a normal end: the
+        exit was requested and the lock is released.
+    No return to hbmenu: the player chose to close the game. kaiHEN: "the
+    second launch and onwards will launch into hbmenu", so starting the donor
+    again with R should work without a reboot.
+  * The watchdog calls CloseForHomeMenu as soon as appletMainLoop() returns
+    false or the flag is set, with no 4 s grace. The L+R+Plus+Minus combo
+    keeps the quit to hbmenu.
+  * EndProcessToHbmenu checks the flag first, so an SDL_EVENT_QUIT that SDL
+    made from the same HOME -> X also goes to CloseForHomeMenu.
+  NRO md5 deb440db85e1f35ab752d138b30a192f (Desktop copy matches).
+
+CONFIDENCE GIVEN TO THE USER
+  * HOME -> X: high that "Please wait" goes away and no error appears. This
+    is the stock behaviour of every homebrew. Not tested.
+  * A remaining unknown: whether kaiHEN itself survives the system ending
+    its donor process. It should, since that is normal kaiHEN use (HOME -> X
+    on hbmenu).
+  * Quit to hbmenu (debug menu / Settings / L+R+Plus+Minus): unchanged from
+    summary_010, about 50-60%.
+
+ASK OF THE USER
+  * Test HOME -> X, then start the donor game again holding R. Report
+    whether hbmenu comes up without a reboot.
+  * Test the debug-menu Quit; send stderr.log, exit.log and
+    sdmc:/kaihen/nro-cleanup.txt.

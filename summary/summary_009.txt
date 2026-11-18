@@ -1,0 +1,68 @@
+================================================================================
+LostOdysseyRecomp - Nintendo Switch 2 port
+Summary - TURN 9: comparison with Ad0ky's Switch 1 build; what to fix to get further
+================================================================================
+No source files changed. Compared against github.com/Ad0ky/LostOdysseyRecomp
+(cloned to /tmp/ad0ky, head b146d2f 2026-11-12). That is the same commit this
+fork merged (Jorsall1's "Complete Switch 2 libounce + OunceVK port" sits on top
+of it), so the fork already has all of Ad0ky's game fixes.
+Ad0ky's docs/SWITCH.md: "Status: early. The game runs on a console"; battles
+30 fps, field 20-25 fps on deko3d.
+
+DIFFERENCES THAT CAN EXPLAIN THE SWITCH 2 LOADING HANG
+1. Guest memory aliasing (the biggest difference).
+   * Switch 1 backs guest memory with svcMapProcessCodeMemory +
+     svcMapProcessMemory, so the Xbox 360 physical views A (0xA0000000),
+     C (0xC0000000) and E (0xE0000000, +4 KiB) are the SAME pages.
+   * Switch 2 under kaiHEN must use Backend::Heap (those syscalls are masked
+     and terminate the process). There, A, C and E are three separate copies.
+   * MmAllocatePhysicalMemoryEx always returns A addresses and the GPU and XMA
+     read A, so the common path still works. But anything the game reaches
+     through C, E or a raw physical address now reads or writes a different
+     copy.
+   * Proven once already: apu/audio.cpp's ResolveFrameView comment (the mix
+     buffer was read from the wrong view, so audio was silent).
+   * Audio is STILL silent (peak=0 in every report, both runs), and the last
+     file opened before the hang is the sound archive xenon_snd.fpd.
+   * Leading hypothesis: sound or XMA initialisation goes through an alias,
+     never completes, and the loading loop waits for it forever.
+   * Not fixable at the OS level: no in-process RW+RW alias is available.
+     libkaihen's JIT alias is RO's view, and svcMapMemory locks its source.
+     It has to be fixed in software, at the places the game uses aliases.
+2. Ad0ky's release env.txt (tools/switch/release-env.txt, identical in this
+   fork) is not on the user's card. Of its lines:
+     LO_SWITCH_BACKEND=deko3d, LO_DEKO3D_GPU_FAST, LO_DEKO3D_LEAN_SHADERS
+       -> Switch 1 only (Switch 2 uses OunceVK/NVK). Do not copy.
+     LO_NATIVE_MOVIES=1 -> already the Switch default (LO_HAS_WMV3_DECODER=1
+       is compiled in).
+     LO_GUEST_AFFINITY=1 -> default OFF. Without it every guest thread starts
+       on the process's default core (kernel/imports.cpp KeSetAffinityThread).
+       Worth testing.
+     LO_PIPELINE_PREBUILD=all -> not recommended. On NVK, pipeline building
+       already took one core at 100% for about 100 s.
+   The Switch 2 process may use cores 0x3f (6 cores, stderr "thread
+   placement"). The affinity mapping uses cores 0-2 only.
+3. CPU load in the new log: Pipeline_Worker was at 100% until about 100 s.
+   The hang outlasted it (and the 591 s run), so it is not CPU starvation.
+
+THE GPU STALL AT 104 s (secondary; it comes after the hang)
+  * The handler sub_827B6C48 clears bit (1 << PCR[0x10C]) at *(device+10900).
+    SetCpuNumber writes PCR+0x10C, which is consistent.
+  * completed=6026 == swap 6026 and pending=0, yet the value stays 0x4. The
+    handler ran but did not clear the copy A that the CP polls. This fits the
+    aliasing hypothesis if *(device+10900) is not 0xA0010000 at that point.
+  * To check: log that pointer in the stall diagnostics.
+
+PLAN GIVEN TO THE USER
+  A. Now, no rebuild: create sdmc:/switch/LostOdysseyRecomp/env.txt with
+       LO_GUEST_AFFINITY=1
+       LO_KERNEL_TRACE=1   (logs guest kernel calls: file reads, waits; big log)
+     LO_KERNEL_TRACE shows whether the game reads xenon_snd.fpd after opening
+     it, and which kernel calls the stuck loop makes.
+  B. Next build (diagnostic):
+       * at the 15 s watchdog dump and the WAIT_REG_MEM stall, list the C/E
+         2 MiB chunks that hold non-zero data (any = the game uses aliases);
+       * log the interrupt block pointer *(device+10900);
+       * log XMA / XAudio import arguments that are in C/E/physical ranges.
+  C. Then the fix: translate the alias addresses to A at the boundary that the
+     diagnostics name.

@@ -82,7 +82,12 @@ static size_t GuestFwrite(const void* data, size_t size, std::FILE* file) { retu
 
 #if LO_PLATFORM_SWITCH
 // os/switch/switch_runtime.cpp: set when the process has decided to end.
-namespace os::switch_platform { extern std::atomic<bool> g_suppressGuestIo; }
+namespace os::switch_platform
+{
+extern std::atomic<bool> g_suppressGuestIo;
+extern std::atomic<bool> g_endGuestThreads;
+[[noreturn]] void EndThreadForExit();
+}
 
 // libnx's application exit runs fsdevUnmountAll, and a guest thread of a hung
 // game can still arrive at a file syscall while that unmount is in progress
@@ -93,8 +98,11 @@ static void ParkGuestIoForExit()
 {
     if (!os::switch_platform::g_suppressGuestIo.load(std::memory_order_acquire))
         return;
-    for (;;)
-        os::switch_platform::SleepNanoseconds(std::numeric_limits<int64_t>::max());
+    // Parked until the main thread begins the exit, then ended: kaiHEN's
+    // loader ends the donor game over threads an NRO leaves running.
+    while (!os::switch_platform::g_endGuestThreads.load(std::memory_order_acquire))
+        os::switch_platform::SleepNanoseconds(50'000'000);
+    os::switch_platform::EndThreadForExit();
 }
 #define GUEST_IO_PARK_FOR_EXIT() ParkGuestIoForExit()
 #else

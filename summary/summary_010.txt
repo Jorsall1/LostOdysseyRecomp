@@ -1,0 +1,73 @@
+================================================================================
+LostOdysseyRecomp - Nintendo Switch 2 port
+Summary - TURN 10: Quit still closed the donor game; second exit fix; loading loop
+================================================================================
+Logs: "C:\Users\Jorda\Desktop\lo project" (runtime-1794977487375354.log,
+stderr.log, and a copy of sdmc:/switch/LostOdysseyRecomp). The card had the
+turn-7 NRO (md5 657bce68...). env.txt had LO_GUEST_AFFINITY=1 and
+LO_KERNEL_TRACE=1, and both were applied (48 "guest affinity" lines).
+
+QUIT
+  * Progress since turn 7: stderr.log now ends with "[exit] leaving through
+    libnx's application exit on the main thread", so rule 1 (exit on the main
+    thread) works. The donor game still closed with an error.
+  * Cause found: RunExit pauses every other thread with svcSetThreadActivity.
+    The loader's parkLeftThread pauses each left-over thread itself, and
+    Horizon refuses to pause an already-paused thread (InvalidState, see
+    Mesosphere KThread::SetActivity). The loader therefore counted every
+    thread LO paused as "running, could not park" and called svcExitProcess.
+    The turn-7 pause made parking impossible.
+  * FIX (os/switch/switch_runtime.cpp):
+      - ScanOtherThreads(true) records the paused handles (up to 256).
+      - RunExit replaces the loader return address with
+        envSetExitFuncPtr(&ResumeThenReturnToLoader). __libnx_exit ends in
+        __nx_exit(0, envGetExitFuncPtr()), so this runs after __appExit (SD
+        card unmounted, services closed), on the main thread. It resumes
+        every paused thread (ThreadActivity_Runnable) and jumps to the
+        loader, which can then park them.
+      - Threads stay paused for the whole libnx teardown, as before. The only
+        window in which they run against closed services is between the
+        resume and the loader's own pause.
+  * exit.log had never been written on the Switch 2: no exit.log or
+    crash_report.txt on the card in any copy. RawAppend's private fsp-srv
+    session apparently fails. FIX: RawAppend falls back to FsdevAppend, which
+    uses libnx's own SD card FsFileSystem (fsdevGetDeviceFileSystem("sdmc"))
+    with fsFs* calls only (no stdio, no locks). Boot now prints "[boot] own SD
+    card session unavailable (rc ...)" to stderr.log when it fails.
+  * Still needed from the user: sdmc:/kaihen/nro-cleanup.txt (outside the LO
+    folder; it was not in the copy).
+  NRO: md5 4baa01b31e2c395db9f500e5cfad33fb on the Desktop. Built OK; NOT
+  tested on hardware.
+
+LOADING
+  * The kernel trace (LO_KERNEL_TRACE=1, 365 lines):
+      - the last NtReadFile is xenon_sys.fpd at 2.486 s;
+      - xenon_snd.fpd is OPENED at 3.410 s but NEVER READ;
+      - the last kernel call is a run of MmAllocatePhysicalMemoryEx at
+        3.8 s, ending with a 0x7c01000 (124 MiB) buffer and 0xff00-0x10000
+        buffers. All are A-view addresses (0xa0..., 0xa9...);
+      - then no traced kernel call for 78 s.
+  * Guest Main is the loading screen's render loop, sub_824856A0:
+        while (*(0x83318040) != 0) {   // loading-active flag
+            if (sub_82485CD8(...)) ...  // take a request
+            else { Sleep; sub_824854D8; sub_823B63E0; sub_82821110; }
+        }
+    It also calls sub_82485C18 -> sub_822D6BB0 (fence insert) ->
+    sub_82322478, the render-fence Sleep(0) loop: *fence > value -> sleep.
+    So the main thread only draws the wheel. The real loading work runs on
+    another thread that never finishes.
+  * Candidates for that thread, from the 81 s dump:
+      - KeWaitForSingleObject obj=0x55e3c4 lr=0x827c139c, waiting 79,254 ms
+        (an event or semaphore in guest memory);
+      - Guest 82cc4d98 KeWaitForSingleObject obj=0x832e0140 (the audio side,
+        0x82cc.. code);
+      - workers in NtWaitForSingleObjectEx lr=0x822c5358, idle for 77-79 s.
+  * LO_GUEST_AFFINITY=1 changed nothing visible. It is harmless; keep it.
+
+NEXT
+  1. User: test Quit with this build; send stderr.log, exit.log (new) and
+     sdmc:/kaihen/nro-cleanup.txt.
+  2. Diagnostic build: log every set/release/wait on guest objects 0x55e3c4
+     and 0x832e0140 (with guest lr), the guest backtrace of their waiters,
+     and the C/E alias scan from summary_009. That names what the loading
+     thread is waiting for.

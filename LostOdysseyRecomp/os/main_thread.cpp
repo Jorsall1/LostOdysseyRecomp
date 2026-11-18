@@ -128,12 +128,25 @@ int RunServing(const std::function<int()>& body, const std::function<void()>& id
     return state.result;
 }
 #elif LO_PLATFORM_SWITCH
+}
+// os/switch/switch_runtime.cpp: waits for the guest's main thread to return,
+// and runs the process exit on this (the main) thread when one is requested.
+// kaiHEN's loader must be returned to from the thread it entered the NRO on.
+namespace os::switch_platform { void ServeExitOnMainThread(const std::atomic<bool>& guestReturned); }
+namespace os::main_thread
+{
 // No main-thread rule on Horizon, but the main thread's stack comes from the
-// homebrew loader. Run the guest's main thread with the guest-code stack size.
+// homebrew loader. Run the guest's main thread with the guest-code stack size,
+// and keep this thread free to run the exit (see ServeExitOnMainThread).
 int RunServing(const std::function<int()>& body, const std::function<void()>&)
 {
     int result = 0;
-    os::GuestCodeThread thread([&] { result = body(); });
+    std::atomic<bool> returned{false};
+    os::GuestCodeThread thread([&] {
+        result = body();
+        returned.store(true, std::memory_order_release);
+    });
+    os::switch_platform::ServeExitOnMainThread(returned);
     thread.join();
     return result;
 }

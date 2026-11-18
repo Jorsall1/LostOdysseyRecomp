@@ -1,0 +1,103 @@
+================================================================================
+LostOdysseyRecomp - Nintendo Switch 2 port (kaiHEN / devkitA64 / libounce / OunceVK)
+Summary - TURN 4: exit-time SD card write fixes
+================================================================================
+Build: cmake --build build -j20 succeeded (exit 0, "Packaging LostOdysseyRecomp.nro").
+Deployed: /mnt/c/Users/Jorda/Desktop/LostOdysseyRecomp.nro, 86,045,105 bytes,
+  md5 fdab6440578161783c8c983e6c8f0241 (matches build/LostOdysseyRecomp/...nro).
+New warnings: none from the edited files (log_file.cpp u8path deprecation and
+  the os/json.h include warnings were already there).
+NOT tested on hardware.
+
+--------------------------------------------------------------------------------
+NOTE: os/logger.cpp DOES NOT EXIST
+--------------------------------------------------------------------------------
+The logger is header-only: Log(), DrainPending() and the writer thread live in
+os/logger.h; DrainForExit() lives in os/log_file.cpp. The latch therefore went
+into logger.h + log_file.cpp/.h. (This touches headers; logger.h is included
+almost everywhere, so the build recompiled most of the runtime.)
+
+--------------------------------------------------------------------------------
+FILES MODIFIED
+--------------------------------------------------------------------------------
+1. os/logger.h
+   * New inline std::atomic<bool> g_logClosed{false}.
+   * Log(): returns at once when g_logClosed is set (before formatting, before
+     g_mutex, before netlog).
+   * DrainPending() (Switch): checks g_logClosed under g_writeMutex, so the
+     writer thread and the sync-log path write nothing after the close.
+
+2. os/log_file.h / os/log_file.cpp
+   * New os::logger::CloseForExit() noexcept: the final flush, then sets
+     g_logClosed while holding g_writeMutex and g_mutex, so no line is added and
+     no write starts after it returns. Same bounded try_lock loop as before
+     (100 x 2 ms); if the locks can't be taken (crashed holder) the latch is
+     set anyway.
+   * DrainForExit() and CloseForExit() share an internal DrainLocked(close).
+     Both are no-ops once the log is closed.
+   * The atexit handler registered in OpenFile now calls CloseForExit (it is
+     registered first, so it runs last among the handlers, after StopMonitor /
+     StopDriverThread, and before libnx's __appExit -> fsdevUnmountAll).
+
+3. modding/text_overlay.cpp
+   * New file-local std::atomic<bool> gExiting + Exiting().
+   * StopPrebuild(): sets gExiting first, then stopping/cancel + notify, then
+     a BOUNDED wait (1000 ms) on gPrebuild.changed for current.empty(). It logs
+     a warning if the build is still running when the bound expires. I did not
+     call WaitForPrebuild(): its predicate returns true as soon as `stopping`
+     is set, so it would never actually wait.
+   * Build(): while exiting:
+       - no <cache>.new folder is created (rebuilt files stay in memory);
+       - the Cancelled handler skips fs::remove_all(building) (the folder has
+         no manifest; the next start removes it before rebuilding);
+       - a background build that finishes its files after exit began throws
+         Cancelled before writing manifest/index files, rename or remove_all.
+   * Prune(): returns at once while exiting (no fs::remove_all).
+   * LoadCache hit path: skips fs::last_write_time on manifest.txt.
+   The 1000 ms bound keeps the quit inside the exit watchdog's 4 s grace.
+
+4. debug/perf_stats.cpp
+   * New perf_stats::StopMonitorForExit() (external linkage) wrapping the
+     anonymous-namespace StopMonitor(). StopMonitor is idempotent.
+
+5. apu/audio.cpp
+   * New apu::StopDriverForExit() (external linkage) wrapping the
+     anonymous-namespace StopDriverThread(). It is idempotent (g_running exchange).
+
+6. os/switch/switch_runtime.cpp
+   * Declares os::logger::CloseForExit, apu::StopDriverForExit and
+     perf_stats::StopMonitorForExit at file scope, in the file's existing style:
+     no header include, because of the libnx typedef clashes.
+   * New QuiesceForExit(), run once (atomic latch): CloseForExit ->
+     StopMonitorForExit -> StopDriverForExit. The log closes first so a thread
+     being stopped can't block on a logger lock or write a last line.
+   * Called from:
+       - EndProcessToHbmenu() (replaces DrainForExit, after QuiesceAudio);
+       - ExitNow() (replaces DrainForExit; also covers the Switch 1 branch,
+         which ends in svcExitProcess without atexit);
+       - ForceExitWithoutTeardown() (at entry; this path never runs atexit,
+         and it is the one FinishRequestedExit / video.cpp / main.cpp use on
+         their error branches).
+   * Ordering fallout: on Switch 2, ExitNow's later mark() lines go to
+     exit.log through RawAppend (a raw fs session, not the logger), so they
+     are unaffected. The "[exit] ..." fprintf(stderr) lines in
+     EndProcessToHbmenu still go out (stderr.log is not the runtime log).
+     Any LOG_* after QuiesceForExit is now dropped. That is intentional.
+
+Not changed: gpu/video.cpp. FinishRequestedExit already calls
+  RequestExit -> StopPrebuild and ends in ExitNow / ForceExitWithoutTeardown,
+  and both now quiesce, so it needed no edit.
+
+--------------------------------------------------------------------------------
+WHAT TO CHECK ON HARDWARE
+--------------------------------------------------------------------------------
+  * Quit via title Quit, HOME -> X and L+R+Plus+Minus: no Switch OS error dialog,
+    and hbmenu comes back.
+  * The runtime log should end before the "[exit] leaving through libnx's
+    application exit" line in stderr.log, with no perf: or audio driver: line
+    after the exit request.
+  * With a mod setup that prebuilds other discs: quit during a background
+    build. Expect at most ~1 s extra, possibly the "still running ... leaving
+    it" warning, and a leftover <hash>.new folder in cache/mods that the next
+    start cleans up.
+  * The remaining WAIT_REG_MEM next steps from summary_003 still apply.

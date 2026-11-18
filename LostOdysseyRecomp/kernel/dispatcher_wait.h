@@ -12,9 +12,33 @@
 
 #include <os/platform.h>
 
+#if LO_PLATFORM_SWITCH
+// os/switch/switch_runtime.cpp. Set when the main thread begins the process
+// exit: kaiHEN's loader ends the donor game when an NRO leaves more than 32
+// threads running, so a guest thread ends itself at its next wait instead.
+namespace os::switch_platform
+{
+extern std::atomic<bool> g_endGuestThreads;
+[[noreturn]] void EndThreadForExit();
+}
+#endif
+
 namespace kernel::wait {
 inline constexpr uint32_t Success = 0, Timeout = 0x102, Invalid = 0xC000000D;
 inline constexpr uint32_t Infinite = 0xFFFFFFFF;
+// Switch: true once the process exit has begun (see above). Callers release
+// their locks, then call EndThreadForExit.
+inline bool EndingForExit() {
+#if LO_PLATFORM_SWITCH
+    return os::switch_platform::g_endGuestThreads.load(std::memory_order_acquire);
+#else
+    return false;
+#endif
+}
+#if LO_PLATFORM_SWITCH
+// The longest a guest wait sleeps before it checks EndingForExit again.
+inline constexpr auto kExitCheckInterval = std::chrono::milliseconds(250);
+#endif
 // A thread in Multiple. It registers on the objects it waits for, so a signal
 // wakes the threads waiting for that object. A domain shared by all multiple
 // waits woke every such thread on every signal in the game: on the Switch that
@@ -55,13 +79,30 @@ public:
     std::vector<MultipleWaiter*> multipleWaiters;
     std::atomic<uint32_t> multipleCount{0};
     uint32_t Wait(uint32_t timeout, uint32_t owner = 0) {
+#if LO_PLATFORM_SWITCH
+        if (EndingForExit()) os::switch_platform::EndThreadForExit();
+#endif
         std::unique_lock lock(mutex);
         const auto ready = [&] { return Ready(owner); };
         if (!ready()) {
             waiters.fetch_add(1);
             struct Counted { std::atomic<uint32_t>& count; ~Counted() { count.fetch_sub(1); } } counted{waiters};
+#if LO_PLATFORM_SWITCH
+            // In steps of at most kExitCheckInterval, so a thread waiting with no
+            // timeout still ends when the process exit begins. Same result as
+            // one wait: a signal wakes it at once, and the deadline is exact.
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout);
+            for (;;) {
+                const auto step = std::chrono::steady_clock::now() + kExitCheckInterval;
+                const bool infinite = timeout == Infinite;
+                if (cv.wait_until(lock, infinite ? step : std::min(step, deadline), ready)) break;
+                if (EndingForExit()) { lock.unlock(); os::switch_platform::EndThreadForExit(); }
+                if (!infinite && std::chrono::steady_clock::now() >= deadline) return Timeout;
+            }
+#else
             if (timeout == Infinite) cv.wait(lock, ready);
             else if (!cv.wait_for(lock, std::chrono::milliseconds(timeout), ready)) return Timeout;
+#endif
         }
         Consume(owner);
         return Success;
@@ -150,6 +191,11 @@ inline uint32_t Multiple(std::span<Target* const> objects, bool all,
     };
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout);
     for (;;) {
+#if LO_PLATFORM_SWITCH
+        // No lock is held here. The waiter stays registered on the objects; its
+        // stack memory is not freed when the thread ends, so a later Wake is harmless.
+        if (EndingForExit()) os::switch_platform::EndThreadForExit();
+#endif
         // Cleared before the check: a wake after this leaves one more pass at most.
         { std::lock_guard lock(self.mutex); self.signaled = false; }
         {
@@ -184,8 +230,15 @@ inline uint32_t Multiple(std::span<Target* const> objects, bool all,
         }
         std::unique_lock lock(self.mutex);
         const auto woken = [&] { return self.signaled; };
+#if LO_PLATFORM_SWITCH
+        // At most kExitCheckInterval, then the loop checks the objects and
+        // EndingForExit again (see Target::Wait).
+        const auto step = std::chrono::steady_clock::now() + kExitCheckInterval;
+        self.cv.wait_until(lock, timeout == Infinite ? step : std::min(step, deadline), woken);
+#else
         if (timeout == Infinite) self.cv.wait(lock, woken);
         else self.cv.wait_until(lock, deadline, woken);
+#endif
     }
 }
 }

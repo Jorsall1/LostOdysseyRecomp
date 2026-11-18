@@ -1,0 +1,153 @@
+================================================================================
+LostOdysseyRecomp - Nintendo Switch 2 port (kaiHEN / devkitA64 / libounce / OunceVK)
+Archie reply summary - TURN 2
+================================================================================
+
+NOTE: the assistant has no system clock, so no wall-clock time is recorded here.
+The session's hardware run is dated ~2026-11-17 (derived from the log filename
+runtime-1794961768357653 -> epoch 1794961768 s, corroborated by the
+"Switch 2 hardware, 2026-11-17" comment in apu/audio.cpp).
+
+Numbering note: summary/session_summary.txt (written the previous turn, holding
+entries 1-3 of this session) is the de facto summary_001 and was NOT modified.
+From this turn on, one new numbered file per reply; next will be summary_003.txt.
+
+--------------------------------------------------------------------------------
+FILES INSPECTED THIS TURN (attached by the user; none modified)
+--------------------------------------------------------------------------------
+  - LostOdysseyRecomp/os/log_file.cpp            [RELEVANT - see findings]
+  - LostOdysseyRecomp/modding/text_overlay.cpp   [RELEVANT - see findings]
+  - tools/XenonRecomp/thirdparty/libmspack/cabextract/src/cabextract.c
+                                                 [not relevant: host-side CAB
+                                                  extraction tool, not on the
+                                                  Switch runtime or exit path]
+  - tools/tests/storage_test.cpp                 [not relevant to the two open
+                                                  bugs: host-side guest-import
+                                                  storage/IO/DLC regression test.
+                                                  Noted only as prior art for
+                                                  deterministic thread-shutdown
+                                                  testing - its IoTask class
+                                                  enforces a 60 s join deadline
+                                                  and calls std::_Exit(1) rather
+                                                  than hanging, the same pattern
+                                                  StopDriverThread's 500 ms wait
+                                                  is trying to achieve.]
+
+NOT attached this turn: apu/audio.cpp, debug/perf_stats.cpp,
+gpu/command_processor.cpp, gpu/video.cpp, kernel/guest_address_space_switch.cpp.
+No source files were modified in this turn.
+
+--------------------------------------------------------------------------------
+WHAT WAS DONE
+--------------------------------------------------------------------------------
+  * Switched the summary scheme from one appended file to one numbered file per
+    reply, at the user's request, and created this file (summary_002.txt).
+  * Reviewed the two relevant attachments against the two open issues from
+    turn 1 (exit-time SD-card writes during fsdevUnmountAll; the WAIT_REG_MEM
+    0x10002 stall). Findings below.
+
+--------------------------------------------------------------------------------
+FINDING A - os/log_file.cpp ALREADY HANDLES EXIT DRAIN, AND THE ORDER IS RIGHT
+--------------------------------------------------------------------------------
+  * OpenFile() registers, on __SWITCH__ only:
+        static const bool drainAtExit = std::atexit([] { DrainForExit(); }) == 0;
+  * std::atexit is LIFO. OpenFile() runs during startup - well before the first
+    perf_stats::Present() (which registers StopMonitor) and before apu::Init()
+    (which registers StopDriverThread). Therefore DrainForExit() runs LAST, i.e.
+    AFTER both thread-stop handlers. That is exactly the order the turn-1 fixes
+    need: the threads are stopped first, then the queued lines are flushed, then
+    libnx unmounts the card. This REDUCES the concern raised in turn 1 about
+    atexit ordering for the logger itself.
+  * Remaining caveats in this file:
+    - DrainForExit() polls try_lock on g_writeMutex + g_mutex only 100 times at
+      2 ms = 200 ms total, then returns SILENTLY, dropping g_pending. A
+      background thread that still holds g_writeMutex at exit causes lost log
+      lines (not a crash) - and is itself evidence that a thread is still live.
+    - On Switch, g_emergencyFile is set to fileno(g_file), i.e. the SAME
+      descriptor as the buffered FILE* (Horizon refuses a second write handle).
+      Any EmergencyWrite() after the normal FILE* is closed therefore writes to a
+      closed descriptor; only the STDERR_FILENO fallback survives.
+    - PruneDefaultLogs()/ArchiveSessionFiles() do significant file I/O but run at
+      startup, not at exit - not a shutdown risk.
+  * Conclusion: the proposed single "g_logClosed" latch still belongs in
+    os/logger.cpp (where LOG_* is implemented), not here; log_file.cpp provides
+    the flush, not the gate.
+
+--------------------------------------------------------------------------------
+FINDING B - modding/text_overlay.cpp IS A FOURTH UNGUARDED EXIT-TIME SD WRITER
+--------------------------------------------------------------------------------
+  This is the significant new finding of the turn.
+  * PrebuildThread() is started with os::DetachThread(std::thread(PrebuildThread))
+    from StartPrebuild(). It is DETACHED - it cannot be joined.
+  * While running it writes extensively to the SD card: per-set cache files under
+    cache/mods/<folder hash>/<key>/ - "<name>.index", "<archive>.tail", overflow
+    archives "xenon_modN.fpd", "manifest.txt.part" -> renamed to "manifest.txt" -
+    plus fs::remove_all()/fs::rename() in Prune() and in Build()'s Cancelled
+    path, and many LOG_NOTICE/LOG_WARNING lines.
+  * A disc prebuild is explicitly expected to take "a minute or two", so it can
+    easily still be running when the user quits with L+R+Plus+Minus.
+  * StopPrebuild() only sets gPrebuild.stopping = true and gPrebuild.cancel =
+    true and notifies - it DOES NOT WAIT. WaitForPrebuild() exists and does wait,
+    but is a separate function. Build() reacts to cancel only between files, and
+    its Cancelled handler still performs fs::remove_all(building) on the way out.
+  * PrepareReload() launches a SECOND detached thread (os::DetachThread) that
+    calls Build() and therefore writes the same cache files; nothing stops it at
+    exit at all.
+  * => Even with apu/audio.cpp and debug/perf_stats.cpp fully fixed, a prebuild
+    or live-reload thread can be mid-write to the SD card when fsdevUnmountAll()
+    runs, reproducing the OS error dialog. This is independent of td214/t25b5.
+  * Recommended (both .cpp, no header edits):
+    1. Have the quit path call StopPrebuild() followed by a BOUNDED wait (e.g.
+       WaitForPrebuild() with a deadline), before std::exit(0).
+    2. Add the g_logClosed latch in os/logger.cpp so that whatever thread is
+       still alive cannot write log lines during the unmount.
+    Note: the file-system writes (not just log lines) still need (1); a log latch
+    alone does not stop cache writes.
+
+--------------------------------------------------------------------------------
+RUNNING LIST: THREADS/PATHS THAT CAN WRITE THE SD CARD AT EXIT
+--------------------------------------------------------------------------------
+  Confirmed so far across turns 1-2:
+   1. perf_stats MonitorMain      (t25b5)  - FIXED turn 1 (CV + join via atexit)
+   2. apu DriverMain              (td214)  - FIXED turn 1 (g_shuttingDown +
+                                             g_driverExited handshake)
+   3. os/log_collection.cpp StartUpload()  - detached, sleeps 5 s, writes
+                                             log-collection-sent + LOG_INFO
+   4. modding/text_overlay.cpp PrebuildThread() and the PrepareReload() thread
+                                           - detached, write mod cache files
+   5. os/logger.cpp's own ~1 s flush; hang watchdog + crash handler RawAppend
+      (own FS session); cpu-samples.bin; heap census; PGO profile writes; the
+      debug server's "shot"
+  Mitigating: os/log_file.cpp's DrainForExit() atexit handler runs after the
+  thread stops (Finding A) - but only covers the buffered log, not (3) or (4).
+
+--------------------------------------------------------------------------------
+WAIT_REG_MEM 0x10002 - NO CHANGE THIS TURN
+--------------------------------------------------------------------------------
+  Nothing in this turn's attachments touches the GPU sync path. The turn-1
+  analysis stands unchanged:
+   - Most likely cause (b): the guest interrupt handler never runs, because
+     InterruptMain()/VsyncMain() in gpu/command_processor.cpp set no thread
+     priority (default ~0x3B, below the guest threads) while the CP poll loop
+     calls std::this_thread::yield(), which on Horizon cannot donate to a
+     lower-priority thread. Priority inversion during loading screens.
+   - Proposed, still NOT APPLIED: raise InterruptMain/VsyncMain to 0x2A; replace
+     yield() with PreciseSleepFor(100 us); extend the stall log with
+     m_interruptsCompleted / m_pendingInterrupts.size() / callback presence /
+     g_workerStage; add a one-shot A/C/E view self-test in
+     CommandProcessor::Init(); try one run with LO_CP_SELF_WAITS=0.
+   - Reminder (corrected in turn 1): the audio starvation (starved=3499) is a
+     SYMPTOM of this stall, not a second bug. 45,000 submitted frames = exactly
+     240 s of audio in a 591 s run, matching the 245 s of non-stalled time.
+
+--------------------------------------------------------------------------------
+STILL NEEDED FROM THE USER
+--------------------------------------------------------------------------------
+  * gpu/command_processor.cpp, gpu/video.cpp, kernel/guest_address_space_switch.cpp
+    (to write the proposed GPU-side fixes as full files).
+  * os/logger.cpp (to add the g_logClosed latch).
+  * The build output - the user ran the build in a separate Ubuntu terminal, so
+    the assistant has never seen whether the turn-1 edits compiled.
+  * A POST-FIX runtime log. The log analysed in turn 1 predates the turn-1 edits
+    (same 591.599 / 591.703 / 592.075 timestamps and starved=3499 as the original
+    task text), so it neither verifies nor refutes either fix.

@@ -572,6 +572,15 @@ void StepBench(BenchRun& run, const PresentSample& sample, float intervalMs, boo
 }
 }
 
+// External linkage for os/switch/switch_runtime.cpp (declared there, as this
+// file's header cannot be included beside libnx's): the exit paths that skip
+// std::atexit (ForceExitWithoutTeardown) stop the monitor explicitly.
+// StopMonitor is idempotent, so the atexit handler running later is harmless.
+void StopMonitorForExit()
+{
+    StopMonitor();
+}
+
 void Present(const PresentSample& sample)
 {
     const Config& config = GetConfig();

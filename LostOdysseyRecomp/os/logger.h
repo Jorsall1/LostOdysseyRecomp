@@ -48,6 +48,12 @@ namespace os::logger
     }
     // Opened once by main; intentionally kept open until process termination.
     inline FILE* g_file = nullptr;
+    // Set once by CloseForExit (os/log_file.cpp) after the final flush: the
+    // process is ending and libnx's exit will unmount the SD card
+    // (fsdevUnmountAll). From then on every LOG_* call returns at once and the
+    // log writer thread writes nothing, so no thread that is still alive can
+    // reach the card during the unmount (the Switch OS reports that as an error).
+    inline std::atomic<bool> g_logClosed{false};
     inline const bool g_verbose = getenv("LO_VERBOSE") != nullptr;
 
     // Every line carries the seconds since the process started and a short
@@ -110,6 +116,10 @@ namespace os::logger
     inline void DrainPending()
     {
         std::lock_guard write(g_writeMutex);
+        // Checked under g_writeMutex: CloseForExit sets it holding that lock,
+        // so no write starts after it returns.
+        if (g_logClosed.load(std::memory_order_acquire))
+            return;
         std::string out;
         {
             std::lock_guard lock(g_mutex);
@@ -148,6 +158,8 @@ namespace os::logger
     template<typename... Args>
     inline void Log(LogType type, const char* func, fmt::format_string<Args...> format, Args&&... args)
     {
+        if (g_logClosed.load(std::memory_order_acquire))
+            return; // the process is ending: see g_logClosed
         if (type == LogType::Kernel && !g_kernelTrace.load(std::memory_order_relaxed))
             return;
         if (type == LogType::Info && !g_infoTrace.load(std::memory_order_relaxed))

@@ -1,0 +1,115 @@
+================================================================================
+LostOdysseyRecomp - Nintendo Switch 2 port
+Summary - TURN 7: why Quit closed the donor game, and the main-thread exit
+================================================================================
+Logs read: "C:\Users\Jorda\Desktop\lo project" (runtime-1794974356360289.log,
+stderr.log, early_boot.log). References read: ouncebrew/kaihen (README),
+ouncebrew/ounce-hbloader @ 2d38bcbe (the commit kaiHEN's Dockerfile pins;
+switch2/clean_main.cpp, entry.S), NerdsMcGee/retroarch-s2
+(frontend/drivers/platform_switch.c), and libounce's crt0 / __libnx_exit,
+disassembled from libounce.a.
+
+--------------------------------------------------------------------------------
+QUIT: WHAT HAPPENED (runtime log 119.307-119.776 s, stderr.log)
+--------------------------------------------------------------------------------
+  The debug-menu button worked as designed up to the handover: SDL_EVENT_QUIT,
+  owner shutdown complete exit_code=0, "[exit] next load ... set", "[exit]
+  leaving through libnx's application exit". Then the donor game closed.
+  Cause, from the loader source:
+  1. libounce's __nx_exit sets sp to the saved entry stack and branches to the
+     loader, ON THE CALLING THREAD. LO called std::exit on the GPU owner
+     thread (tde27). The loader then ran on the wrong thread: it restored its
+     TLS onto that thread and skipped the real main thread when parking.
+  2. The loader's unloadImage parks still-running threads, at most 32 for the
+     whole process lifetime. For more, or for any thread it can't park or
+     release, it calls svcExitProcess, which ends the donor game. LO had about
+     18 guest threads plus about 15-20 host threads alive at exit.
+  3. svcExitProcess anywhere in LO ends the donor game.
+  RetroArch-S2 works because it returns from main() on the main thread with
+  its threads joined.
+  The loader writes its verdict to sdmc:/kaihen/nro-cleanup.txt. Ask the user
+  for it (from the failed run and from the next one).
+
+--------------------------------------------------------------------------------
+CHANGES (built OK; NOT tested on hardware)
+--------------------------------------------------------------------------------
+os/main_thread.cpp (Switch): RunServing starts the guest on a GuestCodeThread
+  as before, but the main thread calls ServeExitOnMainThread instead of join().
+os/switch/switch_runtime.cpp:
+  * ServeExitOnMainThread: the main thread polls every 10 ms for an exit
+    request (or the guest main returning), then runs RunExit. It never
+    returns, and g_exitServerActive is never cleared.
+  * EndProcessToHbmenu (Switch 2): off the main thread, it sets
+    g_exitRequested and ends the calling thread (svcExitThread). Second
+    entrants also end themselves. The Switch 1 path is unchanged.
+  * RunExit, on the main thread:
+      exit.log line
+      -> g_endGuestThreads = true
+      -> QuiesceAudio + QuiesceForExit (log close, perf, audio driver)
+      -> fflush stdout/stderr
+      -> next load sdmc:/hbmenu.nro
+      -> wait up to 1 s for threads to end (stops after 150 ms with no change)
+      -> __malloc_lock(_REENT), never released
+      -> pause every other thread (svcSetThreadActivity; threads found through
+         the TLS ThreadVars scan, the same way the loader finds them)
+      -> exit.log "exit: threads: N running at the exit request, E ended,
+         R still running, P paused"
+      -> appletUnlockExit
+      -> std::_Exit(0)
+    std::_Exit goes _exit -> __syscall_exit -> __libnx_exit (__appExit,
+    __nx_gpu_exit, __nx_win_exit, _serviceGuardCloseAll, _gsvSyncExit,
+    _threadReleaseExited) -> __nx_exit -> the loader, on the main thread.
+    It skips the C++ static destructors.
+  * EndThreadForExit = svcExitThread. No TLS destructors run and nothing is
+    freed, so the loader's releaseEndedThread sees a valid Thread struct and
+    closes the handle. Ended threads do not count toward the 32-park limit.
+  * ForceExitWithoutTeardown (Switch 2) -> EndProcessToHbmenu (no svcExitProcess).
+  * A second fault in the crash handler: svcExitThread, not svcExitProcess.
+kernel/dispatcher_wait.h (Switch): Target::Wait and Multiple wait in steps of
+  at most 250 ms. Once g_endGuestThreads is set they unlock and end the
+  thread; it is also checked on entry. Deadlines are still exact and signals
+  still wake at once.
+kernel/imports.cpp: KeDelayExecutionThread ends the thread before and after
+  its sleep once g_endGuestThreads is set.
+kernel/io/file_system.cpp: ParkGuestIoForExit parks until g_endGuestThreads
+  is set, then ends the thread.
+NRO: md5 657bce680df5d42b83500472c1b89059 (Desktop copy matches build/).
+
+Validation sub-agent: confirmed the debug-menu path reaches __nx_exit on the
+main thread, with no Switch 2 svcExitProcess before the loader. It confirmed
+that svcExitThread-ended pthreads pass releaseEndedThread, and that the wait
+chunking doesn't change gameplay behaviour. It flagged two problems:
+  (1) a paused thread could hold the malloc lock -> FIXED with __malloc_lock;
+  (2) a race / wrong-thread exit after the serve loop ended -> FIXED (the loop
+      never ends).
+Remaining known risks:
+  * A paused thread holding libounce's g_threadMutex, the gsv mutex or the
+    fsdev devoptab lock would hang the exit. Guest file I/O is parked, so the
+    fsdev case is unlikely. The other two can't be taken from outside libounce.
+  * An exit requested before RunServing starts (very early boot) still runs
+    on the calling thread.
+  * Host threads that never reach a guest wait stay paused and are parked by
+    the loader: InterruptMain/VsyncMain, GPU CmdProc, Mesa/NVK, SDL, pipeline
+    workers, the watchdog, APM/awake/profiler threads, netlog. Each counts
+    toward the 32-park limit. The new exit.log line gives the real count.
+  * If the exit itself hangs, the watchdog no longer kills the process. The
+    screen freezes instead, and HOME -> close is the way out.
+
+--------------------------------------------------------------------------------
+LOADING HANG (new log)
+--------------------------------------------------------------------------------
+  * The same as the previous run: the last file opened was xenon_snd.fpd at
+    3.419 s, then the wheel spun at 60 fps (draws=3) for about 100 s.
+  * The single WAIT_REG_MEM stall at 104-109 s printed "interrupt handler:
+    completed=6026 pending=0 callback=0x827b6c48 ... swap=6026". The interrupt
+    thread was NOT starved and no interrupt was outstanding. The priority-
+    inversion theory (summary_003) does not explain this run's stall.
+  * Next experiment: LO_CP_SELF_WAITS=0 in env.txt. The next code target is
+    why the game stops loading after opening the sound archive.
+
+--------------------------------------------------------------------------------
+ASK OF THE USER
+--------------------------------------------------------------------------------
+  1. sdmc:/kaihen/nro-cleanup.txt (the loader's verdict), from the next quit.
+  2. sdmc:/switch/LostOdysseyRecomp/exit.log: the new "exit: threads:" line.
+  3. stderr.log and the runtime log, as before.

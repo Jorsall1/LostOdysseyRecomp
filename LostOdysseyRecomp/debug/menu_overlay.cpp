@@ -25,12 +25,21 @@
 
 // hid.h also declares guest XAMINPUT types; the overlay only needs this host state.
 namespace hid { bool UsesPlayStationPrompts(); }
+#if defined(__SWITCH2__)
+// settings/quit_action_hook.cpp: queues SDL_EVENT_QUIT (its header carries guest PPC templates).
+namespace settings::quit_action { bool PushQuit(); }
+#endif
 
 namespace debug_menu
 {
     using translations::Pick;
-    // Overview's last row: Cancel Victory Request, then the Switch's Debug server switch.
+    // Overview's last row: Cancel Victory Request, then the Switch's Debug server
+    // switch, then on Switch 2 Quit to hbmenu.
+#if defined(__SWITCH2__)
+    constexpr int kOverviewLastRow = 8;
+#else
     constexpr int kOverviewLastRow = LO_PLATFORM_SWITCH ? 7 : 6;
+#endif
 
     struct OverlayState
     {
@@ -284,6 +293,7 @@ namespace debug_menu
             // 5: Win Battle
             // 6: Cancel Battle Request
             // 7: Debug server on / off at the next start (the Switch)
+            // 8: Quit to hbmenu (Switch 2)
             if (action == InputAction::Confirm || action == InputAction::Left || action == InputAction::Right)
             {
                 switch (g_overlayState.selectedRow)
@@ -355,6 +365,29 @@ namespace debug_menu
                             L"No se ha podido guardar el servidor de depuración"));
                     else
                         SetOverlayStatus(Pick(language, L"Applies at the next start", L"下次启动时生效", L"Se aplica en el próximo inicio"));
+                    return;
+                }
+#endif
+#if defined(__SWITCH2__)
+                case 8:
+                {
+                    // The same quit as Settings > Gameplay > Quit to hbmenu: SDL_EVENT_QUIT,
+                    // the GPU owner's cleanup, then EndProcessToHbmenu (next load
+                    // sdmc:/hbmenu.nro, exit lock released, libnx's application exit).
+                    // Confirm only, so a Left/Right press on the row never quits.
+                    if (action != InputAction::Confirm)
+                        return;
+                    const uint32_t language = g_overlayState.language;
+                    stateLock.unlock();
+                    // Close the overlay first: it pauses the game, and the quit must
+                    // not wait on paused guest threads.
+                    ToggleOverlayLocked();
+                    if (!settings::quit_action::PushQuit())
+                    {
+                        ToggleOverlayLocked();
+                        SetOverlayStatus(Pick(language, L"Quit could not be queued: hold L + R + Plus + Minus",
+                            L"无法排入退出请求：请按住 L + R + + + -", L"No se pudo salir: mantén L + R + Más + Menos"));
+                    }
                     return;
                 }
 #endif
@@ -648,6 +681,27 @@ namespace debug_menu
                 host_ui::DrawButton(r, btnX, contentY + 7 * rowH + 6, btnW, 30, serverText, state.selectedRow == 7);
                 helpY = contentY + 8 * rowH + 22;
             }
+#if defined(__SWITCH2__)
+            // 8: Quit to hbmenu, under the Debug server row; the help lines move down one row.
+            host_ui::DrawButton(r, btnX, contentY + 8 * rowH + 6, btnW, 30,
+                Pick(language, L"Quit to hbmenu", L"退出到 hbmenu", L"Salir a hbmenu"), state.selectedRow == 8);
+            helpY = contentY + 9 * rowH + 22;
+            if (state.selectedRow == 8)
+            {
+                const wchar_t* help[] = {
+                    Pick(language, L"Ends the game and returns to the homebrew menu. Unsaved progress is lost.",
+                        L"结束游戏并返回自制软件菜单。未保存的进度将丢失。",
+                        L"Cierra el juego y vuelve al menú homebrew. Se pierde el progreso sin guardar."),
+                    Pick(language, L"If the game is frozen, hold L + R + Plus + Minus instead.",
+                        L"如果游戏卡死，请改为按住 L + R + + + -。",
+                        L"Si el juego está bloqueado, mantén L + R + Más + Menos."),
+                };
+                for (int line = 0; line < 2; ++line)
+                    r.DrawWString(panelX + (panelW - r.MeasureWString(help[line])) / 2, helpY + line * 22, help[line],
+                        host_ui::MakeColor(255, 240, 190, 90));
+            }
+            else
+#endif
             if (state.selectedRow == 7)
             {
                 const wchar_t* help[] = {

@@ -478,6 +478,15 @@ namespace apu
         }
     }
 
+    // External linkage for os/switch/switch_runtime.cpp (declared there): the
+    // exit paths that skip std::atexit (ForceExitWithoutTeardown) stop the
+    // driver explicitly. StopDriverThread is idempotent (g_running exchange),
+    // so the atexit handler running later is harmless.
+    void StopDriverForExit()
+    {
+        StopDriverThread();
+    }
+
     void Init(Output output)
     {
         const bool surround = output == Output::Surround;

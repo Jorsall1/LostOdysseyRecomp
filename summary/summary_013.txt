@@ -1,0 +1,54 @@
+================================================================================
+LostOdysseyRecomp - Nintendo Switch 2 port
+Summary - TURN 13: debug-menu Quit test of the fe4718ba build
+================================================================================
+LOGS ("lo project": exit.log, nro-cleanup.txt, stderr.log, runtime-1794981768381171.log)
+  * The loading wheel hung as before: Guest Main in sub_82485C18 ->
+    sub_82322478 at 106 s; same signature as summary_010.
+  * Quit: the owner shutdown completed at 132.038 s (exit_code=0). exit.log
+    now exists (the fsdev fallback works) and shows the whole sequence:
+      started -> apm restored -> logs flushed -> handing the exit to the main
+      thread -> 6 running, 28 ENDED, 4 still running, 4 paused -> "next load
+      set, exit lock released; std::_Exit -> libnx exit -> loader".
+    Survivors: two unregistered threads (handles 0x2d01e4, 0x2e01e3), Guest
+    Main (0x2f81df) and Memory Monitor (0x4101c5; it sleeps 30 s).
+  * The user saw a black screen for about 2 s (RunExit's 1.5 s wait plus the
+    audio quiesce), then the donor game closed.
+  * nro-cleanup.txt is still hbmenu's, written at 01:02 when hbmenu launched
+    LO. The loader writes this file on BOTH its normal path and its
+    svcExitProcess path, so the loader never reached unloadImage. The process
+    died between std::_Exit and the loader's report: in libnx's teardown, or
+    after ResumeThenReturnToLoader resumed the 4 paused threads.
+
+DIAGNOSIS
+  * By handle IDs, the two unregistered threads were created just before
+    Guest Main. That matches LO's own unregistered libnx threads from
+    Initialize: the exit watchdog (it polls padUpdate / appletMainLoop every
+    100 ms), the APM thread and the awake thread.
+  * Once resumed after __appExit (hidExit unmaps HID shared memory,
+    appletExit closes the applet), the watchdog's next poll touches freed
+    memory or a closed service. The process dies before the loader writes
+    its report.
+  * General rule learned: a thread must not be resumed after the teardown
+    unless it is blocked in something the teardown does not wake.
+
+FIX (os/switch/switch_runtime.cpp)
+  * ShouldEndThisThread: EVERY thread except the exit runner now ends at its
+    next condition-variable wait or sleep, not only profiler-registered ones.
+    The exit watchdog, APM, awake thread, SDL and driver threads included.
+    After g_loaderHandoff, threads block forever in __real_svcSleepThread
+    instead (parkable).
+  * exit.log names each survivor after the pause, with
+    svcGetThreadContext3 pc/lr as ELF offsets
+    ("exit: still running: <name> (handle) pc elf+.. lr elf+.."), so any
+    remaining culprit can be pinned to a function.
+  NRO md5 99dfdcc9129c2a198a6b1b3d4e7a2333 (Desktop copy matches). Build OK.
+
+RISK
+  * libnx/OunceVK teardown waiting on a driver thread that has now ended.
+    The Vulkan device is destroyed by the owner shutdown before this, so
+    driver threads should already be gone.
+
+ASK
+  Same test: debug-menu Quit. Send exit.log (now with pc/lr), stderr.log,
+  the runtime log and sdmc:/kaihen/nro-cleanup.txt.

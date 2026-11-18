@@ -181,6 +181,12 @@ elseif(LO_TARGET_PLATFORM STREQUAL "switch")
     target_link_options(LostOdysseyRecomp PRIVATE "-Wl,--wrap=rename")
     # os/switch/env_file.cpp: names the LO_* switches read before env.txt was applied (stderr.log).
     target_link_options(LostOdysseyRecomp PRIVATE "-Wl,--wrap=getenv")
+    # os/switch/switch_runtime.cpp: at exit the runtime's host threads end at their next condition-variable
+    # wait or sleep, so kaiHEN's loader has none to park (it ends the donor game past 32).
+    if(LO_TARGET_SWITCH2)
+        target_link_options(LostOdysseyRecomp PRIVATE
+            "-Wl,--wrap=__libc_cond_wait,--wrap=__libc_cond_wait_recursive,--wrap=svcSleepThread")
+    endif()
     # thirdparty/plume-deko3d: LO_DEKO3D_PRESENT_THREAD hands deko3d's buffer-queue calls to a worker.
     # Switch 2 (libounce/OunceVK) has no deko3d back end, so neither is built there.
     if(NOT LO_TARGET_SWITCH2)

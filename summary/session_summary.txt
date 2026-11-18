@@ -1,0 +1,239 @@
+LostOdysseyRecomp - Nintendo Switch 2 port (kaiHEN / devkitA64 / libounce / OunceVK)
+Archie session summary log
+
+NOTE ON TIMESTAMPS: the assistant has no access to a system clock. The date
+below is derived from the runtime log filename (runtime-1794961768357653 ->
+epoch 1794961768 s -> 2026-11-17 UTC) and corroborated by the "Switch 2
+hardware, 2026-11-17" comment in apu/audio.cpp. Entry times are marked "~".
+For exact timestamps, append with:
+  SUM="/mnt/c/Users/Jorda/Desktop/lo project/summary"; mkdir -p "$SUM" && \
+    { echo; echo "=== $(date -Is) ==="; cat; } >> "$SUM/session_summary.txt"
+
+NOTE ON APPENDS: the assistant can only write whole files, not append. To
+preserve this history, attach this file each turn (@summary/session_summary.txt)
+or use the shell command above. Without that, each write replaces the file.
+
+================================================================================
+=== ~2026-11-17 | Entry 1 | Thread-shutdown and audio-drain edits
+================================================================================
+
+Files MODIFIED (full-file rewrites, no .h touched per project rule 1):
+  - LostOdysseyRecomp/debug/perf_stats.cpp
+  - LostOdysseyRecomp/apu/audio.cpp
+
+Task 1 - exit thread race (background threads writing during fsdevUnmountAll):
+  * perf_stats.cpp: MonitorMain no longer sleeps detached. Added g_stopMutex /
+    g_stopSignal / g_stopping and WaitForInterval(); the loop exits immediately
+    on shutdown instead of waking to emit another "perf:" line (the 592.075 s
+    line). Added a Stopping() re-check after the line is formatted but before
+    LOG_NOTICE, so a line built during shutdown is discarded.
+  * perf_stats.cpp: the monitor is now a joinable std::thread* (intentionally
+    leaked so no static destructor meets a joinable thread and calls
+    std::terminate). StopMonitor() sets the flag, notifies, joins and deletes;
+    it is registered with std::atexit at the first Present. os::DetachThread is
+    no longer used for it (its include is now unused - noted, not removed).
+  * audio.cpp: added g_shuttingDown and g_driverExited plus StopDriverThread(),
+    registered with std::atexit in Init() via std::call_once.
+  * audio.cpp: StopDriverThread() sets g_shuttingDown, clears g_running, then
+    waits up to 500 ms (1 ms polls) for g_driverExited, which DriverMain
+    publishes AFTER its GuestThreadContext is destroyed. This is the "join":
+    os::GuestCodeThread is detached and cannot be joined. It then clears,
+    destroys the SDL stream and pauses/closes the device under g_deviceMutex.
+  * audio.cpp: while g_shuttingDown is set, the driver dispatches no guest
+    callbacks and every SD-card write on the audio path is suppressed - the
+    10 s "audio driver:" line, "audio frames submitted:", the LO_AUDIO_CAPTURE
+    file and CaptureRequested().
+  * Rationale: EndProcessToHbmenu() ends via std::exit(0), and newlib runs
+    atexit handlers before libnx's teardown reaches fsdevUnmountAll().
+
+Task 2 - audio queue drain (as understood at the time; see Entry 2, CORRECTED):
+  * audio.cpp, Switch 2 only (__SWITCH2__), Switch 1 / Android / desktop
+    unchanged: kQueuedFrames raised 4 -> 8 (~21 ms -> ~43 ms); the drain wait
+    bounded by kBoundedDrainWait to one frame period (5.3 ms); "not draining"
+    detection moved to queueFullSince, tracking continuous fullness ACROSS
+    periods with kDrainStallTimeout = 1000 ms (250 ms on Switch 1); a paused
+    device restarts the timer instead of having its queue cleared.
+
+Build / verification: NOT run by the assistant (it cannot execute commands).
+  Supplied: export DEVKITPRO=/opt/devkitpro && . /opt/devkitpro/switch2vars.sh
+            && cmake --build build -j20
+            && cp -f build/.../LostOdysseyRecomp.nro /mnt/c/.../Desktop/
+            && md5sum (both copies, WSL /mnt/c writes have truncated before)
+  Expected recompile: apu/audio.cpp.o and debug/perf_stats.cpp.o only; any
+  gpu/renderer.cpp.o rebuild is the generated lo_build_revision.h from the
+  LoBuildRevision target, not a header edit (per hbmenu_1440p_fix.txt).
+  The user ran the build in a separate Ubuntu terminal; no output was seen.
+
+Known gap left open: ExitNow() / ForceExitWithoutTeardown() reach
+  svcExitProcess and run no atexit handlers, so neither stop function fires on
+  that path. Closing it needs a stop function declared in a header, which
+  project rule 1 forbids.
+
+================================================================================
+=== ~2026-11-17 | Entry 2 | Hardware log analysis (runtime-1794961768357653)
+================================================================================
+
+Files INSPECTED (read only, nothing modified this entry):
+  - LostOdysseyRecomp/apu/audio.cpp            (as written in Entry 1)
+  - LostOdysseyRecomp/debug/perf_stats.cpp     (as written in Entry 1)
+  - LostOdysseyRecomp/gpu/command_processor.cpp
+  - LostOdysseyRecomp/gpu/video.h, os/switch_platform.h
+  - docs/SWITCH.md, docs/SWITCH-BENCHMARKS.md,
+    docs/archive/2026-09-04/gpu.md
+  - log excerpts pasted by the user (the @file attachments did not resolve)
+
+FINDING 0 - the log predates the Entry 1 fixes.
+  The quoted shutdown lines (591.599 video exit_code=0, 591.703 audio,
+  592.075 perf) and starved=3499 are the same numbers from the original task
+  description. This run neither verifies nor refutes either fix; proof would be
+  the ABSENCE of those two lines. The audio line printing at all means
+  ShuttingDown() was still false, as expected for a pre-fix build.
+
+FINDING 1 - frame-rate claim corrected.
+  14,082 frames / 591 s = 23.8 fps average, not 60. The 60 fps result is real
+  but belongs to the first window: perf: lines at 22.035 s and 202.049 s show
+  fps=59.9 / 60.0, hitches=0 -> swaps 0..12,499 ran locked at 60 fps for 212 s.
+  The remaining 1,582 frames took 379 s (4.2 fps). Correct phrasing:
+  "212 s locked at 60 fps".
+
+FINDING 2 - five hitches are 59% of the session.
+  71.987 + 14.532 + 139.274 + 22.516 + 98.372 = 346.7 s across five frames.
+  frame_ms=139274 is one frame taking 139 s, consistent with the WAIT_REG_MEM
+  loop (logs at the 5 s deadline, then re-arms for 30 s, so it warns rarely
+  while waiting indefinitely). The first stall at 216.990 s falls inside the
+  swap-12500 frame that ends at 283.931 s. Everything after 212 s is this bug.
+
+FINDING 3 - CORRECTION: the audio starvation is a SYMPTOM of the GPU stall.
+  45,000 submitted frames x 256 samples / 48,000 Hz = exactly 240 s of audio in
+  a 591 s run. 591.7 - 346.7 s of stalls = 245 s of non-stalled time. The guest
+  produced ~1 frame per 5.33 ms of NON-STALLED wall time and nothing during the
+  stalls. Corroborating: queued=6144 B = 3 frames (under kQueuedFrames=8),
+  queue_drops=0, queue_errors=0 - the queue was never full, never capped, never
+  erroring. clock_resets=7 is the driver re-anchoring after each host stall.
+  => The Entry 1 task-2 change (kQueuedFrames / kBoundedDrainWait /
+     kDrainStallTimeout) CANNOT have fixed the loading-screen pause, because
+     the drain wait was never what blocked. It is harmless and still correct
+     for a genuine "output stops pulling" case, but must not be credited with
+     this fix. Fix the WAIT_REG_MEM stall and starved= collapses on its own.
+
+FINDING 4 - decoding WAIT_REG_MEM mem 0x10002 ref 0x0 mask 0xffffffff value 0x4.
+  pollRegAddr & ~3 = guest physical 0x10000; & 3 = endian 2 (8in32);
+  waitInfo & 7 = 3 (equal), ref 0. This is the D3D present sync block, the
+  sequence documented in docs/archive/2026-09-04/gpu.md:
+    WAIT mem[blk+4]==1 ; WAIT mem[blk+0]==4   <- CPU Present wrote the mask
+    INTERRUPT cpu_mask=4                      <- PM4_INTERRUPT -> DispatchInterrupt(1,2)
+    WAIT mem[blk+0]==0 ; WAIT mem[blk+4]==0   <- GPU waits for the ISR to clear
+  The block sits at 0x10000 this run (0xB000 previously). value 0x4 = the CPU
+  mask is still set: the CP is waiting for the guest interrupt handler to clear
+  it, and the handler has not run.
+
+  The "views" line is AMBIGUOUS and was not overstated:
+    polled 0x4 views: A 0x4 @ 0xa0010000  C 0x0 @ 0xc0010000  E 0x0 @ 0xe0011000
+  (a) Broken alias - guest writes via C/E, CP reads A (TranslatePhysical =
+      0xA0000000 + (phys & 0x1FFFFFFF)). Supported by the ResolveFrameView
+      comment in audio.cpp ("under Backend::Heap the two views of a physical
+      buffer are no longer the same pages"), which CONTRADICTS docs/SWITCH.md
+      and guest_address_space.cpp. But a dead page would never become 0, and
+      the frame did finish after 139 s - so (a) cannot explain recovery.
+  (b) The ISR never ran - A 0x4 is the live value, C/E are separate zero pages
+      nobody writes; the wait ends when the GPU Interrupt thread finally runs
+      the callback. This FITS the 139 s recovery. Leaning to (b).
+
+FINDING 5 - concrete mechanism for (b): priority inversion.
+  * InterruptMain() and VsyncMain() in gpu/command_processor.cpp set NO thread
+    priority, unlike WorkerMain (PreferPerformanceCores), DriverMain (0x2C) and
+    MonitorMain (0x2B). They run at the default pthread priority (0x3B per the
+    audio.cpp comment), BELOW the guest's threads. Horizon schedules strictly
+    by priority on three cores, so during a loading screen (render_fence::
+    LoadBoost, movie/XMA decode, XAudio workers) the 0x3B interrupt thread can
+    be starved indefinitely while the waiter holds a performance core.
+  * std::this_thread::yield() in the poll loop (when wait < 0x100) is the
+    amplifier: on Horizon yield donates only to threads of EQUAL OR HIGHER
+    priority, so it can never let a 0x3B thread run. The CP spins forever on a
+    thread it is structurally preventing from running. Explains "intermittent,
+    at the loading screen" exactly.
+
+RECOMMENDED next changes (all .cpp, no header touched) - NOT YET APPLIED:
+  1. gpu/command_processor.cpp: SetCurrentThreadPriority(0x2A) at the top of
+     InterruptMain() and VsyncMain() (above Audio Driver 0x2C and the guest
+     threads). Highest-value single change.
+  2. Replace std::this_thread::yield() in the poll loop with
+     PreciseSleepFor(100 us) / svcSleepThread on Switch, so a lower-priority
+     thread can actually be scheduled.
+  3. Extend the stall log with m_interruptsCompleted, m_pendingInterrupts.size(),
+     whether m_interruptRegistration.callback is non-zero, and g_workerStage.
+     pending>0 + completed frozen => (b). pending==0 + none outstanding => (a).
+  4. One-shot alias self-test in CommandProcessor::Init(): write a pattern via
+     TranslatePhysical, read back through 0xC0000000+off and 0xE0000000+off+
+     0x1000, log all three. Settles the audio.cpp / SWITCH.md contradiction.
+  5. Zero-code test: run once with LO_CP_SELF_WAITS=0. If the stall vanishes,
+     the m_pendingMemWrites MEM_WRITE/WAIT_REG_MEM pair matcher is implicated.
+
+SHUTDOWN LOGIC - remaining gaps (mechanism itself is sound; stderr.log confirms
+  the right path: "leaving through libnx's application exit", so std::exit(0)
+  runs and the atexit handlers fire before fsdevUnmountAll):
+  * std::atexit is LIFO and shares its chain with static destructors. Any
+    __cxa_atexit destructor registered after the first Present (lazy
+    function-local statics in the logger, SDL, plume) runs BEFORE StopMonitor.
+    If the log sink dies first while the monitor is inside LOG_NOTICE, join()
+    deadlocks and Horizon kills the process after ~15 s - same dialog, new cause.
+  * The 500 ms wait in StopDriverThread can expire if the driver is inside a
+    guest XAudio callback (the KfAcquireSpinLock stalls in SWITCH-BENCHMARKS.md
+    reached 5 s). Memory-safe (every g_stream use holds g_deviceMutex and
+    null-checks) but not the guarantee the task asked for.
+  * td214/t25b5 are NOT the only card writers. Also writing: the logger's own
+    1 s flush; the hang watchdog and crash handler via RawAppend (own FS
+    session); cpu-samples.bin; the heap census; PGO profile writes on quit; the
+    debug server's shot; and - confirmed this entry from os/log_collection.cpp -
+    StartUpload(), which .detach()es a thread that sleeps 5 s, then writes
+    log-collection-sent and a LOG_INFO line. That is a THIRD unguarded writer.
+  * Convergent fix: one g_logClosed latch in os/logger.cpp (a .cpp) that
+    no-ops every LOG_* after a final flush. Then "zero background threads write"
+    holds regardless of which thread is alive, and the per-module ShuttingDown()
+    guards become belt-and-braces rather than the mechanism.
+  * The 4 s watchdog path in stderr.log ("if it does not finish in 4 s the
+    process ends here") bypasses atexit entirely.
+  * Minor: os/detach_thread.h is now an unused include in perf_stats.cpp;
+    apu::Init() has no re-entry guard on g_thread.
+
+TO VERIFY IN THE NEXT RUN:
+  - Shutdown: NO perf: / audio driver: / audio frames submitted: line after the
+    video thread's exit_code=0, and no OS error dialog during fsdevUnmountAll.
+  - Stall: the WAIT_REG_MEM + polled lines, the alias self-test line, and the
+    perf: line nearest the first stall (cpu_total_pct and threads= - if all
+    three cores read ~98% with GPU_Interrupt absent from the list, (b) is
+    confirmed outright).
+  - Audio: queue_drops= (new risk - with the bounded wait and a 16-frame cap the
+    queue can saturate and drop instead of stalling), starved=, drain_wait_ms=,
+    and audible latency (16 queued frames is ~85 ms).
+
+STILL NEEDED by the assistant to write the proposed fixes as full files:
+  gpu/command_processor.cpp, gpu/video.cpp and
+  kernel/guest_address_space_switch.cpp (none attached so far).
+
+================================================================================
+=== ~2026-11-17 | Entry 3 | Summary-log setup (this entry)
+================================================================================
+
+Files CREATED:
+  - summary/session_summary.txt  (this file)
+
+Files INSPECTED this turn (attached): mostly unrelated - thirdparty/SDL/docs and
+  thirdparty/SDL-switch/docs README-contributing.md, tools/XenonRecomp/.../
+  mspack.h, docs/notes/README.md, four docs/project-management/reconciliation-*
+  and import-audit.md, two tools skill docs. Two were useful:
+  - LostOdysseyRecomp/os/log_collection.cpp  -> third unguarded exit-time card
+    writer (see Entry 2, shutdown gaps).
+  - LostOdysseyRecomp/debug/soft_reset.cpp   -> reviewed, NOT on the exit path.
+  apu/audio.cpp and debug/perf_stats.cpp were NOT attached this turn, so Entries
+  1-2 describe the versions written earlier in this session, not necessarily
+  what is on disk now.
+
+Actions:
+  - Established this summary log at "lo project/summary/session_summary.txt"
+    per user request, with back-filled summaries for Entries 1 and 2.
+  - Flagged the two structural limits: the assistant cannot append (whole-file
+    writes only - attach this file each turn to preserve history) and has no
+    clock (dates derived from the log filename epoch, marked "~").
+
+No source code was modified this entry.

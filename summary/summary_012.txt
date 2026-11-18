@@ -1,0 +1,70 @@
+================================================================================
+LostOdysseyRecomp - Nintendo Switch 2 port
+Summary - TURN 12: kaiHEN analysis, and the debug-menu Quit handover
+================================================================================
+INPUTS
+  "lo project/sd card/kaihen" (the user's kaiHEN: bin/{bootstrap.bin, game,
+  hen, ro}, payload.js, nro-cleanup.txt). The user had NOT yet run the
+  turn-10 or turn-11 builds.
+
+FINDINGS
+  * nro-cleanup.txt: "program: sdmc:/hbmenu.nro / result: clean / threads 0
+    / memory 0". The loader rewrites this file on every NRO return, so it
+    describes hbmenu's last exit, not LO's. It is useful only right after an
+    LO quit, before hbmenu exits.
+  * bin/game/main is the loader (an NSO; LZ4 segments decompressed with
+    /tmp/nso.py into /tmp/hbloader.bin). Its strings are exactly
+    ounce-hbloader 2d38bcbe's: "threads the program left running (paused by
+    the loader)", "could not park", "not created by a libnx-style runtime",
+    /kaihen/nro-cleanup.txt. So the source read in turn 7 is the code the
+    user runs, and the parking rules apply:
+      - at most 32 parked threads for the process lifetime;
+      - svcExitProcess for any thread it cannot pause or release.
+
+CHANGES THIS TURN (os/switch/switch_runtime.cpp, LostOdysseyRecomp/CMakeLists.txt)
+  1. LO's own host threads now END at exit instead of being left to park.
+     - Link flags (LO_TARGET_SWITCH2 only):
+       -Wl,--wrap=__libc_cond_wait,--wrap=__libc_cond_wait_recursive,--wrap=svcSleepThread.
+       Verified in the ELF: pthread_cond_wait/timedwait, sem_wait,
+       pthread_barrier_wait and __syscall_nanosleep reach the wrappers.
+     - ShouldEndThisThread(): g_endHostThreads is set, and the thread is not
+       the exit runner (g_exitRunner) and is in g_endable. g_endable is a copy
+       of os::switch_cpu_profiler::CopyThreads, taken in RunExit. Registered
+       threads: GPU CmdProc/Vsync/Interrupt, Pipeline Worker/Libraries,
+       Kernel Time, Heap Census, Perf, Audio Driver, XMA, IO/Memory Monitor,
+       guest and movie threads. SDL, GPU-driver and libnx threads are excluded:
+       libnx's teardown may wait on them, and the loader parks them.
+     - A wrapped call releases the lock, then EndThreadForExit (svcExitThread).
+     - Infinite cond waits register in a 128-slot atomic table, and RunExit
+       broadcasts them each 25 ms pass.
+     - RunExit waits the full 1.5 s (or until none remain), then writes one
+       exit.log line per surviving thread ("exit: still running: <name>").
+     - Cost during play: one acquire load per wait/sleep, plus a CAS per
+       infinite wait.
+  2. Validation sub-agent found two defects, both FIXED:
+     - A resumed thread whose sleep timed out while paused could end inside
+       the loader's scan (between its "still running" check and its pause) ->
+       svcExitProcess. Fix: g_loaderHandoff, set at the start of
+       ResumeThenReturnToLoader. After it, EndThreadForExit blocks forever in
+       __real_svcSleepThread, where the loader can pause and park the thread.
+     - The early stop at 200 ms would have left the IO Monitor (1 s sleeps)
+       alive. Fix: the loop runs the full 1.5 s.
+  Carried over from turns 10-11, still untested:
+     - pause during teardown, then resume before the loader;
+     - exit.log through fsdev;
+     - the HOME -> X CloseForHomeMenu path.
+  NRO md5 fe4718badd08885dce4ec9b2e6f93158 (Desktop copy matches). Build OK.
+
+REMAINING RISKS
+  * A runtime thread that ends inside driver code while holding a driver
+    mutex. That mutex is not used by libnx's teardown as far as can be seen;
+    the OunceVK source was not available.
+  * Unregistered threads (SDL, OunceVK/NVK, libnx) are still parked: a few,
+    well under 32.
+
+TEST PROCEDURE GIVEN TO THE USER
+  1. Debug-menu Quit. Then, before doing anything in hbmenu, copy
+     sdmc:/kaihen/nro-cleanup.txt (it should name LostOdysseyRecomp.nro),
+     sdmc:/switch/LostOdysseyRecomp/exit.log and stderr.log.
+  2. HOME -> X: there should be no "Please wait". Start the donor game with R
+     again; hbmenu should come up without a reboot.

@@ -40,6 +40,10 @@ namespace os::logger
     // crash and exit paths: gives up rather than wait on a lock a crashed
     // thread may hold. Elsewhere a no-op (lines are written as they come).
     void DrainForExit() noexcept;
+    // Switch: DrainForExit, then closes the log for good (g_logClosed in
+    // os/logger.h): every later LOG_* call is a no-op and nothing more is
+    // written to the card. Only for paths that end the process. Elsewhere a no-op.
+    void CloseForExit() noexcept;
 
     // Flush and copy the complete active log while holding the logger mutex.
     // Returns an error if the sink is absent, flushing fails or copying fails.

@@ -1,0 +1,44 @@
+================================================================================
+LostOdysseyRecomp - Nintendo Switch 2 port
+Summary - TURN 6: "the wheel is still spinning" - log re-diagnosis
+================================================================================
+No source files changed. Diagnosis only (runtime-1794961768357653.log).
+
+KEY FINDING: the boot loading screen never finished, and the GPU fix doesn't cover it
+--------------------------------------------------------------------------------
+  * The LAST game file opened was xenon_snd.fpd at 3.410 s. After that the game
+    opened no files for the remaining ~588 s.
+  * perf: lines from 12 s to 212 s: fps=60 with draws=3 throughout (the
+    spinning wheel). The renderer's texinfo lines show textured_draws=1200 per
+    log interval, which matches a light loading screen.
+    => From ~4 s to 212 s the loading screen was animating normally. Frames
+       were presenting and the GPU wasn't stalled, but the game made no
+       loading progress.
+  * The WAIT_REG_MEM freezes (fps=0, draws=0) began only at ~217 s, after the
+    load had already been stuck for more than 200 s. The priority-inversion
+    fix (842caa50) targets those freezes. It does NOT explain the spinning wheel.
+    summary_003's claim that the WAIT_REG_MEM stall was "the loading-screen bug"
+    was too broad.
+  * Guest thread dump at 15.36 s: most guest threads were blocked in
+    NtWaitForSingleObjectEx / NtWaitForMultipleObjectsEx (workers waiting on
+    events, 12-13 s), plus one "running" thread in the 0x82485xxx / 0x827b...
+    range. This is not conclusive on its own. The next step is to find which
+    event the main loader thread waits on and who should signal it. Possible
+    causes: a file read completion (async I/O / overlapped), the XMA or audio
+    path (the last file opened was the 1.7 GB sound archive), or a guest
+    thread starved by priority.
+
+EXPECTED LOAD TIMES (told to the user)
+  * The boot load from the wheel to the title should take seconds to a few
+    tens of seconds, even with first-run shader work. On 360 hardware the
+    loads were roughly 10-30 s.
+  * A wheel that spins for more than about 60-90 s with no change should be
+    treated as stuck.
+
+ASKED OF THE USER
+  * Exit with L+R+Plus+Minus (1.5 s hold). Send the new runtime-*.log,
+    stderr.log and hang-*.log / exit.log. Check: the last "open '" line, and
+    whether a WAIT_REG_MEM warning appears at all.
+  * If it is stuck again with no file opens after the sound archive, the
+    next code step is to trace the loader thread's wait (the
+    NtWaitForSingleObjectEx object and its signaller).

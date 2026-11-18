@@ -1,0 +1,61 @@
+================================================================================
+LostOdysseyRecomp - Nintendo Switch 2 port
+Summary - TURN 8: what LO_CP_SELF_WAITS is, and the state of the loading hang
+================================================================================
+No source files changed. Diagnosis of runtime-1794974356360289.log only.
+
+LO_CP_SELF_WAITS (gpu/command_processor.cpp, SelfWaitsEnabled)
+  * Default on. A speed shortcut: D3D writes 0xFFFFFEED to marker words with
+    one-word MEM_WRITEs and then waits for that same value (WAIT_REG_MEM),
+    about 360 times a frame in the busy street. The shortcut treats a write
+    plus its own immediate wait as a no-op: it does not advance the "sync
+    epoch", which the per-draw caches key on.
+  * LO_CP_SELF_WAITS=0 makes every such pair a full sync point. That is
+    slower but follows the hardware's ordering more literally.
+  * It does NOT decide whether a wait is satisfied. The value is always
+    written before the wait reads it.
+  * Its value to the user is as a cheap A/B test: it rules the shortcut
+    in or out as the cause of the fence-related stall. It is unlikely to fix
+    the wheel. I overstated it as the "next step" in turn 7.
+
+LOADING HANG: NO FIX EXISTS YET (told to the user plainly)
+  * The 842caa50 priority fix targeted the later full GPU freezes, not the
+    wheel. The new log disproves it as the cause of the stall in this run:
+    "interrupt handler: completed=6026 pending=0".
+  * The facts in the new log:
+      - The last file opened is xenon_snd.fpd at 3.419 s, the same as the
+        previous run.
+      - The wheel animates at 60 fps for about 100 s (draws=3).
+      - Shader/pipeline preparation runs in the background until 39.8 s
+        (3,446 recipes, 0 failed). It is not the blocker: the hang continues
+        after it ends.
+      - Audio peak=0 in every report and starved climbs (592 -> 1868). The
+        game output silence the whole time.
+      - The 15 s guest thread dump:
+          Guest Main: "running" in a sleep-poll loop (lr 0x827cacfc =
+            KeDelayExecutionThread call site, liveLr 0x82485c50, bt
+            0x82485048 0x82484c24).
+          tid 0xcb561751: running at liveLr 0x827b6304, bt 0x827b549c
+            0x823b6554 0x824858a4. The 0x827b6xxx code is the same area as
+            the GPU Interrupt/Vsync callbacks, i.e. a render fence wait. Its
+            caller 0x824858a4 sits next to Guest Main's 0x82485xxx frames.
+          At 3.570 s: "guest lock 0x510610 (recursion 422) handed over while
+            the thread is parked in a render fence wait".
+          Most other workers are idle in NtWaitForSingleObjectEx (lr 0x822c5358).
+  * Reading: the loading code (0x82485xxx) is polling for a condition that
+    never becomes true. Two candidates:
+      (a) a GPU fence the CPU side waits on, while the GPU keeps presenting;
+      (b) the sound system: the last file opened is the sound archive and
+          audio stays silent. A sound-bank load/decode completion may never
+          be signalled.
+    Not yet resolved.
+
+PLANNED NEXT CODE STEP
+  Instrument the loop: log what 0x82485048 / 0x82484c24 / 0x824858a4 poll
+  (disassemble those guest functions in the recompiled sources) and what the
+  render fence at 0x827b549c waits for, so the next run names the condition.
+
+ASK OF THE USER
+  * Optional A/B run with LO_CP_SELF_WAITS=0 in
+    sdmc:/switch/LostOdysseyRecomp/env.txt (one KEY=VALUE per line).
+  * The quit test from turn 7 (nro-cleanup.txt, exit.log, stderr.log).

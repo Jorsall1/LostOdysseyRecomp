@@ -1,0 +1,175 @@
+================================================================================
+LostOdysseyRecomp - Nintendo Switch 2 port (kaiHEN / devkitA64 / libounce / OunceVK)
+Archie reply summary - TURN 3
+================================================================================
+
+NOTE: the assistant has no system clock; no wall-clock time is recorded. The
+hardware run under analysis is dated ~2026-11-17 (runtime-1794961768357653 ->
+epoch 1794961768 s, matching the "Switch 2 hardware, 2026-11-17" comment in
+apu/audio.cpp).
+
+--------------------------------------------------------------------------------
+FILES MODIFIED THIS TURN (full-file rewrites; no .h touched, per rule 1)
+--------------------------------------------------------------------------------
+  - LostOdysseyRecomp/gpu/command_processor.cpp
+  - LostOdysseyRecomp/os/log_collection.cpp
+  - summary/summary_003.txt (this file)
+
+FILES INSPECTED, NOT MODIFIED:
+  - LostOdysseyRecomp/gpu/video.cpp                        (see DECLINED below)
+  - LostOdysseyRecomp/kernel/guest_address_space_switch.cpp (see FINDING A)
+
+================================================================================
+FINDING A - NO CHANGE IS POSSIBLE OR NEEDED IN guest_address_space_switch.cpp
+================================================================================
+The user asked for a patch there so that "writes to View A are immediately
+recognized". The file's own code refutes the premise:
+  * On __SWITCH2__ the backend is Backend::Heap. kaiHEN 20261116 title takeover
+    runs the NRO inside a donor title whose NPDM syscall mask contains 0x73,
+    0x74, 0x75, 0x77, 0x78 and 0x51; a masked svc* TERMINATES the process rather
+    than returning an error, so no mapping syscall may be used at all. The whole
+    4 GiB window is therefore ONE memalign() block.
+  * Its own comment: "C and E are distinct ranges of the block now, not hardware
+    aliases of A: a write through A no longer shows up through C or E."
+  => The stall line "A 0x4 @ 0xa0010000  C 0x0 @ 0xc0010000  E 0x0 @ 0xe0011000"
+     means only: A holds the live value 0x4, and C/E are two unrelated zeroed
+     ranges of the same block. It is NOT evidence of an aliasing failure.
+  * CommandProcessor::TranslatePhysical already reads A
+    (0xA0000000 + (phys & 0x1FFFFFFF)); the poll loop already uses
+    volatile uint32_t*; ARM64 data caches are coherent across cores. The write
+    IS recognised immediately.
+  * Decisive: reading (a) "broken alias" cannot explain the observed recovery -
+    a dead mapping never becomes 0, yet the swap-12500 frame did finish after
+    139 s. Reading (b) "the ISR never ran" does.
+  This supersedes the ambiguity recorded in summary_002 FINDING 4.
+
+================================================================================
+FINDING B - ROOT CAUSE OF THE WAIT_REG_MEM 0x10002 STALL: PRIORITY INVERSION
+================================================================================
+Packet decode (confirmed against docs/archive/2026-09-04/gpu.md): pollRegAddr
+0x10002 -> physical 0x10000, endian 2 (8in32); waitInfo & 7 == 3 (equal), ref 0;
+value 0x4 is the CPU mask PM4_INTERRUPT raised, which the GUEST INTERRUPT
+HANDLER must clear. Two defects in gpu/command_processor.cpp stop it running:
+
+  1. InterruptMain() and VsyncMain() set NO thread priority.
+     WorkerMain calls os::scheduling::PreferPerformanceCores(); apu::DriverMain
+     sets 0x2C; perf_stats::MonitorMain sets 0x2B. These two set nothing and run
+     at the default pthread priority, BELOW the game's own threads. Horizon
+     schedules strictly by priority across three cores, so a loading screen
+     (render_fence::LoadBoost, movie/XMA decode, XAudio workers) starves the one
+     thread the GPU is blocked on.
+  2. std::this_thread::yield() in the WAIT_REG_MEM poll loop (taken whenever the
+     packet's wait field is < 0x100). On Horizon yield() donates only to threads
+     of EQUAL OR HIGHER priority, so it can never let the lower-priority
+     "GPU Interrupt" thread run. The CP spins a performance core waiting on a
+     thread it is itself preventing from being scheduled. This explains the
+     intermittent, loading-screen-specific nature exactly.
+
+================================================================================
+CHANGES APPLIED - gpu/command_processor.cpp
+================================================================================
+  * Added #include <os/switch_platform.h> inside the existing
+    #if LO_PLATFORM_SWITCH include block (a new include only; no header edited).
+  * New helper GuestCallbackThreadPriority() (LO_PLATFORM_SWITCH only):
+    returns 0x2B by default - above the game's threads and the audio driver
+    (0x2C), below SDL's audio output (0x2A) - clamped to 0x00..0x3F and
+    overridable at runtime with LO_GPU_ISR_PRIORITY. The override exists because
+    the tree's own comments disagree about whether guest threads sit at 0x2C
+    (perf_stats.cpp) or 0x3B (audio.cpp), so the value stays tunable on hardware
+    without a rebuild.
+  * InterruptMain(): SetCurrentThreadPriority(GuestCallbackThreadPriority()) at
+    entry, with the full rationale in a comment citing the 216.990 s stall.
+  * VsyncMain(): the same - it also runs the registered interrupt callback.
+  * WAIT_REG_MEM poll loop: no longer spins on Switch. kMinimumPollMs is 1 on
+    LO_PLATFORM_SWITCH and 0 elsewhere, so the wait always takes the
+    m_waitProgress condition-variable path with at least a 1 ms sleep. A
+    completed interrupt still wakes it immediately via m_interruptsCompleted, so
+    the normal case costs nothing. Desktop behaviour (yield when wait < 0x100)
+    is byte-for-byte unchanged.
+  * Stall diagnostics: new second warning line
+      "  interrupt handler: completed=.. pending=.. callback=.. poll_ms=..
+       self_waits=.. stage=.. swap=.."
+    m_pendingInterrupts.size() is read under m_interruptMutex, which is released
+    before GetInterruptCallbackSnapshot() is called (it takes the same mutex).
+    pending>0 with completed frozen confirms starvation; pending==0 with no
+    callback means no interrupt is outstanding at all.
+  * Views line corrected under #if defined(__SWITCH2__): prints view A only and
+    states that C and E are separate ranges of the same heap block, not aliases.
+    The three-view line is preserved verbatim for the mapping backends. This
+    stops the next session being spent on a non-existent aliasing bug.
+
+================================================================================
+CHANGES APPLIED - os/log_collection.cpp
+================================================================================
+  * CORRECTION to summary_002: this file is NOT one of the Switch exit-time SD
+    writers. The entire upload path is inside #ifdef _WIN32; on Horizon
+    StartUpload() is just "(void)currentLog;". The earlier claim was wrong.
+  * Still added, for the desktop build: an anonymous-namespace
+    std::atomic<bool> shuttingDown + ShuttingDown(), set from an std::atexit
+    handler registered once inside StartUpload(). The detached uploader now
+    sleeps in 50 x 100 ms slices instead of one 5 s block, and checks the latch
+    before Upload(), before Post(), and before writing "log-collection-sent" or
+    its LOG_INFO line. Fully self-contained: needs no header change to reach the
+    detached thread.
+
+================================================================================
+NOT DONE, WITH REASONS
+================================================================================
+  * os/logger.cpp (the g_logClosed latch) - NOT ATTACHED. Not guessed at.
+    Attach it and this is a ten-line change: no-op every LOG_* after one final
+    flush. This remains the single convergent fix for "zero background threads
+    write during fsdevUnmountAll", because it covers whichever thread is still
+    alive rather than enumerating them.
+  * gpu/video.cpp (explicit StopMonitor / StopDriverThread / prebuild wait in
+    FinishRequestedExit) - DECLINED THIS TURN, deliberately:
+      - The file is ~4,000 lines. Aye Chat writes returned files straight to
+        disk, so a transcription error would destroy a working file.
+      - The benefit is low: stderr.log proves the atexit handlers already run -
+        "[exit] leaving through libnx's application exit (applet type 0, exit
+        lock released)". os::switch_platform::ExitNow() goes through newlib's
+        exit, so StopMonitor/StopDriverThread fire BEFORE fsdevUnmountAll. The
+        explicit calls are ordering insurance, not the fix.
+      - It also needs exported symbols: StopMonitor and StopDriverThread are
+        currently in anonymous namespaces (internal linkage) and cannot be named
+        from another TU. They must be given external linkage in perf_stats.cpp /
+        audio.cpp and declared extern in video.cpp - which needs those two files
+        attached AS THEY ARE ON DISK, not the versions written in turn 1.
+      - Offered: send gpu/video.cpp as the only attachment and it will be done.
+  * modding/text_overlay.cpp - not attached this turn. Note that
+    WaitForPrebuild() is already declared in the header video.cpp includes, so
+    calling it needs no header edit; its exact signature is unverified.
+
+================================================================================
+STANDING CORRECTIONS CARRIED FORWARD
+================================================================================
+  * 14,082 frames / 591 s = 23.8 fps average. The 60 fps result is real but is
+    the first window only: swaps 0..12,499 ran locked at 60 fps for 212 s
+    (perf: lines at 22.035 s and 202.049 s, hitches=0). Defensible phrasing:
+    "212 s locked at 60 fps".
+  * Five hitches total 346.7 s = 59% of the session. Everything after 212 s is
+    the WAIT_REG_MEM bug.
+  * starved=3499 is a SYMPTOM of that stall, not a second bug: 45,000 submitted
+    frames x 256 / 48,000 = exactly 240 s of audio in a 591 s run, matching the
+    245 s of non-stalled time. queued=6144 B = 3 frames (under kQueuedFrames=8),
+    queue_drops=0, queue_errors=0 - the queue was never full. The turn-1 audio
+    drain change must not be credited with fixing the loading-screen pause.
+
+================================================================================
+NEXT STEPS FOR THE USER
+================================================================================
+  1. Zero-code test first: run once with LO_CP_SELF_WAITS=0. If the stall
+     vanishes, the m_pendingMemWrites MEM_WRITE/WAIT_REG_MEM pair matcher is
+     dropping the write that would satisfy the wait - a different bug. The new
+     self_waits= field in the stall log records which mode was active.
+  2. Build:
+       export DEVKITPRO=/opt/devkitpro && . /opt/devkitpro/switch2vars.sh \
+         && cmake --build build -j20
+     Expected recompile: gpu/command_processor.cpp.o and os/log_collection.cpp.o
+     only, then link + "Packaging LostOdysseyRecomp.nro". Any gpu/renderer.cpp.o
+     rebuild is the generated lo_build_revision.h from the LoBuildRevision
+     target, not a header edit.
+  3. Verify with md5sum after copying to /mnt/c (WSL writes have truncated).
+  4. Send back: the WAIT_REG_MEM + "interrupt handler:" lines, and the perf:
+     line nearest the first stall (cpu_total_pct and threads= - all three cores
+     at ~98% with GPU_Interrupt absent from the list confirms starvation).
+  5. Attach os/logger.cpp to get the g_logClosed latch.

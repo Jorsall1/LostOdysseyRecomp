@@ -1,0 +1,58 @@
+================================================================================
+LostOdysseyRecomp - Nintendo Switch 2 port
+Summary - TURN 14: lessons from Lightmaxifrvr/UnleashedRecomp-NX2 (Sonic Unleashed, Switch 2)
+================================================================================
+No source files changed. Repo cloned to /tmp/ur2 (946c8a8, 2026-11-15).
+
+WHAT UR-NX2 DOES
+  * Memory (UnleashedRecomp/kernel/memory.cpp):
+      - with the mapping syscalls hinted, the Switch 1 path:
+        svcMapProcessCodeMemory + svcMapProcessMemory chunk commits;
+      - otherwise, on __SWITCH2__: "KaiHEN does not expose the privileged
+        process-memory SVCs to an NRO" -> base = calloc(1, 4 GiB),
+        switchUsingHeapFallback.
+    This is the same flat heap block as LO's Backend::Heap. Nobody on kaiHEN
+    has aliased guest memory.
+  * Sonic works on that heap because UnleashedRecomp NEVER aliases the
+    physical views, not even on PC (one flat mmap). The Sonic engine does
+    not need it.
+  * Exit: no appletLockExit anywhere. The docs say "closing from HOME kills
+    the process". There is no quit-to-hbmenu path. This matches the turn-11
+    HOME -> X change (release the lock and let the system end the process).
+  * Graphics: OunceVK/NVK through plume. docs/SWITCH-PERFORMANCE*.md and
+    SWITCH-MESA.md are performance notes to mine later. README: FMVs still
+    have artifacts.
+
+WHAT IT MEANS FOR LOST ODYSSEY (the key conclusion)
+  * Lost Odyssey DOES depend on the aliases. Upstream's own note
+    docs/archive/notes/physical-alias-rendering.md (2026-09-04): characters
+    rendered as black silhouettes because the game's D3D occlusion queries
+    (0x823CF3F0) read GPU-written results through the C view
+    (0xC0000000 + physical), while the GPU wrote them through the A view.
+    The fix was the aliased A/C/E address space, which the Switch 2 heap
+    backend cannot provide.
+  * Guest code builds C-view addresses in about 200 places: 172 "lis
+    0xC000"-style constants and 31 "| 0xC0000000" ORs in
+    LostOdysseyRecompLib/ppc. No E-view constants.
+  * So on Switch 2 every GPU-written value the CPU reads back through C
+    (queries, and possibly fences or timestamps) is never seen, and any guest
+    write through C is never seen by the GPU. This fits:
+      - the boot loading hang: Guest Main waits in the render-fence loop
+        sub_82322478, and the loading never completes;
+      - the WAIT_REG_MEM 0x10002 stall: the interrupt handler ran
+        (completed == swaps) but the A copy kept 0x4;
+      - silent audio (the mix was already shown to be read from the wrong view).
+
+RECOMMENDED NEXT WORK ("C-view coherence" on Backend::Heap)
+  1. Diagnostic first: log which C-view addresses the guest touches. Sample
+     the 200 sites, or at the stall and at 15 s list the 2 MiB C chunks that
+     differ from their A counterparts.
+  2. Mirror host-side writes into guest physical memory to the C copy (and
+     E = A + 0x1000): CP MEM_WRITE, EVENT_WRITE*, REG_TO_MEM, query results,
+     ring read-pointer writeback, resolves, XMA output.
+  3. Redirect guest C accesses to A at the guest sites that matter
+     (occlusion query read 0x823CF3F0, the interrupt block pointer, the
+     fence), with recompiler function overrides / mid-asm hooks.
+  4. A general option to evaluate: re-target C to A at recompile time (mask
+     0xC0000000 -> 0xA0000000 in the 31 OR sites and 172 constants). It is
+     cheap if every use is an address, but needs per-site checks.

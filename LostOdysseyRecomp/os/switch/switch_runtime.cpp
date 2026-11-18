@@ -23,6 +23,8 @@
 #include <typeinfo>
 #include <cstdlib>
 #include <malloc.h>
+#include <reent.h>
+extern "C" void __malloc_lock(struct _reent*); // newlib: the allocator lock, recursive
 #include <system_error>
 #include <unistd.h>
 
@@ -55,7 +57,7 @@ extern "C" char* fake_heap_end;
 namespace os::switch_platform { void ApplyEnvFile(const char* path); }
 
 // os/log_file.h (not included: this file sees libnx headers, not the PCH).
-namespace os::logger { void DrainForExit() noexcept; }
+namespace os::logger { void DrainForExit() noexcept; void CloseForExit() noexcept; }
 
 // Declared at file scope, not inside the anonymous namespace below: their
 // definitions live in other translation units and this file cannot include their
@@ -63,6 +65,8 @@ namespace os::logger { void DrainForExit() noexcept; }
 // is not available here).
 namespace settings::quit_action { bool PushQuit(); } // settings/quit_action_hook.cpp: queues SDL_EVENT_QUIT
 namespace apu { void SetPaused(bool paused); }        // apu/audio.cpp: silences the SDL audio device
+namespace apu { void StopDriverForExit(); }           // apu/audio.cpp: ends the driver thread, closes the device
+namespace perf_stats { void StopMonitorForExit(); }   // debug/perf_stats.cpp: joins the perf: line thread
 namespace apu::xma { void Shutdown(); }               // apu/xma.cpp: stops the decoder worker
 void DumpGuestThreadStates();                         // kernel/imports.cpp: what every guest thread waits on
 
@@ -73,7 +77,16 @@ namespace os::switch_platform
 // SD card under it (io/file_system.cpp reads this; see EndProcessToHbmenu).
 // Defined below, in a .cpp on both sides: no header carries it.
 extern std::atomic<bool> g_suppressGuestIo;
+// Set by the main thread when it begins the exit (RunExitOnMainThread): a guest
+// thread that reaches a wait, a sleep or a file syscall from then on ends there
+// (EndThreadForExit). kernel/dispatcher_wait.h, kernel/imports.cpp and
+// io/file_system.cpp read it through extern declarations.
+extern std::atomic<bool> g_endGuestThreads;
+// Set when control passes back to kaiHEN's loader: no thread ends after it.
+extern std::atomic<bool> g_loaderHandoff;
+[[noreturn]] void EndThreadForExit();
 }
+extern "C" void __real_svcSleepThread(s64 nano); // the unwrapped sleep (see the wraps at the end)
 
 namespace
 {
@@ -84,8 +97,14 @@ AppletHookCookie g_operationModeHook{};
 std::atomic<bool> g_operationModeChanged{false};
 void StartBoostThread(); // below
 
+// HOME -> X: the system asked the game to close (AppletMessage_ExitRequest).
+// Set by the applet hook on whichever thread took the message (SDL's event
+// pump or the exit watchdog); the watchdog then runs CloseForHomeMenu.
+std::atomic<bool> g_homeCloseRequested{false};
 void OnAppletEvent(AppletHookType hook, void*)
 {
+    if (hook == AppletHookType_OnExitRequest)
+        g_homeCloseRequested.store(true, std::memory_order_release);
     if (hook == AppletHookType_OnOperationMode)
         g_operationModeChanged.store(true, std::memory_order_release);
     // A game started docked gets the handheld GPU configuration when it is first undocked.
@@ -218,70 +237,248 @@ void QuiesceAudio()
         svcSleepThread(10'000'000ull);
 }
 
-// One exit for every path: the L+R+Plus+Minus watchdog, HOME -> X, the title's
-// Quit, and the crash report.
-//
-//  * appletLockExit() is held from Initialize() until AllowExit(). Ending the
-//    process with exit still locked made am treat it as a fatal application
-//    error on 2026-11-16 hardware: the system error dialog appeared and kaiHEN's
-//    R -> hbmenu hook stopped working. It is therefore always unlocked before
-//    the process ends, never after.
-//  * std::exit(0) rather than svcExitProcess(): it runs libnx's own application
-//    exit (__appExit: socketExit, fsdevUnmountAll, hidExit, appletExit) and the
-//    atexit handlers, which is the teardown that leaves Horizon and kaiHEN
-//    clean. No ISelfController::Exit request anywhere: under title takeover am
-//    applies that to the donor game and the console lands on the HOME menu with
-//    hbmenu gone.
-//  * audio first, so neither audio thread touches the device or guest memory
-//    while that teardown runs.
-[[noreturn]] void EndProcessToHbmenu()
+// The last SD card writes of the process, on every exit path, including those
+// that never run the std::atexit handlers (ForceExitWithoutTeardown and the
+// Switch 1 ExitNow end in svcExitProcess). In this order:
+//  1. the runtime log gets its final flush and closes (os::logger::CloseForExit):
+//     every later LOG_* call from any thread still alive returns at once, so
+//     nothing that logs can reach the card during fsdevUnmountAll, and no
+//     thread stopped below can block on a logger lock a crashed thread holds;
+//  2. the perf: monitor thread is joined (it waits on a signal, not a sleep);
+//  3. the audio driver thread is ended (500 ms bound) and the device closed.
+// Each step is idempotent, so the atexit handlers that repeat 2, 3 and 1 on the
+// std::exit path do nothing more. Runs once; a second caller returns at once.
+void QuiesceForExit()
 {
-    // Set before anything else, so the fallback path below has it too. From here
-    // on the process is ending and libnx's application exit will run
-    // fsdevUnmountAll; a guest thread of a hung game can still reach a file
-    // syscall from under that teardown (item 5 of retroarch_quit_fix.txt), so
-    // guest file I/O parks in io/file_system.cpp from now on instead of calling
-    // into fsdev on a device that is being unmounted.
-    os::switch_platform::g_suppressGuestIo.store(true, std::memory_order_release);
-    if (g_endingProcess.exchange(true, std::memory_order_acq_rel))
+    static std::atomic<bool> done{false};
+    if (done.exchange(true, std::memory_order_acq_rel))
+        return;
+    os::logger::CloseForExit();
+    perf_stats::StopMonitorForExit();
+    apu::StopDriverForExit();
+}
+// ---- Leaving for hbmenu under kaiHEN ---------------------------------------
+//
+// kaiHEN's loader (ounce-hbloader, switch2/clean_main.cpp and entry.S) runs
+// this NRO in the donor game's process and takes it back when libnx's exit
+// reaches __nx_exit. Three rules of that loader decide whether hbmenu comes
+// back or the donor game is ended:
+//  1. __nx_exit puts the loader back on the thread that calls it. The loader
+//     entered the NRO on the process main thread; resumed on any other thread,
+//     it runs hbmenu with the wrong thread's TLS and never pauses the real main
+//     thread. Every exit until 2026-11-17 ran std::exit on the GPU owner or the
+//     watchdog thread, and the donor game was closed. The exit now always runs
+//     on the main thread, which waits in RunServing (os/main_thread.cpp) for
+//     either the guest's main thread to return or an exit request.
+//  2. Threads the NRO leaves running are paused and "parked", at most 32 for
+//     the life of the process. Past that, or for a thread it cannot park, the
+//     loader calls svcExitProcess: the donor game ends. Guest threads therefore
+//     end themselves at their next wait or sleep (g_endGuestThreads), the
+//     main thread waits briefly for them, and pauses whatever is left so that
+//     nothing runs while libnx tears down.
+//  3. svcExitProcess anywhere ends the donor game, so no Switch 2 exit path
+//     calls it any more.
+// RetroArch-S2 returns to hbmenu cleanly for the same reason: it leaves from
+// main() on the main thread with its threads joined.
+//
+// Kept from the earlier exits:
+//  * appletLockExit() is held from Initialize() until AllowExit(), and is
+//    released before the process leaves (am treated an exit with it held as a
+//    fatal application error on 2026-11-16 hardware).
+//  * No ISelfController::Exit request: under title takeover am applies it to
+//    the donor game.
+//  * Audio first, so neither audio thread touches the device while the
+//    teardown runs; the log closed before the SD card is unmounted.
+
+std::atomic<bool> g_exitServerActive{false};   // the main thread is in ServeExitOnMainThread
+std::atomic<bool> g_exitRequested{false};      // a thread asked it to run the exit
+Handle g_mainThreadHandle = INVALID_HANDLE;    // set before g_exitServerActive
+
+bool OnMainThread()
+{
+    return g_mainThreadHandle != INVALID_HANDLE && threadGetCurHandle() == g_mainThreadHandle;
+}
+
+void MarkExit(const char* text)
+{
+    os::switch_platform::RawAppend("exit.log", text, std::strlen(text));
+}
+
+// The threads of this process that a libnx-style runtime created (pthreads,
+// std::thread, threadCreate), found the way the loader finds them: through
+// the ThreadVars at the end of every 0x200-byte TLS slot. See the loader's
+// handleNroThreads.
+struct ExitThreadVars
+{
+    u32 magic;
+    Handle handle;
+    u64 thread;
+    u64 reent;
+    u64 tls_tp;
+};
+static_assert(sizeof(ExitThreadVars) == 0x20);
+constexpr u32 kThreadVarsMagic = 0x21545624; // "!TV$"
+constexpr u64 kTlsSlotSize = 0x200;
+
+struct ThreadCensus
+{
+    u32 running = 0; // alive and not this thread
+    u32 ended = 0;   // ended; the loader closes the handle
+    u32 paused = 0;  // paused by this call
+};
+
+// The threads RunExit pauses for libnx's teardown. They must be running again
+// when the loader takes over: its parkLeftThread pauses each thread itself,
+// and Horizon refuses to pause a thread that is already paused (InvalidState,
+// KThread::SetActivity), which the loader treats as a thread it cannot park
+// and answers with svcExitProcess - the donor game closed with an error on
+// the 2026-11-17 23:52 run. ResumeThenReturnToLoader undoes the pauses.
+constexpr u32 kMaxPausedThreads = 256;
+Handle g_pausedThreads[kMaxPausedThreads];
+u32 g_pausedCount = 0;
+LoaderReturnFn g_loaderReturn = nullptr;
+
+// libnx's __libnx_exit ends in __nx_exit(0, envGetExitFuncPtr()): this runs
+// there, after __appExit (SD card unmounted, services closed), on the main
+// thread and the entry stack, right before the loader. Only system calls.
+[[noreturn]] void ResumeThenReturnToLoader(int result)
+{
+    // From here on no thread may end: one ending between the loader's
+    // "still running?" check and its pause makes the pause fail, and the
+    // loader then ends the donor game. EndThreadForExit blocks instead.
+    os::switch_platform::g_loaderHandoff.store(true, std::memory_order_release);
+    for (u32 i = 0; i < g_pausedCount; ++i)
+        svcSetThreadActivity(g_pausedThreads[i], ThreadActivity_Runnable);
+    g_loaderReturn(result);
+}
+
+// Counts the other threads; with pause, also pauses every running one. With
+// running, also lists the running threads' handles (up to capacity).
+ThreadCensus ScanOtherThreads(bool pause, Handle* running = nullptr, u32 capacity = 0)
+{
+    ThreadCensus census;
+    const u64 ownSlot = reinterpret_cast<u64>(armGetTls()) & ~(kTlsSlotSize - 1);
+    const Handle self = threadGetCurHandle();
+    u64 address = 0;
+    for (;;)
     {
-        // Another thread is already ending the process. Wait for it, but not
-        // forever: if that teardown wedges, the watchdog (which ends here too)
-        // must still take the console back to hbmenu instead of hanging with it.
-        // Ending a wedged teardown is not an excuse to end it worse than the
-        // normal exit does, though: the same two handover steps are repeated,
-        // because a process that ends with the applet exit lock still held makes
-        // am treat it as a fatal application error and drops kaiHEN's R -> hbmenu
-        // hook (2026-11-16 hardware), and a process that ends without a next load
-        // leaves the console on the HOME menu with hbmenu gone.
-        for (int tenth = 0; tenth < 50; ++tenth)
-            svcSleepThread(100'000'000ull);
-        if (envHasNextLoad())
-            envSetNextLoad("sdmc:/hbmenu.nro", "\"sdmc:/hbmenu.nro\"");
-        appletUnlockExit(); // a second unlock is harmless; the first entrant may not have reached it
-        svcExitProcess();
-        __builtin_unreachable();
+        MemoryInfo info{};
+        u32 pageInfo = 0;
+        if (R_FAILED(svcQueryMemory(&info, &pageInfo, address)))
+            break;
+        if (info.type == MemType_ThreadLocal && (info.perm & Perm_R))
+        {
+            for (u64 slot = info.addr; slot + kTlsSlotSize <= info.addr + info.size; slot += kTlsSlotSize)
+            {
+                if (slot == ownSlot)
+                    continue;
+                ExitThreadVars vars;
+                std::memcpy(&vars, reinterpret_cast<const void*>(slot + kTlsSlotSize - sizeof(vars)), sizeof(vars));
+                if (vars.magic != kThreadVarsMagic || vars.handle == INVALID_HANDLE || vars.handle == self)
+                    continue;
+                u64 threadId = 0;
+                if (R_FAILED(svcGetThreadId(&threadId, vars.handle)))
+                    continue; // the slot of a thread that is gone
+                s32 index = -1;
+                if (R_SUCCEEDED(svcWaitSynchronization(&index, &vars.handle, 1, 0)))
+                {
+                    ++census.ended; // a thread handle is signaled once the thread has ended
+                    continue;
+                }
+                if (running && census.running < capacity)
+                    running[census.running] = vars.handle;
+                ++census.running;
+                if (pause && g_pausedCount < kMaxPausedThreads &&
+                    R_SUCCEEDED(svcSetThreadActivity(vars.handle, ThreadActivity_Paused)))
+                {
+                    g_pausedThreads[g_pausedCount++] = vars.handle;
+                    ++census.paused;
+                }
+            }
+        }
+        const u64 next = info.addr + info.size;
+        if (next <= address)
+            break;
+        address = next;
     }
+    return census;
+}
+
+// Set by RunExit after the audio, perf and log threads are stopped: every
+// other thread ends at its next condition-variable wait or sleep.
+std::atomic<bool> g_endHostThreads{false};
+
+// Condition variables threads are waiting on now, so RunExit can wake them
+// (a spurious wake is allowed for every condition variable user). Fixed size,
+// no locks: a thread that finds no free slot just waits unregistered.
+constexpr int kCondWaitSlots = 128;
+std::atomic<_COND_T*> g_condWaits[kCondWaitSlots];
+
+int RegisterCondWait(_COND_T* cond)
+{
+    for (int i = 0; i < kCondWaitSlots; ++i)
+    {
+        _COND_T* expected = nullptr;
+        if (g_condWaits[i].compare_exchange_strong(expected, cond, std::memory_order_acq_rel))
+            return i;
+    }
+    return -1;
+}
+
+void UnregisterCondWait(int slot)
+{
+    if (slot >= 0)
+        g_condWaits[slot].store(nullptr, std::memory_order_release);
+}
+
+void WakeRegisteredWaits()
+{
+    for (auto& slot : g_condWaits)
+        if (_COND_T* cond = slot.load(std::memory_order_acquire))
+            __libc_cond_broadcast(cond);
+}
+
+// The thread running the exit, and the runtime's own named threads (the CPU
+// profiler's registry: pipeline workers, GPU threads, profiler, APM, the
+// watchdog...). Copied by RunExit before g_endHostThreads is set. Threads of
+// libnx, SDL and the GPU driver are not in it and are left to the loader to
+// park: libnx's own teardown may still wait on them.
+Handle g_exitRunner = INVALID_HANDLE;
+os::switch_cpu_profiler::ThreadInfo g_endable[128];
+size_t g_endableCount = 0;
+
+// Every thread except the exit runner. The registered ones alone were not
+// enough (2026-11-18 01:05 run): the exit watchdog, APM and awake threads are
+// libnx threads with no profiler name. They survived, were paused, and ran
+// again after libnx's teardown had closed HID and the applet - the watchdog
+// polls HID shared memory and the applet every 100 ms - and the process died
+// before the loader had written its report. g_endable only names survivors.
+bool ShouldEndThisThread()
+{
+    return g_endHostThreads.load(std::memory_order_acquire) && threadGetCurHandle() != g_exitRunner;
+}
+
+// The exit itself. On the Switch 2 it runs on the main thread whenever that
+// thread is serving (see rule 1); otherwise where it is called.
+[[noreturn]] void RunExit()
+{
+    char line[192];
+    std::snprintf(line, sizeof(line), "exit: running the exit on the %s thread\n",
+                  OnMainThread() ? "main" : "calling (main thread not serving)");
+    MarkExit(line);
+#if defined(__SWITCH2__)
+    // Guest threads end at their next wait, sleep or file syscall (rule 2).
+    os::switch_platform::g_endGuestThreads.store(true, std::memory_order_release);
+#endif
     QuiesceAudio();
-    os::logger::DrainForExit(); // lines still queued for the log writer
+    QuiesceForExit(); // final log flush and close, perf monitor and audio driver stopped
     // Not fflush(nullptr): it locks every open file, and a crashed thread may
-    // still hold one of those locks.
+    // still hold one of those locks. Done before any thread is paused, as a
+    // paused thread could hold stderr's lock.
     std::fflush(stdout);
     std::fflush(stderr);
-    // libnx's own exit does this work: __libnx_exit calls __appExit (appletExit,
-    // which is what tells am the applet is leaving), then __nx_win_exit,
-    // _serviceGuardCloseAll and __nx_exit. Closing the window and the applet
-    // here first is the one thing a normal homebrew exit never does, and after
-    // the HOME -> X run at 14:47:32 kaiHEN's R -> hbmenu hook no longer fired.
-    //
-    // Chain-load hbmenu into this same process when the loader supports it
-    // (nx-hbloader / kaiHEN): envSetNextLoad leaves the loader's exit path set
-    // to sdmc:/hbmenu.nro, so L+R+Plus+Minus comes back to hbmenu without the
-    // donor title being closed - and, on 2026-11-17 hardware, without kaiHEN
-    // dropping its R hook the way it did when the process simply ended.
-    // Without loader support the call is skipped and the exit is the ordinary
-    // libnx one below.
-    if (envHasNextLoad())
+    const bool nextLoadSupported = envHasNextLoad();
+    if (nextLoadSupported)
     {
         const Result nextLoad = envSetNextLoad("sdmc:/hbmenu.nro", "\"sdmc:/hbmenu.nro\"");
         std::fprintf(stderr, "[exit] next load sdmc:/hbmenu.nro: %s (0x%x)\n",
@@ -289,15 +486,158 @@ void QuiesceAudio()
     }
     else
         std::fprintf(stderr, "[exit] loader has no next-load support; leaving through the ordinary exit\n");
+    std::fprintf(stderr, "[exit] leaving through libnx's application exit on the %s thread (applet type %d)\n",
+                 OnMainThread() ? "main" : "calling", int(appletGetAppletType()));
+    std::fflush(stderr);
+#if defined(__SWITCH2__)
+    // Host threads too (perf, audio and the log are stopped above): every
+    // other thread now ends at its next condition-variable wait or sleep
+    // (__wrap___libc_cond_wait, __wrap_svcSleepThread below), so kaiHEN's
+    // loader finds nothing it has to park.
+    g_exitRunner = threadGetCurHandle();
+    g_endableCount = os::switch_cpu_profiler::CopyThreads(g_endable, 128);
+    g_endHostThreads.store(true, std::memory_order_release);
+    // Up to 1.5 s for them to end; stop early once none has for 200 ms. The
+    // waits registered in g_condWaits are woken each pass, so a thread asleep
+    // on a condition variable with no timeout ends too.
+    WakeRegisteredWaits();
+    ThreadCensus census = ScanOtherThreads(false);
+    const u32 runningAtStart = census.running;
+    u32 lastRunning = census.running;
+    // The full 1.5 s unless every thread has ended: threads that sleep for
+    // a second at a time (IO Monitor) need most of it.
+    for (int tick = 0; tick < 60 && census.running; ++tick)
+    {
+        svcSleepThread(25'000'000ull);
+        WakeRegisteredWaits();
+        census = ScanOtherThreads(false);
+    }
+    (void)lastRunning;
+
+    // Taken, and never released, before any thread is paused: a thread paused
+    // inside malloc or free would otherwise hold the allocator lock that
+    // libnx's teardown (__nx_gpu_exit, __nx_win_exit) needs. Recursive, so
+    // this thread can still allocate. Threads still running wait for it, then
+    // are paused below.
+    __malloc_lock(_REENT);
+    // Nothing else runs from here on: no thread can reach the SD card or a
+    // service while libnx tears down. They run again just before the loader
+    // takes over (ResumeThenReturnToLoader), so that it can park them.
+    census = ScanOtherThreads(true);
+    // Name each survivor and where it stopped (offsets into the executable,
+    // tools/switch/switch-cpu-profile.py style): each is a thread the loader
+    // must park, and one that runs into closed services after the resume is
+    // the one that ends the donor game.
+    for (u32 i = 0; i < g_pausedCount; ++i)
+    {
+        const char* name = "(unregistered)";
+        for (size_t n = 0; n < g_endableCount; ++n)
+            if (g_endable[n].handle == g_pausedThreads[i])
+                name = g_endable[n].name;
+        ThreadContext context{};
+        const Result rc = svcGetThreadContext3(&context, g_pausedThreads[i]);
+        const u64 base = os::switch_cpu_profiler::ModuleBase();
+        std::snprintf(line, sizeof(line), "exit: still running: %s (handle %#x) pc elf+%#llx lr elf+%#llx (rc %#x)\n",
+                      name, unsigned(g_pausedThreads[i]), (unsigned long long)(context.pc.x - base),
+                      (unsigned long long)(context.lr - base), unsigned(rc));
+        MarkExit(line);
+    }
+    if (census.paused)
+    {
+        g_loaderReturn = envGetExitFuncPtr();
+        if (g_loaderReturn)
+            envSetExitFuncPtr(&ResumeThenReturnToLoader);
+        else
+            for (u32 i = 0; i < g_pausedCount; ++i) // no loader to return to: undo now
+                svcSetThreadActivity(g_pausedThreads[i], ThreadActivity_Runnable);
+    }
+    std::snprintf(line, sizeof(line),
+                  "exit: threads: %u running at the exit request, %u ended, %u still running, %u paused "
+                  "(kaiHEN's loader parks up to 32; more ends the donor game)\n",
+                  runningAtStart, census.ended, census.running, census.paused);
+    MarkExit(line);
+#endif
     // The exit lock is released before anything else so am's 15 s
     // forced-termination timer can never start while the teardown runs
     // (libnx: appletUnlockExit must be used before main returns).
     appletUnlockExit();
-    std::fprintf(stderr, "[exit] leaving through libnx's application exit (applet type %d, exit lock released)\n",
-                 int(appletGetAppletType()));
-    std::exit(0);              // __libnx_exit: __appExit (appletExit), __nx_win_exit, svcExitProcess
-    svcExitProcess();          // only if exit() itself gave up
+    MarkExit(nextLoadSupported ? "exit: next load set, exit lock released; std::_Exit -> libnx exit -> loader\n"
+                               : "exit: exit lock released; std::_Exit -> libnx exit\n");
+    // _Exit, not exit: libnx's own teardown (__libnx_exit: __appExit,
+    // __nx_gpu_exit, __nx_win_exit, _serviceGuardCloseAll, then __nx_exit back
+    // to the loader) without the C++ static destructors, which would join or
+    // lock on the threads just paused. The atexit work is done above.
+    std::_Exit(0);
+}
+
+// HOME -> X. The player closed the game from the HOME menu, so the process is
+// meant to end: the system does that itself as soon as the exit lock is
+// released, which is how every homebrew is closed (RetroArch-S2 releases the
+// lock in its deinit). Going back to hbmenu here instead, as this path used
+// to, kept the process alive while the system waited on the lock: "Please
+// wait", then a forced end treated as an application error, and kaiHEN
+// needed a reboot. The donor game can be started again afterwards and goes
+// straight to hbmenu (kaiHEN: "the second launch and onwards").
+// Only what must not be cut off is done first: the runtime log's last lines
+// go to the card and close, and guest file I/O stops.
+[[noreturn]] void CloseForHomeMenu()
+{
+    os::switch_platform::g_suppressGuestIo.store(true, std::memory_order_release);
+    MarkExit("exit: HOME -> X: closing the game for the system (log closed, exit lock released)\n");
+    os::logger::CloseForExit(); // bounded: gives up on a lock a crashed thread holds
+    appletUnlockExit();
+    // The system ends the process within moments of the unlock. If it has
+    // not after 3 s, end it here: the exit was requested and the lock is
+    // released, so this is an ordinary close, not an error.
+    for (int tenth = 0; tenth < 30; ++tenth)
+        svcSleepThread(100'000'000ull);
+    MarkExit("exit: HOME -> X: still running 3 s after the unlock; ending the process\n");
+    svcExitProcess();
     __builtin_unreachable();
+}
+
+// Every exit path ends here: the L+R+Plus+Minus watchdog, the title's Quit,
+// Settings and debug menu "Quit to hbmenu", HOME -> X, and the crash paths.
+[[noreturn]] void EndProcessToHbmenu()
+{
+    // Set before anything else: from here on guest file I/O parks (or ends, see
+    // g_endGuestThreads) in io/file_system.cpp instead of reaching fsdev while
+    // libnx's exit unmounts the card (item 5 of retroarch_quit_fix.txt).
+    os::switch_platform::g_suppressGuestIo.store(true, std::memory_order_release);
+#if defined(__SWITCH2__)
+    // HOME -> X reached the normal quit first (SDL turned the request into
+    // SDL_EVENT_QUIT): the system is waiting for the process to end, so close
+    // for it instead of returning to hbmenu.
+    if (g_homeCloseRequested.load(std::memory_order_acquire))
+        CloseForHomeMenu();
+    if (g_exitServerActive.load(std::memory_order_acquire) && !OnMainThread())
+    {
+        // Rule 1: hand the exit to the main thread, which polls for it every
+        // 10 ms and does nothing else, then end this thread: one thread fewer
+        // for the loader, and a crashing thread does not stay on the shared
+        // exception stack.
+        if (!g_exitRequested.exchange(true, std::memory_order_acq_rel))
+            MarkExit("exit: requested; handing the exit to the main thread\n");
+        os::switch_platform::EndThreadForExit();
+    }
+#endif
+    if (g_endingProcess.exchange(true, std::memory_order_acq_rel))
+    {
+        // Another thread is already running the exit: nothing left to do here.
+#if defined(__SWITCH2__)
+        os::switch_platform::EndThreadForExit();
+#else
+        // Switch 1: wait for it, but not forever, then repeat the handover.
+        for (int tenth = 0; tenth < 50; ++tenth)
+            svcSleepThread(100'000'000ull);
+        if (envHasNextLoad())
+            envSetNextLoad("sdmc:/hbmenu.nro", "\"sdmc:/hbmenu.nro\"");
+        appletUnlockExit(); // a second unlock is harmless; the first entrant may not have reached it
+        svcExitProcess();
+        __builtin_unreachable();
+#endif
+    }
+    RunExit();
 }
 
 // A native fault or a C library abort() in NVK / Mesa does not always reach
@@ -488,7 +828,9 @@ const char* ExceptionClassName(uint32_t esr)
         static const char second[] =
             "=== second fault while reporting a crash, report incomplete\n=== end of crash report\n";
         AppendCrashReport(second, sizeof(second) - 1);
-        svcExitProcess();
+        // Not svcExitProcess: it would end the donor game. The first report
+        // is already taking the process to hbmenu; end only this thread.
+        svcExitThread();
     }
 
     g_crashLength = 0;
@@ -895,11 +1237,72 @@ namespace os::switch_platform
 // See EndProcessToHbmenu: guest file syscalls park while the process ends
 // (io/file_system.cpp reads it through an extern declaration).
 std::atomic<bool> g_suppressGuestIo{false};
+std::atomic<bool> g_endGuestThreads{false};
+std::atomic<bool> g_loaderHandoff{false};
+// A guest thread at a wait, sleep or file syscall once the main thread has
+// begun the exit. The caller has released every lock it held. svcExitThread,
+// not threadExit or pthread_exit: no thread-local destructors or allocator
+// calls on the way out. The loader closes the handle and undoes the stack
+// mirror of an ended thread, which leaves nothing for it to park.
+void EndThreadForExit()
+{
+    // After ResumeThenReturnToLoader: block where the loader can pause and
+    // park this thread, instead of ending under its scan.
+    if (g_loaderHandoff.load(std::memory_order_acquire))
+        for (;;)
+            __real_svcSleepThread(INT64_MAX);
+    for (;;)
+        svcExitThread();
+}
 
+// os/main_thread.cpp, Switch: the main thread, while the guest's main thread
+// runs. Does not return: an exit request, or the guest's main thread
+// returning, runs the exit here (EndProcessToHbmenu, rule 1).
+void ServeExitOnMainThread(const std::atomic<bool>& guestReturned)
+{
+    g_mainThreadHandle = threadGetCurHandle();
+    g_exitServerActive.store(true, std::memory_order_release);
+    // Stays the exit thread for the rest of the process (g_exitServerActive is
+    // never cleared): a request is never lost, and never runs elsewhere. The
+    // guest's main thread returning also ends the process, here.
+    while (!guestReturned.load(std::memory_order_acquire) && !g_exitRequested.load(std::memory_order_acquire))
+        svcSleepThread(10'000'000ull);
+    g_suppressGuestIo.store(true, std::memory_order_release);
+    if (!g_endingProcess.exchange(true, std::memory_order_acq_rel))
+        RunExit();
+    for (;;) // another thread is already running it (an exit before this loop began)
+        svcSleepThread(INT64_MAX);
+}
+
+// RawAppend without its own session: libnx's SD card file system (fsdev), with
+// fsFs* requests only - no stdio, no newlib locks. On the Switch 2 the private
+// fsp-srv session never opened, so exit.log and crash_report.txt were never
+// written; this is that case.
+bool FsdevAppend(const char* fileName, const char* data, size_t size)
+{
+    FsFileSystem* sd = fsdevGetDeviceFileSystem("sdmc");
+    if (!sd)
+        return false;
+    char path[FS_MAX_PATH]{};
+    std::snprintf(path, sizeof(path), "%s/%s", g_rawRoot, fileName);
+    fsFsCreateFile(sd, path, 0, 0); // fails harmlessly if it exists
+    FsFile file{};
+    Result rc = fsFsOpenFile(sd, path, FsOpenMode_Write | FsOpenMode_Append, &file);
+    if (R_FAILED(rc))
+        return false;
+    s64 offset = 0;
+    rc = fsFileGetSize(&file, &offset);
+    if (R_SUCCEEDED(rc))
+        rc = fsFileWrite(&file, offset, data, size, FsWriteOption_Flush);
+    fsFileClose(&file);
+    return R_SUCCEEDED(rc);
+}
 bool RawAppend(const char* fileName, const char* data, size_t size)
 {
-    if (!g_rawReady || size == 0)
+    if (size == 0)
         return false;
+    if (!g_rawReady)
+        return FsdevAppend(fileName, data, size);
     // The watchdog and the crash handler may both write. Never wait long: a stuck writer must
     // not stop the other one.
     bool locked = false;
@@ -1001,8 +1404,13 @@ void Initialize(const std::filesystem::path& dataRoot)
         const std::string root = dataRoot.string();
         std::snprintf(g_rawRoot, sizeof(g_rawRoot), "%s", root.compare(0, 5, "sdmc:") == 0 ? root.c_str() + 5 : root.c_str());
         mutexInit(&g_rawMutex);
-        if (R_FAILED(RawInitialize()))
+        const Result raw = RawInitialize();
+        if (R_FAILED(raw))
+        {
             g_rawReady = false;
+            std::fprintf(stderr, "[boot] own SD card session unavailable (rc %#x); exit.log and crash reports use libnx's\n",
+                         unsigned(raw));
+        }
     }
     CaptureModuleRange();
     std::set_terminate(OnTerminate);
@@ -1111,7 +1519,7 @@ void ExitNow()
     mark("exit: profile saved\n");
 #endif
     RestoreApmForExit(mark);
-    os::logger::DrainForExit();
+    QuiesceForExit(); // final log flush and close, perf monitor and audio driver stopped
     // Not fflush(nullptr): it locks every open file, game files included.
     std::fflush(stdout);
     std::fflush(stderr);
@@ -1179,6 +1587,15 @@ void ExitNow()
 // error and drop kaiHEN's R -> hbmenu hook on 2026-11-16 hardware.
 void ForceExitWithoutTeardown()
 {
+#if defined(__SWITCH2__)
+    // svcExitProcess would end the donor game (see EndProcessToHbmenu, rule 3):
+    // take the same exit as a normal quit. It pauses the threads this path
+    // used to leave running instead of tearing down under them.
+    EndProcessToHbmenu();
+#endif
+    // No atexit handlers run on this path, so their work is done here: the
+    // final log flush and close, the perf monitor and the audio driver.
+    QuiesceForExit();
     if (envHasNextLoad())
         envSetNextLoad("sdmc:/hbmenu.nro", "\"sdmc:/hbmenu.nro\"");
     appletUnlockExit();
@@ -1278,7 +1695,14 @@ void ExitWatchdogMain(void*)
         // Horizon then kills it. Poll the applet on this thread too, so closing
         // the game stays a normal quit even when the renderer is stuck.
         const bool appletQuit = !appletMainLoop();
-        if (!comboDone && !appletQuit)
+        // HOME -> X, whichever thread took the message: close for the system
+        // (CloseForHomeMenu), not the quit to hbmenu below.
+        if (appletQuit || g_homeCloseRequested.load(std::memory_order_acquire))
+        {
+            std::fprintf(stderr, "[watchdog] HOME -> X: the system asked the game to close; releasing the exit lock\n");
+            CloseForHomeMenu();
+        }
+        if (!comboDone)
             continue;
 
         quitting = true;
@@ -1472,6 +1896,67 @@ uint32_t SetThreadPriority(uint32_t handle, int priority)
 void SetLoadingBoost(bool enabled)
 {
     appletSetCpuBoostMode(enabled ? ApmCpuBoostMode_FastLoad : ApmCpuBoostMode_Normal);
+}
+}
+#endif
+
+#if defined(__SWITCH2__)
+// ---- Ending the runtime's host threads at exit (see RunExit) -----------------
+// Linked in with -Wl,--wrap=__libc_cond_wait,--wrap=__libc_cond_wait_recursive,
+// --wrap=svcSleepThread (LostOdysseyRecomp/CMakeLists.txt). Every
+// std::condition_variable and pthread_cond wait ends in __libc_cond_wait, and
+// every sleep (std::this_thread::sleep_for, nanosleep) in svcSleepThread. Until
+// the exit begins each costs one relaxed-order load more; a wait with no
+// timeout also takes a slot in g_condWaits so that RunExit can wake it.
+extern "C"
+{
+int __real___libc_cond_wait(_COND_T* cond, _LOCK_T* lock, uint64_t timeout_ns);
+int __real___libc_cond_wait_recursive(_COND_T* cond, _LOCK_RECURSIVE_T* lock, uint64_t timeout_ns);
+void __real_svcSleepThread(s64 nano);
+
+int __wrap___libc_cond_wait(_COND_T* cond, _LOCK_T* lock, uint64_t timeout_ns)
+{
+    if (ShouldEndThisThread())
+    {
+        __libc_lock_release(lock);
+        os::switch_platform::EndThreadForExit();
+    }
+    const int slot = timeout_ns == UINT64_MAX ? RegisterCondWait(cond) : -1;
+    const int result = __real___libc_cond_wait(cond, lock, timeout_ns);
+    UnregisterCondWait(slot);
+    if (ShouldEndThisThread())
+    {
+        __libc_lock_release(lock); // the wait took it again
+        os::switch_platform::EndThreadForExit();
+    }
+    return result;
+}
+
+int __wrap___libc_cond_wait_recursive(_COND_T* cond, _LOCK_RECURSIVE_T* lock, uint64_t timeout_ns)
+{
+    if (ShouldEndThisThread())
+    {
+        __libc_lock_release_recursive(lock);
+        os::switch_platform::EndThreadForExit();
+    }
+    const int slot = timeout_ns == UINT64_MAX ? RegisterCondWait(cond) : -1;
+    const int result = __real___libc_cond_wait_recursive(cond, lock, timeout_ns);
+    UnregisterCondWait(slot);
+    if (ShouldEndThisThread())
+    {
+        __libc_lock_release_recursive(lock);
+        os::switch_platform::EndThreadForExit();
+    }
+    return result;
+}
+
+void __wrap_svcSleepThread(s64 nano)
+{
+    if (ShouldEndThisThread())
+        os::switch_platform::EndThreadForExit();
+    __real_svcSleepThread(nano);
+    if (ShouldEndThisThread())
+        os::switch_platform::EndThreadForExit();
 }
 }
 #endif

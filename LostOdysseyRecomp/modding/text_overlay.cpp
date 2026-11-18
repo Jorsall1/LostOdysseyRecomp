@@ -57,6 +57,15 @@ namespace
 namespace fs = std::filesystem;
 namespace cpx = xenos::resources::cpx;
 
+// The process is ending (StopPrebuild, from video::RequestExit). From here on
+// nothing in this file creates, renames, touches or removes anything in the mod
+// cache: on the Switch libnx's exit unmounts the SD card (fsdevUnmountAll)
+// shortly after, and a write under that unmount makes the OS show an error.
+// An unfinished <cache>.new folder is left for the next start, which removes
+// it before building into it again.
+std::atomic<bool> gExiting{false};
+bool Exiting() { return gExiting.load(std::memory_order_acquire); }
+
 // The game turns a record's sector into a 32-bit byte offset from its low 21 bits.
 constexpr uint64_t kMaxOffset = (uint64_t(1) << 21) * fpi::kSector;
 
@@ -718,6 +727,7 @@ double MiB(uint64_t bytes) { return double(bytes) / (1024.0 * 1024.0); }
 // sets, unfinished builds and files of the earlier one-set layout go.
 void Prune(const fs::path &folderCache, const fs::path &current)
 {
+    if (Exiting()) return; // removal waits for the next start (see gExiting)
     std::lock_guard pins(gCachePinsMutex); // a new handle cannot acquire a pin during removal
     std::erase_if(gCachePins, [](const auto &entry) { return entry.second.expired(); });
     struct Set { fs::path path; fs::file_time_type used; };
@@ -848,7 +858,7 @@ Folder Build(const fs::path &folder, const ModSet &set, const BuildOptions &opti
     {
         LOG_NOTICE("[mods] rebuilt files for {} read from {}", Utf8(folder), Utf8(cache));
         // In use now: the manifest's time orders the sets.
-        fs::last_write_time(cache / "manifest.txt", fs::file_time_type::clock::now(), ec);
+        if (!Exiting()) fs::last_write_time(cache / "manifest.txt", fs::file_time_type::clock::now(), ec);
         Prune(sets, cache);
         return result;
     }
@@ -871,7 +881,8 @@ Folder Build(const fs::path &folder, const ModSet &set, const BuildOptions &opti
     } finished{options.progress};
 
     // Build into <cache>.new, then put it in place of the old one.
-    fs::path building = cache.empty() ? fs::path() : fs::path(cache).concat(".new");
+    // Not while the process ends: the rebuilt files stay in memory (see gExiting).
+    fs::path building = cache.empty() || Exiting() ? fs::path() : fs::path(cache).concat(".new");
     if (!building.empty())
     {
         {
@@ -915,11 +926,18 @@ Folder Build(const fs::path &folder, const ModSet &set, const BuildOptions &opti
         // Nothing half done stays: the folder has no manifest and goes.
         for (auto &[name, tail] : tails) tail.file.close();
         for (auto &[name, overflow] : overflows) overflow.file.close();
-        if (!building.empty()) fs::remove_all(building, ec);
+        // At exit the folder stays (no manifest, so it never counts as a cache
+        // set); the next start removes it before building into it again.
+        if (!building.empty() && !Exiting()) fs::remove_all(building, ec);
         throw;
     }
     for (auto &[name, tail] : tails) tail.file.close();
     for (auto &[name, overflow] : overflows) overflow.file.close();
+    // A background build that finished its files as the process began to end
+    // writes no manifest or index and moves nothing into place: the same as a
+    // cancelled one. (A foreground build has no Cancelled handler; the game's
+    // own file I/O is parked at exit, so it does not get here.)
+    if (options.background && Exiting()) throw Cancelled{};
     if (counts.files || counts.failed)
         // Keys a copy lacks are normal: a pack made from the DLC copy of a file
         // also applies to the disc copy, which has fewer entries.
@@ -1381,12 +1399,29 @@ void WaitForPrebuild()
 
 void StopPrebuild()
 {
-    {
-        std::lock_guard lock(gPrebuild.mutex);
-        gPrebuild.stopping = true;
-        gPrebuild.cancel = true;
-    }
+    // Before the cancel, so a build that sees it also sees that nothing may be
+    // written (Build: no manifest, no rename, no removal of <cache>.new).
+    gExiting.store(true, std::memory_order_release);
+    std::unique_lock lock(gPrebuild.mutex);
+    gPrebuild.stopping = true;
+    gPrebuild.cancel = true;
+    lock.unlock();
     gPrebuild.changed.notify_all();
+    // Bounded wait for the build in progress to leave the cache. WaitForPrebuild
+    // cannot be used: it returns as soon as stopping is set. The background
+    // thread checks the cancel between files and clears current (then notifies)
+    // once Build has returned, so this normally ends within one file. The bound
+    // keeps the quit inside the exit watchdog's 4 s grace if a single package
+    // rebuild runs long; gExiting still stops its writes when it finishes.
+    constexpr auto kStopWait = std::chrono::milliseconds(1000);
+    lock.lock();
+    if (!gPrebuild.changed.wait_for(lock, kStopWait, [] { return gPrebuild.current.empty(); }))
+    {
+        const auto folder = gPrebuild.current;
+        lock.unlock();
+        LOG_WARNING("[mods] background preparation of {} still running {} ms after the exit request; leaving it",
+                    Utf8(folder), kStopWait.count());
+    }
 }
 
 void SelectLanguagePack(const std::string &id)

@@ -192,8 +192,11 @@ namespace os::logger
         g_emergencyFile.store(emergency, std::memory_order_release);
         g_file = file;
 #if defined(__SWITCH__)
-        // Lines queued for the writer thread reach the card on a normal exit too.
-        static const bool drainAtExit = std::atexit([] { DrainForExit(); }) == 0;
+        // Lines queued for the writer thread reach the card on a normal exit
+        // too, and the log closes. Registered first, so newlib runs it after the
+        // later handlers (perf_stats StopMonitor, audio StopDriverThread) and
+        // before libnx's __appExit unmounts the SD card.
+        static const bool drainAtExit = std::atexit([] { CloseForExit(); }) == 0;
         (void)drainAtExit;
 #endif
         const auto runtimePath = g_filePath;
@@ -321,30 +324,58 @@ namespace os::logger
         }
     }
 
+#if defined(__SWITCH__)
+    namespace
+    {
+        // The drain for DrainForExit and CloseForExit: at most 100 x 2 ms for
+        // the two locks, as a crashed thread may hold one. close sets
+        // g_logClosed while both are held, so no line is added and no write
+        // starts once this returns; without the locks it is set anyway, and only
+        // a write already in progress can still finish.
+        void DrainLocked(bool close) noexcept
+        {
+            if (g_logClosed.load(std::memory_order_acquire))
+                return;
+            for (int attempt = 0; attempt < 100; ++attempt)
+            {
+                if (g_writeMutex.try_lock())
+                {
+                    if (g_mutex.try_lock())
+                    {
+                        if (!g_pending.empty() && g_file)
+                        {
+                            fwrite(g_pending.data(), 1, g_pending.size(), g_file);
+                            g_pending.clear();
+                        }
+                        if (g_file)
+                            fflush(g_file);
+                        if (close)
+                            g_logClosed.store(true, std::memory_order_release);
+                        g_mutex.unlock();
+                        g_writeMutex.unlock();
+                        return;
+                    }
+                    g_writeMutex.unlock();
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+            if (close)
+                g_logClosed.store(true, std::memory_order_release);
+        }
+    }
+#endif
+
     void DrainForExit() noexcept
     {
 #if defined(__SWITCH__)
-        for (int attempt = 0; attempt < 100; ++attempt)
-        {
-            if (g_writeMutex.try_lock())
-            {
-                if (g_mutex.try_lock())
-                {
-                    if (!g_pending.empty() && g_file)
-                    {
-                        fwrite(g_pending.data(), 1, g_pending.size(), g_file);
-                        g_pending.clear();
-                    }
-                    if (g_file)
-                        fflush(g_file);
-                    g_mutex.unlock();
-                    g_writeMutex.unlock();
-                    return;
-                }
-                g_writeMutex.unlock();
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(2));
-        }
+        DrainLocked(false);
+#endif
+    }
+
+    void CloseForExit() noexcept
+    {
+#if defined(__SWITCH__)
+        DrainLocked(true);
 #endif
     }
 

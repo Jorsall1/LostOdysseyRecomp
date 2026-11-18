@@ -940,6 +940,10 @@ static uint32_t KeResumeThread(uint32_t handle)
 static uint32_t KeDelayExecutionThread(uint32_t WaitMode, bool Alertable, be<int64_t>* Timeout)
 {
     WaitScope scope("KeDelayExecutionThread", 0);
+#if LO_PLATFORM_SWITCH
+    // The process exit has begun: end here (see kernel::wait::EndingForExit).
+    if (kernel::wait::EndingForExit()) os::switch_platform::EndThreadForExit();
+#endif
     if (Alertable && DeliverUserApcs())
         return STATUS_USER_APC;
     uint32_t timeout = GuestTimeoutToMilliseconds(Timeout);
@@ -958,6 +962,9 @@ static uint32_t KeDelayExecutionThread(uint32_t WaitMode, bool Alertable, be<int
         std::this_thread::sleep_for(std::chrono::milliseconds(timeout));
     else
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
+#if LO_PLATFORM_SWITCH
+    if (kernel::wait::EndingForExit()) os::switch_platform::EndThreadForExit();
+#endif
     if (Alertable && DeliverUserApcs())
         return STATUS_USER_APC;
     return STATUS_SUCCESS;
