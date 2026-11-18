@@ -1,0 +1,43 @@
+================================================================================
+LostOdysseyRecomp - Nintendo Switch 2 port
+Summary - TURN 25: mv_01v: stream is fine, the event timeline stops ticking it
+================================================================================
+Build: NRO md5 c6ba2f016c9f0cbc76c602010cb860b6 (Desktop copy matches).
+ELF: build/moviediag_turn25_c6ba2f01.elf. kaiHEN fix untouched.
+LOGS READ (runtime-1795020052435702.log; env LO_GUEST_AFFINITY=1,
+LO_TRACE_MOVIE=1)
+  * 64.464 s movie start M=0xb280d20 from lr 0x827e30e8 (sub_827E2DD0).
+  * Stream job runs (2018 ticks by 97 s). First two requests filled both
+    caches: M+76 cache 6 x 512 KiB = 3 MiB loaded, M+48 cache 4 x 512 KiB =
+    2 MiB loaded, of 0xa409ce3 bytes. Every later request returns 0 (nothing
+    to do: caches full, the player has not read anything yet). Info slot
+    idle (status20=0, request22=0). -> Movie data streaming is NOT the
+    problem; the movie is buffered and ready.
+  * M+104 stays 2 (player created) at 10 s and 30 s. It should become 3.
+DECODED sub_827E2DD0 (event timeline movie track tick; vtable 0x8200e568 /
+pdata 0x8223f440, called through a vtable)
+  r3 = track (+108 entries of 20 bytes: preload time, start time, length;
+  +112 count), r5 = owner (+60 previous time, +64 movie M), f1 = time.
+    * time passes preload: allocate M (sub_82814C30), start (sub_82815248).
+    * every tick: sub_82375b18(M); if M+104 == 2 -> M+104 = 3 and
+      owner->vtable[+280](M) (tells the owner the movie is ready).
+    * time reaches start: M+16 = 1, sub_82b5caa0, byte 0x8324797C... (r25
+      -31964:31020) = 1 (movie playing); then sub_823efbe0(M, time) / the
+      render command that plays it.
+    * time reaches end: release (sub_82814570).
+  Since M+104 never became 3, this tick has not run since the player was
+  created (64.889 s). The event timeline stopped ticking the movie track.
+  Likely the timeline is paused (the flashing loading icon) waiting for
+  something, and the movie's "ready" report only happens in this tick.
+CHANGES (diagnostics only)
+  movie/movie_hooks.cpp
+    * PPC_FUNC sub_827E2DD0: logs ticks 1-8 and every 120th up to 6000:
+      track, owner, lr, time, previous time, entry preload/start/length,
+      M and M+104. Counter and last time also in the object status line
+      (trackTicks, trackTime).
+NEXT
+  Same env.txt. Read "track tick" lines:
+    * ticks stop right after the start: the caller (owner, lr) stops
+      updating the track -> find what gates the timeline update.
+    * ticks continue but time is frozen below the start time: the event
+      clock is paused -> find the pause condition.

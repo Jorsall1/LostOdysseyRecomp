@@ -34,6 +34,8 @@
 #include <os/switch_platform.h>
 #endif
 #include <algorithm>
+#include <atomic>
+#include <bit>
 #include <cctype>
 #include <chrono>
 #include <cstdlib>
@@ -51,6 +53,7 @@ extern "C" PPC_FUNC(__imp__sub_82CE9FD8);
 extern "C" PPC_FUNC(__imp__sub_82CF8140);
 extern "C" PPC_FUNC(__imp__sub_82815208);
 extern "C" PPC_FUNC(__imp__sub_82813A50);
+extern "C" PPC_FUNC(__imp__sub_827E2DD0);
 
 namespace
 {
@@ -108,6 +111,9 @@ std::mutex g_mutex;
 std::unique_ptr<Movie> g_movie;
 // Diagnostics: calls of the movie stream job (sub_82815208) and stream read requests (sub_82813A50).
 std::atomic<uint32_t> g_jobTicks{0}, g_streamRequests{0};
+// Diagnostics: event timeline movie track ticks (sub_827E2DD0) and the last time passed to it.
+std::atomic<uint32_t> g_trackTicks{0};
+std::atomic<float> g_trackTime{0.f};
 
 // Archive and offset of a movie file on the current disc, from its LO.fpi.
 struct Location
@@ -279,11 +285,12 @@ void LogStatus(Movie& movie, const char* why)
     const uint32_t info = r32(m + 44);
     LOG_WARNING("native movie: {} object M={:#x} flags8={:#x} state104={} step108={} info={:#x} status20={} request22={} "
                 "dest24={:#x} size28={:#x} file36={:#x} offset40={:#x} cache48 buf={:#x} loaded={:#x} end={:#x} "
-                "cache76 buf={:#x} loaded={:#x} end={:#x} jobTicks={} requests={}",
+                "cache76 buf={:#x} loaded={:#x} end={:#x} jobTicks={} requests={} trackTicks={} trackTime={:.3f}",
                 movie.name, m, r32(m + 8) >> 24, int16_t(r16(m + 104)), r32(m + 108), info, info ? r16(info + 20) : 0,
                 info ? r16(info + 22) : 0, info ? r32(info + 24) : 0, info ? r32(info + 28) : 0, info ? r32(info + 36) : 0,
                 info ? r32(info + 44) : 0, r32(m + 48 + 12), r32(m + 48 + 20), r32(m + 48 + 24), r32(m + 76 + 12),
-                r32(m + 76 + 20), r32(m + 76 + 24), g_jobTicks.load(), g_streamRequests.load());
+                r32(m + 76 + 20), r32(m + 76 + 24), g_jobTicks.load(), g_streamRequests.load(), g_trackTicks.load(),
+                g_trackTime.load());
     std::string words;
     for (uint32_t i = 0; i < 128; i += 4) words += fmt::format(" {:08x}", r32(m + i));
     LOG_WARNING("native movie: M+0..127:{}", words);
@@ -560,6 +567,28 @@ PPC_FUNC(sub_82813A50)
                    n, m, cache - m, mode, ctx.r3.u32, PPC_LOAD_U32(cache + 20), info ? PPC_LOAD_U32(info + 36) : 0,
                    info ? PPC_LOAD_U16(info + 20) : 0, info ? PPC_LOAD_U16(info + 22) : 0);
     }
+}
+
+// Diagnostics: the event timeline's movie track tick. r3 = track (+108 entries of 20 bytes: preload, start,
+// length floats ...; +112 entry count), r5 = owner (+60 previous time, +64 movie M), f1 = current time.
+// It creates and starts M when the time passes an entry's preload time, moves M+104 from 2 (player created)
+// to 3 and tells the owner (vtable +280), and starts playback once the time reaches the entry's start.
+PPC_FUNC(sub_827E2DD0)
+{
+    const uint32_t track = ctx.r3.u32, owner = ctx.r5.u32;
+    const double now = ctx.f1.f64;
+    const uint32_t lr = uint32_t(ctx.lr);
+    auto f32 = [&](uint32_t a) { return std::bit_cast<float>(PPC_LOAD_U32(a)); };
+    const uint32_t n = ++g_trackTicks;
+    g_trackTime.store(float(now));
+    const uint32_t entries = PPC_LOAD_U32(track + 108), count = PPC_LOAD_U32(track + 112);
+    const uint32_t m = PPC_LOAD_U32(owner + 64);
+    if (n <= 8 || (n <= 6000 && n % 120 == 0))
+        LOG_NOTICE("native movie: track tick #{} track={:#x} owner={:#x} lr={:#x} time={:.3f} prev={:.3f} entries={} "
+                   "first preload={:.3f} start={:.3f} length={:.3f} M={:#x} state104={}",
+                   n, track, owner, lr, now, f32(owner + 60), count, count ? f32(entries) : 0.f,
+                   count ? f32(entries + 4) : 0.f, count ? f32(entries + 8) : 0.f, m, m ? int16_t(PPC_LOAD_U16(m + 104)) : -1);
+    __imp__sub_827E2DD0(ctx, base);
 }
 
 bool movie::NativeMoviesEnabled()
