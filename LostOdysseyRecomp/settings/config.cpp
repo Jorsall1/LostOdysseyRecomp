@@ -225,6 +225,14 @@ Config Validate(Config value)
     value.width = Docked() ? 2560u : 1920u;
     value.height = Docked() ? 1440u : 1080u;
 #endif
+#if defined(__SWITCH2__)
+    // Locked scene height (2026-11-18): 1080 rows handheld, 1440 docked (SwitchAutomaticHeight). A saved
+    // settings.ini's Maximum/Minimum resolution and dynamic resolution no longer apply.
+    value.dynamicResolution = false;
+    for (uint32_t mode = 0; mode < 2; ++mode)
+        value.maximumHeight[mode] = value.minimumHeight[mode] = 0;
+    value.frameRate = 60;
+#endif
     if (const uint32_t rows = RenderHeightOverride()) value.internalResolution = int(rows);
     else value.internalResolution = int(SwitchMaximumHeight(value, Docked()));
     value.shadowResolution = 1;

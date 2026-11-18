@@ -122,7 +122,14 @@ namespace gpu::frame_plan
             static const uint32_t step = dynamic_resolution::EnvironmentStep();
             static dynamic_resolution::Controller controller;
             static uint32_t announcedMinimum = 0, announcedBase = 0;
+#if defined(__SWITCH2__)
+            // Switch 2: removed (2026-11-18). The scene stays at 1080 rows handheld and 1440 docked; mid-battle
+            // steps rebuilt every scene target. Neither the menu nor env.txt turns it on.
+            (void)environmentEnabled;
+            const bool enabled = false;
+#else
             const bool enabled = environmentEnabled >= 0 ? environmentEnabled == 1 : config.dynamicResolution;
+#endif
             if (!enabled || config.upscaler != upscaling::Upscaler::Off || !dynamic_resolution::Supports(configured)) {
                 gpu_busy::g_dynamicResolution.store(false, std::memory_order_relaxed);
                 if (announcedBase) {

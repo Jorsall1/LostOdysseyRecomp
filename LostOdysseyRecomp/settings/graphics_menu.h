@@ -123,6 +123,10 @@ inline bool FsrSharpnessFromEnvironment()
 // Whether dynamic resolution and FSR run with these settings and env.txt.
 inline bool DynamicResolutionOn(const Config& config)
 {
+#if defined(__SWITCH2__)
+    (void)config;
+    return false; // removed on Switch 2 (gpu/frame_plan.cpp)
+#endif
     return DynamicResolutionFromEnvironment() ? gpu::dynamic_resolution::EnvironmentEnabled() == 1 : config.dynamicResolution;
 }
 inline bool FsrOn(const Config& config)

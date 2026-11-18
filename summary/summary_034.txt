@@ -1,0 +1,59 @@
+================================================================================
+LostOdysseyRecomp - Nintendo Switch 2 port
+Summary - TURN 34: black characters = occlusion queries read through the C view
+================================================================================
+Build: NRO md5 83cbd3cd41b693febdd851daa814e94c (Desktop copy matches).
+ELF: build/views_turn34_83cbd3cd.elf. kaiHEN fix untouched.
+Desktop env.txt: LO_GUEST_AFFINITY=1 only.
+
+USER REPORT / EVIDENCE ("lo project": runtime-1795037775449618.log, pictures/)
+  * Photos: battle characters (Kaim, soldiers) are flat black silhouettes with
+    a faint ambient tint and a ghost outline; terrain, sky and HUD are fine.
+  * No "dummy texture" line: every sampled slot had a real texture.
+  * occlusion history f3000: reads 163531, ready 162475, zero 162228.
+  * 85.9 s: "GPU fence wait failed raw_vk=-4", MESA "native: completion join
+    failed: status 7", "submission failed; the primary arena is poisoned";
+    the game closed after the device loss. GPU was at 49 ms a frame at
+    1920x1080 (perf 82.1 s: fps 31.3, gpu_pct 154, 1514 pipelines building).
+
+ROOT CAUSE (black silhouettes)
+  docs/archive/notes/physical-alias-rendering.md (2026-09-04) is this exact
+  bug on PC: D3D GetData (sub_823CF3F0) converts a query record to physical
+  and reads it at 0xC0000000 + physical (cached view), while the GPU writes
+  0xA0000000 + physical. On Switch 2's heap backend C is separate zeroed
+  memory, so every END record read 0, not the sentinel: "ready", 0 pixels.
+  UE3 (sub_823CE960) then clears the primitive's visibility bit and the base
+  pass (sub_823D0500) skips it: skeletal meshes keep only depth/shadow passes.
+  Exactly 13 sites in 11 functions do physical -> 0xC0000000 (`addis
+  rX,rY,-16384` after the inlined MmGetPhysicalAddress): 823CDCA8 x2,
+  823CE2C0, 823CF3F0 x2 (types 9 and 10), 823F0D18, 8270EA78, 827B67E0,
+  827B8378, 827B8F48, 827B9010, 827C08A8, 827C1648.
+
+CHANGES
+  * tools/ppc_codegen.py: retarget_cached_views rewrites those 13 lines to
+    0xA0000000 (+ -1610612736, comment "A view (ppc_codegen.py)"); run by
+    `generate` and by the new `views` command; idempotent. Applied to
+    LostOdysseyRecompLib/ppc (13 sites). Same memory where views alias, so
+    other platforms are unaffected.
+  * Dynamic resolution removed on Switch 2: gpu/frame_plan.cpp never enables
+    it (menu or env.txt); settings::Validate forces dynamicResolution off,
+    Maximum/Minimum rows to Automatic (1080 handheld, 1440 docked) and
+    frame rate 60; Graphics hides Render/Dynamic/Minimum resolution rows;
+    graphics_menu::DynamicResolutionOn is false.
+  * Host extras off on Switch 2 (not in the original game):
+    - title menu "Y: Settings" / "Back: Quit game" footer, the Y shortcut
+      and the Back quit dialog (settings/title_entry.cpp kTitleExtras);
+    - shader preparation bar and achievement toast (gpu/video.cpp).
+    LB + RB debug menu unchanged.
+  * No LB+RB+Start+Select (L+R+Plus+Minus) combo exists in this source or
+    the built ELF strings; the old L+R+Plus+Minus quit was already removed.
+
+OPEN
+  * GPU device loss at 1080p (libounce native completion join status 7).
+    Locked 1080/1440 per user; the battle GPU cost there was ~49 ms before
+    characters drew their base pass, so expect more load now.
+  * Settings menu overlay glitch: still no screenshot of it.
+
+NEXT
+  Battle: characters should be textured and lit; occlusion "zero" should drop
+  well below "ready". Watch for another device loss.

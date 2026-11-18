@@ -42,6 +42,14 @@ constexpr uint32_t ConfirmSound = 0x10000001;
 constexpr uint32_t ProfileError = 0x832631D0;
 // All state belongs to the title guest thread.
 bool entered = false;
+// Switch 2 keeps the retail title menu (2026-11-18): no "Y: Settings" / "Back:
+// Quit game" footer, no Y shortcut into Settings and no Back quit dialog. The
+// debug menu (LB + RB) stays the only host menu there.
+#if defined(__SWITCH2__)
+constexpr bool kTitleExtras = false;
+#else
+constexpr bool kTitleExtras = true;
+#endif
 
 // The menu waits for input and Y would open Settings now.
 bool MenuIdle(uint8_t* base, uint32_t title)
@@ -227,11 +235,11 @@ PPC_FUNC(sub_8234B9B8)
         entered = false;
         LOG_INFO("settings: title entry closed, title state {}", state);
     }
-    const bool idle = MenuIdle(base, title);
+    const bool idle = kTitleExtras && MenuIdle(base, title);
     const bool quitOwnsInput = settings::UpdateTitleQuit(base, idle);
     if (settings::ConsumeTitleShortcut(idle && !quitOwnsInput))
         OpenSettings(ctx, base, title);
-    ReportHint(MenuIdle(base, title) && !quitOwnsInput);
+    ReportHint(kTitleExtras && MenuIdle(base, title) && !quitOwnsInput);
     settings::title_entry::TickWithMenuInputMuted(quitOwnsInput, ctx.r4.u32,
         [base](uint32_t address) { return PPC_LOAD_U32(address); },
         [base](uint32_t address, uint32_t mask) { PPC_STORE_U32(address, mask); },

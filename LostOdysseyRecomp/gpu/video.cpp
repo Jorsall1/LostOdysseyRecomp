@@ -4940,7 +4940,7 @@ namespace gpu::video
     // The achievement-unlocked toast over game frames (ui/achievement_overlay.cpp),
     // uploaded every frame while it animates. The previous present has
     // completed, so the upload buffer can be rewritten.
-    static void DrawAchievementToast(plume::RenderTexture* backBuffer)
+    [[maybe_unused]] static void DrawAchievementToast(plume::RenderTexture* backBuffer)
     {
 #ifdef LO_GPU_PLUME
         if (!g_presentation) return;
@@ -5126,7 +5126,7 @@ namespace gpu::video
     // translucent bar along the bottom edge, filled done/total, fading out once
     // done. Only game frames draw it, so the host menus and prompts hide it. The
     // previous present has completed, so the upload buffer can be rewritten.
-    static void DrawPreparationBar(plume::RenderTexture* backBuffer)
+    [[maybe_unused]] static void DrawPreparationBar(plume::RenderTexture* backBuffer)
     {
 #ifdef LO_GPU_PLUME
         auto& bar = g_preparationBar;
@@ -5825,8 +5825,12 @@ namespace gpu::video
                     DrawTitleHint(backBuffer);
                     if (settingsOverGame)
                         DrawSettingsOverlay(backBuffer, g_menuPixels, menuWidth, menuHeight, g_menuRevision);
+#if !defined(__SWITCH2__)
+                    // Switch 2 draws nothing over the game the original does not
+                    // (2026-11-18): no shader preparation bar, no achievement toast.
                     DrawPreparationBar(backBuffer);
                     DrawAchievementToast(backBuffer);
+#endif
                     if (performanceOverlay)
                         DrawPerformanceOverlay(backBuffer, presentationConfig.performanceOverlay, sourcePlan,
                             sourceWidth, sourceHeight, now);

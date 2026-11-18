@@ -1351,6 +1351,13 @@ bool GraphicsRowHidden(int r)
     // maps, no host AA, AO, filtering, HDR or PC upscalers). The rows that do something here, and the Switch's own:
     // the scene height (Render / Maximum, Dynamic and Minimum resolution) and FSR 1 with its sharpness.
     // Frame rate is pinned at 30, or 30/60 on Switch 2 (Validate). Scene fades Off skips the crossfade's full-screen quad.
+#if defined(__SWITCH2__)
+    // Switch 2: the scene height is locked (1080 handheld, 1440 docked, settings::Validate) and dynamic
+    // resolution is gone, so their rows are too.
+    if (r == int(GraphicsRow::RenderResolution) || r == int(GraphicsRow::DynamicResolution) ||
+        r == int(GraphicsRow::MinimumResolution))
+        return true;
+#endif
     switch (GraphicsRow(r))
     {
     case GraphicsRow::Preset: case GraphicsRow::RenderResolution: case GraphicsRow::DynamicResolution:
@@ -2113,9 +2120,9 @@ void Publish(uint8_t *base, uint32_t config)
             break;
         case GraphicsRow::Preset:
 #if defined(__SWITCH2__)
-            next.help = Tr(L"All use FSR at 60 FPS and a fixed 1080p handheld / 1440p docked scene. Quality: every effect. Balanced: depth of field 50%, no bloom. "
+            next.help = Tr(L"All run at 60 FPS with the scene locked at 1080p handheld / 1440p docked. Quality: every effect. Balanced: depth of field 50%, no bloom. "
                            L"Performance: also no dynamic shadows, motion blur or depth of field.",
-                           L"皆使用 FSR、60 FPS，固定掌機 1080p／主機 1440p。品質：所有效果。平衡：景深 50%，無光暈。效能：另關閉動態陰影、動態模糊與景深。");
+                           L"皆為 60 FPS，畫面鎖定掌機 1080p／主機 1440p。品質：所有效果。平衡：景深 50%，無光暈。效能：另關閉動態陰影、動態模糊與景深。");
 #elif LO_PLATFORM_SWITCH
             next.help = Tr(L"All use FSR at 30 FPS. Quality: fixed 540p, every effect. Balanced: dynamic 360-540p, depth of field 50%, no bloom. "
                            L"Performance: also no dynamic shadows, motion blur or depth of field.",
