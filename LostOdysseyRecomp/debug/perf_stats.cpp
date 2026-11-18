@@ -11,6 +11,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstring>
 #include <iterator>
@@ -270,6 +271,51 @@ Window g_window;
 std::mutex g_lastLineMutex;
 std::string g_lastLine; // the last perf: line, for the debug server's info
 
+// ---------------------------------------------------------------- shutdown
+//
+// The monitor thread wrote a perf: line while the process was ending
+// (runtime log 592.075 s, during fsdevUnmountAll), which the Switch OS reports
+// as an error. It is now a joinable thread that waits on this signal instead
+// of sleeping, and StopMonitor joins it from an std::atexit handler: exit
+// handlers run before libnx unmounts the SD card, so no line of this thread can
+// reach the card during the unmount.
+std::mutex g_stopMutex;
+std::condition_variable g_stopSignal;
+bool g_stopping = false;                 // under g_stopMutex
+std::thread* g_monitorThread = nullptr;  // under g_stopMutex; joined and deleted by StopMonitor
+
+// False when the process is ending: the caller must leave its loop at once.
+bool WaitForInterval(int seconds)
+{
+    std::unique_lock lock(g_stopMutex);
+    if (seconds > 0)
+        g_stopSignal.wait_for(lock, std::chrono::seconds(seconds), [] { return g_stopping; });
+    return !g_stopping;
+}
+
+bool Stopping()
+{
+    std::lock_guard lock(g_stopMutex);
+    return g_stopping;
+}
+
+void StopMonitor()
+{
+    std::thread* thread = nullptr;
+    {
+        std::lock_guard lock(g_stopMutex);
+        g_stopping = true;
+        std::swap(thread, g_monitorThread);
+    }
+    g_stopSignal.notify_all();
+    if (thread)
+    {
+        if (thread->joinable())
+            thread->join();
+        delete thread;
+    }
+}
+
 void MonitorMain()
 {
     os::SetCurrentThreadName("Perf Monitor");
@@ -288,7 +334,8 @@ void MonitorMain()
 #endif
     for (;;)
     {
-        std::this_thread::sleep_for(std::chrono::seconds(config.intervalSeconds));
+        if (!WaitForInterval(config.intervalSeconds))
+            break; // the process is ending: write nothing more
         Window window;
         window.intervals.reserve(4096);
         {
@@ -324,6 +371,8 @@ void MonitorMain()
             Ms(window.sleepNs) / perFrame, Ms(window.presentNs) / perFrame,
             Ms(after.cpIdleNs - before.cpIdleNs) / perFrame, gpu, double(after.draws - before.draws) / perFrame,
             BackendWork(before, after, frames), SceneText(), console, MapText());
+        if (Stopping())
+            break; // shutdown began while this line was built: it must not reach the card
         LOG_NOTICE("{}", line);
         {
             std::lock_guard lock(g_lastLineMutex);
@@ -540,7 +589,18 @@ void Present(const PresentSample& sample)
         if (config.gpu)
             gpu::gpu_busy::g_perf.store(true, std::memory_order_relaxed);
         if (perf)
-            os::DetachThread(std::thread(MonitorMain));
+        {
+            // Joinable and never detached: StopMonitor joins it from an exit
+            // handler, which runs before libnx unmounts the SD card. The thread
+            // object is leaked on purpose so no static destructor can meet a
+            // still-joinable thread and call std::terminate.
+            {
+                std::lock_guard lock(g_stopMutex);
+                if (!g_stopping && !g_monitorThread)
+                    g_monitorThread = new std::thread(MonitorMain);
+            }
+            std::atexit(&StopMonitor);
+        }
         LOG_NOTICE("perf stats: {}, GPU timing {}{}",
             perf ? fmt::format("perf lines every {} s, hitch lines over {}", config.intervalSeconds,
                        config.hitchMs > 0 ? fmt::format("{:.0f} ms", config.hitchMs)

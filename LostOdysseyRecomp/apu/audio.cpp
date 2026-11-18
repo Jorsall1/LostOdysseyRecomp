@@ -15,7 +15,11 @@
 #include <os/switch_platform.h>
 #endif
 #include <SDL3/SDL.h>
+#include <atomic>
+#include <chrono>
 #include <cmath>
+#include <cstdlib>
+#include <thread>
 
 namespace apu
 {
@@ -28,6 +32,16 @@ namespace apu
         std::atomic<uint32_t> g_framesSubmitted{ 0 };
         os::GuestCodeThread g_thread; // runs the guest audio callback
         std::atomic<bool> g_running{ false };
+        // The process is ending (EndProcessToHbmenu -> std::exit(0)). Set by the
+        // exit handler below before libnx unmounts the SD card: from here on the
+        // driver runs no guest callback and nothing on the audio path writes to
+        // the log, the capture files or the card. The runtime log at 591.703 s
+        // showed this thread (td214) still writing during fsdevUnmountAll.
+        std::atomic<bool> g_shuttingDown{ false };
+        // Set by the driver thread as its last action, after its guest thread
+        // context is gone: a GuestCodeThread is detached and cannot be joined,
+        // so StopDriverThread waits for this instead.
+        std::atomic<bool> g_driverExited{ false };
         // A live output change closes the device while guest threads may
         // queue, clear or pause it; every use of g_device holds this lock.
         std::mutex g_deviceMutex;
@@ -48,10 +62,31 @@ namespace apu
         // Frames kept queued ahead of the device. A phone's thermally capped
         // CPU can run the driver thread tens of milliseconds late, so Android
         // keeps ~43 ms instead of ~21 ms; a late wakeup within that catches up.
+        // Switch 2 keeps the same ~43 ms: its output pulls in bursts, and with
+        // ~21 ms the device ran dry over and over (runtime log 445.533 s,
+        // starved=3499) while the loading screen waited on the guest callback.
 #if LO_PLATFORM_ANDROID
+        constexpr uint32_t kQueuedFrames = 8;
+#elif defined(__SWITCH2__)
         constexpr uint32_t kQueuedFrames = 8;
 #else
         constexpr uint32_t kQueuedFrames = 4;
+#endif
+        // Hard cap on the device queue in SubmitFrame: a frame beyond it is
+        // dropped, which is what bounds the queue when the drain wait does not.
+        constexpr uint32_t kQueueCapFrames = kQueuedFrames * 2 > 16 ? kQueuedFrames * 2 : 16;
+#if LO_PLATFORM_SWITCH
+        // Switch 2: the drain wait never holds the guest's audio callback for
+        // more than one frame period, and the queue counts as stuck only after
+        // a full second of being continuously full (across periods), so a burst
+        // no longer clears the whole queue and stalls the loading bar.
+#if defined(__SWITCH2__)
+        constexpr bool kBoundedDrainWait = true;
+        constexpr auto kDrainStallTimeout = std::chrono::milliseconds(1000);
+#else
+        constexpr bool kBoundedDrainWait = false;
+        constexpr auto kDrainStallTimeout = std::chrono::milliseconds(250);
+#endif
 #endif
         // Times a frame found the queue empty (the device ran dry) and times
         // the driver gave up catching up after a stall; logged with the frames.
@@ -73,6 +108,8 @@ namespace apu
         std::atomic<std::chrono::steady_clock::rep> g_resumedAt{ 0 };
         constexpr auto kResumeDrainTimeout = std::chrono::milliseconds(300);
 #endif
+
+        bool ShuttingDown() { return g_shuttingDown.load(std::memory_order_relaxed); }
 
         uint32_t FrameBytes() { return XAUDIO_NUM_SAMPLES * g_channels * sizeof(float); }
 
@@ -153,6 +190,37 @@ namespace apu
             return g_stream ? std::max(0, SDL_GetAudioStreamQueued(g_stream)) / FrameBytes() : 0;
         }
 
+        // Ends the driver thread and closes the device before the process does.
+        // Registered with std::atexit in Init: newlib runs the exit handlers
+        // before libnx's teardown unmounts the SD card, so by the time
+        // fsdevUnmountAll runs this thread is out of the log and out of the card.
+        void StopDriverThread()
+        {
+            g_shuttingDown.store(true, std::memory_order_relaxed);
+            if (!g_running.exchange(false))
+                return; // never started, or already stopped
+            // The driver checks g_running once per 5.3 ms period, so this is the
+            // join: it publishes g_driverExited after its guest thread context
+            // has been destroyed.
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+            while (!g_driverExited.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < deadline)
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            std::lock_guard lock(g_deviceMutex);
+            if (g_stream)
+            {
+                SDL_ClearAudioStream(g_stream);
+                SDL_DestroyAudioStream(g_stream);
+                g_stream = nullptr;
+            }
+            if (g_device)
+            {
+                SDL_PauseAudioDevice(g_device);
+                SDL_CloseAudioDevice(g_device);
+                g_device = 0;
+            }
+            g_outputChannels = 0;
+        }
+
 #if LO_PLATFORM_ANDROID
         // SDL hands the app lifecycle events only to event watchers, on the
         // thread that handles the pause or resume, before the app blocks in the
@@ -192,6 +260,7 @@ namespace apu
         {
             static const char* requestPath = getenv("LO_AUDIO_CAPTURE_REQUEST");
             if (!requestPath) return;
+            if (ShuttingDown()) return; // no SD card writes while the process ends
             static uint64_t serial = 0;
             static uint32_t remaining = 0;
             static std::ofstream output;
@@ -245,145 +314,167 @@ namespace apu
 #else
             os::scheduling::RaiseAudioThreadPriority();
 #endif
-            GuestThreadContext ctx(3);
-            constexpr auto framePeriod = std::chrono::microseconds(1000000ull * XAUDIO_NUM_SAMPLES / XAUDIO_SAMPLES_HZ);
-            auto next = std::chrono::steady_clock::now();
-#if LO_PLATFORM_SWITCH
-            uint64_t ticks = 0, dispatches = 0, stalls = 0;
-            double waitedMs = 0;
-            auto lastReport = next;
-            auto nextReport = next + std::chrono::seconds(10);
-#endif
-            while (g_running)
             {
-                next += framePeriod;
-                // Precise wakeups: a late one drains the few frames SDL has queued.
-                os::scheduling::PreciseSleepUntil(next);
-                // Avoid a burst of catch-up callbacks after a host stall.
-                if (std::chrono::steady_clock::now() - next > framePeriod * kQueuedFrames)
-                {
-                    next = std::chrono::steady_clock::now();
-                    g_clockResets.fetch_add(1, std::memory_order_relaxed);
-                }
-                if (const bool surround = g_surroundRequested; g_audioReady && surround != g_surroundOpen)
-                {
-                    std::lock_guard lock(g_deviceMutex);
-                    g_surroundOpen = surround;
-                    OpenDevice(surround);
-                }
-                else if (!g_outputChannels && g_device) // a request withdrawn before it was applied
-                    g_outputChannels = g_channels;
-#if LO_PLATFORM_ANDROID
-                auto resumed = g_resumedAt.load(std::memory_order_relaxed);
-                bool waited = false;
-#endif
+                GuestThreadContext ctx(3);
+                constexpr auto framePeriod = std::chrono::microseconds(1000000ull * XAUDIO_NUM_SAMPLES / XAUDIO_SAMPLES_HZ);
+                auto next = std::chrono::steady_clock::now();
 #if LO_PLATFORM_SWITCH
-                // Wait for the device to drain, but not forever: an output
-                // that stops pulling (seen on Switch: no sound, one frame ever
-                // reported) must not also stop the guest's audio callbacks.
-                const auto waitStart = std::chrono::steady_clock::now();
-                auto stallStart = waitStart;
+                uint64_t ticks = 0, dispatches = 0, stalls = 0;
+                double waitedMs = 0;
+                auto lastReport = next;
+                auto nextReport = next + std::chrono::seconds(10);
+                // How long the queue has been continuously full, across periods.
+                auto queueFullSince = std::chrono::steady_clock::time_point{};
 #endif
-                while (QueuedFrames() >= kQueuedFrames)
+                while (g_running.load(std::memory_order_relaxed))
                 {
-#if LO_PLATFORM_SWITCH
-                    if (std::chrono::steady_clock::now() - stallStart > std::chrono::milliseconds(250))
+                    next += framePeriod;
+                    // Precise wakeups: a late one drains the few frames SDL has queued.
+                    os::scheduling::PreciseSleepUntil(next);
+                    // Avoid a burst of catch-up callbacks after a host stall.
+                    if (std::chrono::steady_clock::now() - next > framePeriod * kQueuedFrames)
+                    {
+                        next = std::chrono::steady_clock::now();
+                        g_clockResets.fetch_add(1, std::memory_order_relaxed);
+                    }
+                    if (const bool surround = g_surroundRequested; g_audioReady && surround != g_surroundOpen)
                     {
                         std::lock_guard lock(g_deviceMutex);
-                        if (g_paused) // a paused device is meant to hold its queue
-                        {
-                            stallStart = std::chrono::steady_clock::now();
-                            continue;
-                        }
-                        if (g_stream) SDL_ClearAudioStream(g_stream);
-                        ++stalls;
-                        if (stalls == 1 || stalls % 100 == 0)
-                            LOG_WARNING("audio output is not draining ({} stalls); queue cleared", stalls);
-                        break;
+                        g_surroundOpen = surround;
+                        OpenDevice(surround);
                     }
-#endif
+                    else if (!g_outputChannels && g_device) // a request withdrawn before it was applied
+                        g_outputChannels = g_channels;
 #if LO_PLATFORM_SWITCH
-                    // The queue holds about 21 ms: half a frame is fine, and fewer wakeups for the busy threads.
-                    os::scheduling::PreciseSleepFor(std::chrono::microseconds(2500));
+                    // Wait for the device to drain, but not forever: an output
+                    // that stops pulling (seen on Switch: no sound, one frame
+                    // ever reported) must not also stop the guest's audio
+                    // callbacks. Switch 2 (runtime log 445.533 s: starved=3499,
+                    // "audio output is not draining 1 stalls; queue cleared"):
+                    // the output pulls in bursts, so this wait could hold the
+                    // callback for the whole stall timeout and the loading bar
+                    // stopped with it. There the wait is capped at one frame
+                    // period - the device keeps the queue it has and
+                    // SubmitFrame's cap is what bounds it - and the queue is
+                    // cleared only after a second of being full throughout.
+                    const auto waitStart = std::chrono::steady_clock::now();
+                    bool queueFull = false;
+                    while (QueuedFrames() >= kQueuedFrames)
+                    {
+                        queueFull = true;
+                        const auto waitNow = std::chrono::steady_clock::now();
+                        if (queueFullSince == std::chrono::steady_clock::time_point{})
+                            queueFullSince = waitNow;
+                        if (kBoundedDrainWait && waitNow - waitStart >= framePeriod)
+                            break; // the guest callback runs on time, whatever the output does
+                        if (waitNow - queueFullSince > kDrainStallTimeout)
+                        {
+                            std::lock_guard lock(g_deviceMutex);
+                            if (g_paused) // a paused device is meant to hold its queue
+                            {
+                                queueFullSince = std::chrono::steady_clock::now();
+                                continue;
+                            }
+                            if (g_stream) SDL_ClearAudioStream(g_stream);
+                            queueFullSince = std::chrono::steady_clock::time_point{};
+                            ++stalls;
+                            if (!ShuttingDown() && (stalls == 1 || stalls % 100 == 0))
+                                LOG_WARNING("audio output is not draining ({} stalls); queue cleared", stalls);
+                            break;
+                        }
+                        // The queue holds about 21-43 ms: half a frame is fine, and fewer wakeups for the busy threads.
+                        os::scheduling::PreciseSleepFor(std::chrono::microseconds(2500));
+                    }
+                    if (!queueFull)
+                        queueFullSince = std::chrono::steady_clock::time_point{};
+                    waitedMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - waitStart).count();
 #else
-                    os::scheduling::PreciseSleepFor(std::chrono::milliseconds(1));
-#endif
 #if LO_PLATFORM_ANDROID
-                    waited = true;
-                    ReopenIfStalledAfterResume();
+                    auto resumed = g_resumedAt.load(std::memory_order_relaxed);
+                    bool waited = false;
 #endif
-                }
+                    while (QueuedFrames() >= kQueuedFrames)
+                    {
+                        os::scheduling::PreciseSleepFor(std::chrono::milliseconds(1));
 #if LO_PLATFORM_ANDROID
-                // A full queue went below the limit: the device takes audio again.
-                if (resumed && waited) g_resumedAt.compare_exchange_strong(resumed, 0);
+                        waited = true;
+                        ReopenIfStalledAfterResume();
 #endif
-#if LO_PLATFORM_SWITCH
-                waitedMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - waitStart).count();
+                    }
+#if LO_PLATFORM_ANDROID
+                    // A full queue went below the limit: the device takes audio again.
+                    if (resumed && waited) g_resumedAt.compare_exchange_strong(resumed, 0);
+#endif
 #endif
 
-                // LO_AUDIO_SKIP_GUEST=1 (diagnostic only: silence, and the game may wait on its voices): the guest
-                // callback is not called, so neither the XAudio workers' mixing nor the XMA decoding it asks for run.
-                // Measures what the game's audio costs the other threads.
-                static const bool skipGuest = [] {
-                    const char* value = getenv("LO_AUDIO_SKIP_GUEST");
-                    return value && value[0] == '1';
-                }();
-                const auto dispatch = [&](uint32_t frames)
-                {
-                    if (skipGuest) return;
-                    g_guestFramesPerOutput.store(frames, std::memory_order_relaxed);
-                    for (uint32_t i = 0; i < frames; ++i)
+                    // LO_AUDIO_SKIP_GUEST=1 (diagnostic only: silence, and the game may wait on its voices): the guest
+                    // callback is not called, so neither the XAudio workers' mixing nor the XMA decoding it asks for run.
+                    // Measures what the game's audio costs the other threads.
+                    static const bool skipGuest = [] {
+                        const char* value = getenv("LO_AUDIO_SKIP_GUEST");
+                        return value && value[0] == '1';
+                    }();
+                    const auto dispatch = [&](uint32_t frames)
                     {
-                        const bool dispatched = g_client.Dispatch([&](uint32_t callback, uint32_t param)
+                        if (skipGuest || ShuttingDown()) return;
+                        g_guestFramesPerOutput.store(frames, std::memory_order_relaxed);
+                        for (uint32_t i = 0; i < frames; ++i)
                         {
-                            // Unregister can run on another guest thread or
-                            // inside an earlier callback of this boosted group.
-                            // Only this driver touches the processor's state.
-                            if (g_resetFastForwardAudio.load(std::memory_order_relaxed)
-                                && g_resetFastForwardAudio.exchange(false, std::memory_order_relaxed))
+                            const bool dispatched = g_client.Dispatch([&](uint32_t callback, uint32_t param)
                             {
-                                g_fastForwardAudio.Reset();
-                                g_lastAudioSamples.fill(0);
-                            }
-                            ctx.ppcContext.r3.u64 = param;
-                            g_memory.FindFunction(callback)(ctx.ppcContext, g_memory.base);
-                        });
+                                // Unregister can run on another guest thread or
+                                // inside an earlier callback of this boosted group.
+                                // Only this driver touches the processor's state.
+                                if (g_resetFastForwardAudio.load(std::memory_order_relaxed)
+                                    && g_resetFastForwardAudio.exchange(false, std::memory_order_relaxed))
+                                {
+                                    g_fastForwardAudio.Reset();
+                                    g_lastAudioSamples.fill(0);
+                                }
+                                ctx.ppcContext.r3.u64 = param;
+                                g_memory.FindFunction(callback)(ctx.ppcContext, g_memory.base);
+                            });
 #if LO_PLATFORM_SWITCH
-                        if (dispatched) ++dispatches;
+                            if (dispatched) ++dispatches;
 #else
-                        (void)dispatched;
+                            (void)dispatched;
 #endif
+                        }
+                    };
+                    if (const uint32_t rate = debug_menu::fast_forward::AudioRate(); rate > 1)
+                    {
+                        // Up to `rate` guest frames per period, as many as fit in
+                        // three quarters of it, so the output never runs dry.
+                        const uint32_t frames = std::min(rate, g_boostFrames);
+                        const auto start = std::chrono::steady_clock::now();
+                        dispatch(frames);
+                        const auto spent = std::chrono::steady_clock::now() - start;
+                        if (spent > framePeriod * 3 / 4)
+                            g_boostFrames = std::max(2u, frames - 1);
+                        else if (spent < framePeriod / 2 && frames == g_boostFrames)
+                            g_boostFrames = std::min(g_boostFrames + 1, kMaxBoostFrames);
                     }
-                };
-                if (const uint32_t rate = debug_menu::fast_forward::AudioRate(); rate > 1)
-                {
-                    // Up to `rate` guest frames per period, as many as fit in
-                    // three quarters of it, so the output never runs dry.
-                    const uint32_t frames = std::min(rate, g_boostFrames);
-                    const auto start = std::chrono::steady_clock::now();
-                    dispatch(frames);
-                    const auto spent = std::chrono::steady_clock::now() - start;
-                    if (spent > framePeriod * 3 / 4)
-                        g_boostFrames = std::max(2u, frames - 1);
-                    else if (spent < framePeriod / 2 && frames == g_boostFrames)
-                        g_boostFrames = std::min(g_boostFrames + 1, kMaxBoostFrames);
-                }
-                else
-                    dispatch(1);
+                    else
+                        dispatch(1);
 #if LO_PLATFORM_SWITCH
-                ++ticks;
-                if (std::chrono::steady_clock::now() >= nextReport)
-                {
-                    const auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - lastReport).count();
-                    LOG_INFO("audio driver: {:.1f} s ticks={} dispatches={} submitted={} queued_frames={} drain_wait_ms={:.0f} stalls={}",
-                        elapsed, ticks, dispatches, g_framesSubmitted.load(), QueuedFrames(), waitedMs, stalls);
-                    ticks = dispatches = 0;
-                    waitedMs = 0;
-                    lastReport = std::chrono::steady_clock::now();
-                    nextReport = lastReport + std::chrono::seconds(10);
-                }
+                    ++ticks;
+                    if (std::chrono::steady_clock::now() >= nextReport)
+                    {
+                        const auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - lastReport).count();
+                        if (!ShuttingDown())
+                            LOG_INFO("audio driver: {:.1f} s ticks={} dispatches={} submitted={} queued_frames={} drain_wait_ms={:.0f} stalls={}",
+                                elapsed, ticks, dispatches, g_framesSubmitted.load(), QueuedFrames(), waitedMs, stalls);
+                        ticks = dispatches = 0;
+                        waitedMs = 0;
+                        lastReport = std::chrono::steady_clock::now();
+                        nextReport = lastReport + std::chrono::seconds(10);
+                    }
 #endif
+                }
             }
+            // The guest thread context is gone and nothing of this thread will
+            // touch the log or the card again: StopDriverThread may return.
+            g_driverExited.store(true, std::memory_order_release);
         }
     }
 
@@ -404,8 +495,14 @@ namespace apu
         if (g_audioReady) SDL_AddEventWatch(WatchLifecycle, nullptr);
 #endif
         g_running = true;
+        g_driverExited.store(false, std::memory_order_relaxed);
         g_thread = os::GuestCodeThread(DriverMain);
         g_thread.detach();
+        // EndProcessToHbmenu() ends the process with std::exit(0), which runs
+        // these handlers before libnx unmounts the SD card (fsdevUnmountAll).
+        // The driver thread is stopped there, not left running into the unmount.
+        static std::once_flag exitHandler;
+        std::call_once(exitHandler, [] { std::atexit(&StopDriverThread); });
     }
 
     void RegisterClient(uint32_t callback, uint32_t param)
@@ -634,12 +731,13 @@ namespace apu
         if (peak > 0)
             g_everHeardAudio = true;
         uint32_t n = ++g_framesSubmitted;
+        const bool shuttingDown = ShuttingDown();
         CaptureRequested(stereo.data(), n);
         // Bounded diagnostic capture, before mute; raw f32le, 48 kHz stereo.
         static std::ofstream capture;
-        if (n == 1)
+        if (n == 1 && !shuttingDown)
             if (const char* path = getenv("LO_AUDIO_CAPTURE")) capture.open(path, std::ios::binary);
-        if (capture.is_open())
+        if (capture.is_open() && !shuttingDown)
         {
             if (n <= 11250) capture.write(reinterpret_cast<const char*>(stereo.data()), sizeof(stereo));
             else capture.close();
@@ -656,7 +754,7 @@ namespace apu
             surround.fill(0);
         }
         static uint32_t queueDrops = 0, queueErrors = 0;
-        const bool report = n == 1 || (n % 1875) == 0; // every ~10 s
+        const bool report = (n == 1 || (n % 1875) == 0) && !shuttingDown; // every ~10 s
         uint32_t queued = 0;
         {
             std::lock_guard lock(g_deviceMutex);
@@ -665,7 +763,7 @@ namespace apu
                 const float* data = g_channels == 6 ? surround.data() : stereo.data();
                 const int before = SDL_GetAudioStreamQueued(g_stream);
                 if (before == 0 && n > 1) g_starved.fetch_add(1, std::memory_order_relaxed);
-                if (before < int(FrameBytes() * 16))
+                if (before < int(FrameBytes() * kQueueCapFrames))
                 {
                     if (!SDL_PutAudioStreamData(g_stream, data, int(FrameBytes()))) ++queueErrors;
                 }

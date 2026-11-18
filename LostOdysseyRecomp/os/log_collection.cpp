@@ -26,6 +26,21 @@ std::atomic<int> consent{-1};
 constexpr const char* PreferenceFile = "log-collection.ini";
 constexpr size_t MaxLineBytes = 2000;
 
+// The process is ending. StartUpload detaches a thread that sleeps five seconds
+// and then writes "log-collection-sent" and a LOG_INFO line, so without this it
+// can still be writing while the exit path tears the file system down. Set from
+// an std::atexit handler registered in StartUpload: newlib runs exit handlers
+// before any of that teardown, and the flag needs no header change to reach the
+// detached thread.
+//
+// Note for the Switch 2 port: the whole upload path below is inside #ifdef
+// _WIN32, so on Horizon StartUpload is a no-op and this file is NOT one of the
+// threads that can write to the SD card during fsdevUnmountAll. The latch is
+// kept for correctness on the desktop build only.
+std::atomic<bool> shuttingDown{false};
+
+bool ShuttingDown() { return shuttingDown.load(std::memory_order_relaxed); }
+
 char Lower(char c) { return c >= 'A' && c <= 'Z' ? char(c - 'A' + 'a') : c; }
 
 // ASCII case-insensitive, as Windows compares paths.
@@ -265,6 +280,7 @@ bool Post(const std::string& body, std::string& outcome)
 
 void Upload(const std::filesystem::path& directory, uint64_t current, const std::vector<Replacement>& replacements)
 {
+    if (ShuttingDown()) return;
     uint64_t sent = 0;
     std::ifstream(directory / SentFile) >> sent;
     std::optional<std::pair<uint64_t, std::filesystem::path>> previous;
@@ -280,8 +296,11 @@ void Upload(const std::filesystem::path& directory, uint64_t current, const std:
     if (text.empty()) return;
     const auto body = fmt::format(R"({{"schema":1,"build":{},"platform":"windows","text":{}}})", Json(lo_version::Source), Json(text));
     std::string outcome;
-    if (!Enabled()) return;
+    if (!Enabled() || ShuttingDown()) return;
     const bool accepted = Post(body, outcome);
+    // The process may have started ending while the request was in flight: no
+    // file is written and no line is logged once the exit path has begun.
+    if (ShuttingDown()) return;
     if (accepted) std::ofstream(directory / SentFile, std::ios::trunc) << previous->first << '\n';
     LOG_INFO("log collection: session {} ({} bytes) {}", previous->first, text.size(), outcome);
 }
@@ -425,12 +444,25 @@ void StartUpload(const std::filesystem::path& currentLog)
 #ifdef _WIN32
     const auto current = SessionStamp(currentLog);
     if (!Enabled() || !current || getenv("LO_BACKGROUND") || getenv("LO_HEADLESS")) return;
+    // The thread below is detached and cannot be joined, so the exit path gets a
+    // latch instead: newlib runs atexit handlers before the file system is torn
+    // down, and after this the thread writes neither the sent file nor the log.
+    static const bool stopAtExit = std::atexit([] {
+        shuttingDown.store(true, std::memory_order_relaxed);
+    }) == 0;
+    (void)stopAtExit;
     try
     {
         // Startup work comes first; the request itself is a few kilobytes.
         std::thread([directory = currentLog.parent_path(), current = *current, replacements = AccountReplacements()] {
-            std::this_thread::sleep_for(std::chrono::seconds(5));
-            if (!Enabled()) return;
+            // Woken in 100 ms slices so a quit during the first five seconds is
+            // noticed instead of being slept through.
+            for (int slice = 0; slice < 50; ++slice)
+            {
+                if (ShuttingDown()) return;
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+            if (!Enabled() || ShuttingDown()) return;
             try { Upload(directory, current, replacements); }
             catch (...) {}
         }).detach();

@@ -22,6 +22,9 @@
 #include <os/logger.h>
 #if LO_PLATFORM_SWITCH
 #include <os/switch_cpu_profiler.h>
+// SetCurrentThreadPriority for the interrupt and vsync threads (see
+// InterruptMain). A new include only; no header is modified.
+#include <os/switch_platform.h>
 #endif
 #include <os/thread_name.h>
 #include <os/host_scheduling.h>
@@ -76,6 +79,27 @@ std::atomic<uint32_t> g_presentedSwaps{ 0 }; // global mirror for other subsyste
 namespace gpu
 {
     static std::atomic<uint32_t> g_traceBudget{ 0 };
+
+#if LO_PLATFORM_SWITCH
+    // Priority for the two guest-callback threads the command processor blocks
+    // on (GPU Interrupt, GPU Vsync). Horizon schedules strictly by priority
+    // across the three cores, and a WAIT_REG_MEM that waits for the guest's
+    // interrupt handler cannot finish until that handler has been scheduled.
+    // Default 0x2B: above the game's own threads and the audio driver (0x2C),
+    // below SDL's audio output (0x2A). Lower is higher priority on Horizon.
+    // LO_GPU_ISR_PRIORITY overrides it without a rebuild - the tree's own
+    // comments disagree about whether guest threads sit at 0x2C or 0x3B, so
+    // this stays tunable on hardware.
+    static uint32_t GuestCallbackThreadPriority()
+    {
+        static const uint32_t priority = [] {
+            const char* value = getenv("LO_GPU_ISR_PRIORITY");
+            const long parsed = value && *value ? strtol(value, nullptr, 0) : 0x2B;
+            return uint32_t(std::clamp<long>(parsed, 0x00, 0x3F));
+        }();
+        return priority;
+    }
+#endif
 
     // Idle and WAIT_REG_MEM loops pump window events between short waits. On
     // the Switch an SDL pump polls HID and costs ~0.2 ms, so pumping every
@@ -902,6 +926,12 @@ namespace gpu
     void CommandProcessor::VsyncMain()
     {
         os::SetCurrentThreadName("GPU Vsync");
+#if LO_PLATFORM_SWITCH
+        // Same reason as InterruptMain below: this thread also runs the guest's
+        // registered interrupt callback, and at the default pthread priority a
+        // busy loading screen can keep it off all three cores for seconds.
+        os::switch_platform::SetCurrentThreadPriority(GuestCallbackThreadPriority());
+#endif
         GuestThreadContext ctx(2); // Xenia dispatches vblanks on CPU 2
         FramePacer pacer;
         while (m_running)
@@ -960,6 +990,22 @@ namespace gpu
     void CommandProcessor::InterruptMain()
     {
         os::SetCurrentThreadName("GPU Interrupt");
+#if LO_PLATFORM_SWITCH
+        // Horizon schedules strictly by priority across the three cores, and the
+        // command processor blocks in WAIT_REG_MEM until this thread has run the
+        // guest's interrupt handler. Left at the default pthread priority this
+        // thread sits BELOW the game's own threads, so a loading screen that
+        // keeps all three cores busy (render_fence::LoadBoost, movie/XMA decode,
+        // the XAudio workers) can starve it for seconds or minutes while the GPU
+        // waits on it - runtime log 216.990 s, "WAIT_REG_MEM stalled 5s (mem
+        // 0x10002 ref 0x0 mask 0xffffffff value 0x4)", where 0x4 is exactly the
+        // CPU mask this handler is supposed to clear, and five frames then took
+        // 347 s of a 591 s session. The poll loop's former
+        // std::this_thread::yield() made it worse: on Horizon yield donates only
+        // to threads of equal or higher priority, so it could never let this
+        // thread run.
+        os::switch_platform::SetCurrentThreadPriority(GuestCallbackThreadPriority());
+#endif
         GuestThreadContext ctx(2);
         while (m_running)
         {
@@ -1570,14 +1616,7 @@ namespace gpu
                     if (isMemory)
                     {
                         // This stall stays a stall: nothing below releases the wait
-                        // or copies between views. What is logged is the same word
-                        // through the guest's other physical views - A
-                        // (0xA0000000 + offset), C (0xC0000000 + offset) and E
-                        // (0xE0000000 + offset + 0x1000, a page shifted; see
-                        // guest_address_space_switch.cpp) - plus what every guest
-                        // thread is parked on, so a later stall such as
-                        // "mem 0x10002" shows whether the guest wrote through C or E
-                        // instead of the A view.
+                        // or copies between views.
                         const uint32_t wordAddress = pollRegAddr & ~3u;
                         auto viewValue = [&](uint32_t view, uint32_t pageShift)
                         {
@@ -1585,22 +1624,77 @@ namespace gpu
                             auto* word = static_cast<volatile uint32_t*>(g_memory.Translate(address));
                             return fmt::format("{:#x} @ {:#x}", GpuSwap(*word, pollRegAddr & 3), address);
                         };
+#if defined(__SWITCH2__)
+                        // Switch 2 runs Backend::Heap (kernel/guest_address_space_switch.cpp):
+                        // kaiHEN's donor title masks svcMapProcessMemory /
+                        // svcMapProcessCodeMemory / svcMapTransferMemory, so the whole
+                        // 4 GiB window is one memalign block and C and E are separate
+                        // ranges of that block rather than hardware aliases of A -
+                        // "a write through A no longer shows up through C or E".
+                        // Printing them was actively misleading: the 216.990 s stall
+                        // reported "A 0x4 C 0x0 E 0x0", which only means A holds the
+                        // live value and the two unrelated ranges are still zero, not
+                        // that the guest wrote through the wrong view. A only here.
+                        LOG_WARNING("  polled {:#x} (ref {:#x} mask {:#x}) view A {} (heap backend: C and E are "
+                                    "separate ranges of the same block, not aliases, so they say nothing)",
+                            value, ref, mask, viewValue(0xA0000000u, 0x0u));
+#else
+                        // What is logged is the same word through the guest's other
+                        // physical views - A (0xA0000000 + offset), C (0xC0000000 +
+                        // offset) and E (0xE0000000 + offset + 0x1000, a page shifted;
+                        // see guest_address_space_switch.cpp) - which do alias on the
+                        // mapping backends.
                         LOG_WARNING("  polled {:#x} (ref {:#x} mask {:#x}) views: A {} C {} E {}", value, ref, mask,
                             viewValue(0xA0000000u, 0x0u), viewValue(0xC0000000u, 0x0u), viewValue(0xE0000000u, 0x1000u));
+#endif
+                        // What this wait actually depends on. The D3D present sync
+                        // block waits for the guest's interrupt handler to clear the
+                        // CPU mask PM4_INTERRUPT raised (DispatchInterrupt -> the
+                        // "GPU Interrupt" thread), so pending > 0 with completed
+                        // frozen means that thread has not been scheduled, while
+                        // pending == 0 with no callback means no interrupt is
+                        // outstanding at all.
+                        size_t pendingInterrupts = 0;
+                        {
+                            std::lock_guard lock(m_interruptMutex);
+                            pendingInterrupts = m_pendingInterrupts.size();
+                        }
+                        LOG_WARNING("  interrupt handler: completed={} pending={} callback={:#x} poll_ms={} "
+                                    "self_waits={} stage={} swap={}",
+                            m_interruptsCompleted.load(std::memory_order_relaxed), pendingInterrupts,
+                            GetInterruptCallbackSnapshot().callback, wait / 0x100, SelfWaitsEnabled(),
+                            g_workerStage.load(std::memory_order_relaxed), g_swapCount.load());
                         static std::atomic<uint32_t> stallDumps{0};
                         if (stallDumps.fetch_add(1, std::memory_order_relaxed) < 4)
                             ::DumpGuestThreadStates();
                     }
                     deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
                 }
-                if (wait >= 0x100)
+                // Each frame D3D waits here for its interrupt handler to clear
+                // the scratch writeback word. Re-check when any handler completes
+                // rather than always sleeping the whole poll interval.
+                //
+                // Switch: never spin. Horizon schedules strictly by priority and
+                // std::this_thread::yield() donates only to threads of equal or
+                // higher priority, so a packet with wait < 0x100 used to spin this
+                // thread on a performance core while the lower-priority
+                // "GPU Interrupt" thread - the one that clears the very word being
+                // polled - could never be scheduled. That is the 216.990 s stall
+                // (mem 0x10002 stuck at the 0x4 CPU mask) and the five frames that
+                // took 347 s of a 591 s session. A 1 ms floor on the condition
+                // variable wait lets the handler run; a completed interrupt still
+                // wakes this immediately through m_interruptsCompleted, so the
+                // normal case costs nothing. Other platforms keep yielding.
+#if LO_PLATFORM_SWITCH
+                constexpr uint32_t kMinimumPollMs = 1;
+#else
+                constexpr uint32_t kMinimumPollMs = 0;
+#endif
+                if (const uint32_t pollMs = std::max<uint32_t>(wait / 0x100, kMinimumPollMs); pollMs)
                 {
-                    // Each frame D3D waits here for its interrupt handler to clear
-                    // the scratch writeback word. Re-check when any handler completes
-                    // rather than always sleeping the whole poll interval.
                     std::unique_lock lock(m_waitProgressMutex);
                     m_waitProgressWaiters.fetch_add(1);
-                    m_waitProgress.wait_for(lock, std::chrono::milliseconds(wait / 0x100), [&] {
+                    m_waitProgress.wait_for(lock, std::chrono::milliseconds(pollMs), [&] {
                         return m_interruptsCompleted.load(std::memory_order_relaxed) != progress || !m_running ||
                             m_wake.exchange(false, std::memory_order_acq_rel);
                     });
