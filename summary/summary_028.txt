@@ -1,0 +1,32 @@
+================================================================================
+LostOdysseyRecomp - Nintendo Switch 2 port
+Summary - TURN 28: comparison with the Switch 1 base (LostOdysseyNX)
+================================================================================
+Build: NRO md5 55e2c0915a8a97a9ab96c5ab6ca13e7d (commit 5ad59927, Desktop copy
+matches). ELF: build/moviediag_turn28.elf. kaiHEN fix untouched.
+QUESTION: how does the Switch 1 build handle the New Game hang?
+  * Our branch switch2-ouncevk = LostOdysseyNX at b146d2fd (Ad0ky v1.2.0-nx,
+    PR #43; local branch equals origin) + 38 of our commits. Nothing newer
+    upstream to pull.
+  * LostOdysseyNX has no commit about New Game, the opening event, mv_01v or
+    event prepare. There is no special fix there; the game code and the
+    movie/event hooks are the same. Not confirmed that New Game works on
+    the Switch 1 build (ask the user / Ad0ky's issue list).
+  * If it does work there, the cause is one of our Switch 2 differences.
+    The largest: kernel/guest_address_space_switch.cpp "Heap" backend
+    (commit 1eadf13b). On Switch 1 the window is built with
+    svcMapProcessCodeMemory/svcMapProcessMemory, so the Xbox physical views
+    are real aliases (A 0xA0000000+x, C 0xC0000000+x same pages, E
+    0xE0000000+y = A+y+0x1000). On Switch 2 (kaiHEN, no svcMap*) one heap
+    block holds the window and C and E are separate ranges: a write through
+    one view is not seen through another. Earlier scans (boot, 15 s / 40 s)
+    found no data in C/E, but none was taken during the New Game event.
+    Other differences: GuestLockHold (c093a8db), WAIT_REG_MEM view guards
+    (b149b351, 0027b5a8), SEH finally overrides (b16aec41), poll/priority
+    changes (842caa50).
+CHANGE
+  os/switch/switch_runtime.cpp: the movie stall dump (10 s / 30 s) also runs
+  DumpGuestAliasUsage (C/E chunks with data and how they differ from A).
+NEXT
+  Same test as turn 27. Read "event group prepare" (the blocking track) and
+  "guest alias views" (any C/E data written during the event).
