@@ -1,0 +1,62 @@
+================================================================================
+LostOdysseyRecomp - Nintendo Switch 2 port
+Summary - TURN 24: mv_01v stall narrowed: the game never tells the movie to play
+================================================================================
+Build: NRO md5 41b8000c8988c1957c8845f7ca7c7244 (commit 0e8f31de, Desktop copy
+matches). ELF: build/moviediag_turn24_41b8000c.elf. kaiHEN fix untouched.
+LOGS READ (runtime-1795018718436803.log, stderr.log; env.txt =
+LO_GUEST_AFFINITY=1, LO_TRACE_MOVIE=1). User: same loading flashes and hang.
+FINDINGS
+  * 66.779 s "movie trace: start M=0c07b860 mv_01v.wmv lr=827e30e8" (game
+    thread), 66.926 s player created on the rendering thread (t0db7).
+  * Movie status at 10 s and 30 s: GetNextFrame calls 0, movie time 0, host
+    decoder decoded 7 frames and holds 6 queued (first pts 0), no error.
+    -> The host decoder works. The guest never asks for a frame.
+  * LO_TRACE_MOVIE logged only the start: no "update#" (sub_823F0038), no
+    82815010 (the command that runs the first update and then
+    sub_82CE9FD8 resume), no 82813888, no release/close, no slow reads.
+  * Thread dump: still 20 guest threads (same as before the movie: the
+    player has not started its own threads). Nothing blocked on the movie:
+      - Guest Main runs its normal frame loop (209 distinct stacks);
+      - rendering thread t0db7 mostly at 0x827b6304 <- 0x827b549c <-
+        0x823b6554 <- 0x824858a4 (frame work);
+      - job thread t31b1 (wait 16 ms loop at 0x82be3154 <- 0x8285bf54)
+        once seen returning from 0x82815228 = sub_82815208, the movie's
+        stream job (M is itself a job, queued by sub_82850D98(M, 1)).
+      - t6842 (obj 0x7c004060) is a worker fed by Guest Main, still active.
+    No fence wait open for long, no heap lock problem.
+  * So the game is waiting for a condition before it issues the play
+    (82815010) command. The obvious candidate is the movie data stream:
+    sub_828143C8 (called by the job when M+104 >= 2) is a 4-step machine at
+    M+108 that asks the game's streaming for the next chunk through the
+    FMVInfo slot (M+44): +22 = 1 request, +24 dest, +28 size, +40 offset,
+    and waits for +20 == 2 (done), alternating caches M+76 and M+48. If the
+    game's streaming never completes that request, the movie never becomes
+    ready and the game keeps flashing its loading icon.
+GAME FUNCTIONS (new notes)
+  sub_82815248  movie start (game thread): makes info (sub_82814918),
+                sub_82814B68(path), queues M as a job.
+  sub_82815060  player create (rendering thread): M+104 = 2, M+120/124 size,
+                re-queues M as a job (unless M+8 bit 1).
+  sub_82815208  M's job tick: if M+104 >= 2 -> sub_828143C8 (stream step).
+  sub_82813A50  stream request: r5=0 issue (info+22=1 ...), 1 collect.
+  sub_82815308  movie destroy (info+22 = 255).
+  Command vtables (MSVC: COL pointer at vtable-4): 0x82037ba0 -> 82815010,
+  0x82037bd8 -> 828151E0 (create), names "DecMoviePauseCommand",
+  "DecMovieResumeCommand", "DecMovieCommand" next to them.
+CHANGES (diagnostics only)
+  movie/movie_hooks.cpp
+    * Movie keeps M; the status line is followed by "object M=... flags8
+      state104 step108 info status20 request22 dest24 size28 file36
+      offset40 cache48/76 buf/loaded/end jobTicks requests" and raw dumps
+      of M+0..127 and info+0..67.
+    * PPC_FUNC sub_82815208: counts job ticks, logs the first 3.
+    * PPC_FUNC sub_82813A50: counts requests, logs the first 12 with the
+      result, cache loaded bytes and the info slot status.
+NEXT
+  Same test (env.txt unchanged, LO_TRACE_MOVIE=1). Read the 10 s / 30 s
+  object dumps:
+    * step108 stuck at 1 or 3 with status20 != 2: the game's streaming never
+      served the request -> look at the streaming/IO thread (ta264/tc842).
+    * stream fully loaded / step cycling but no 82815010: the wait is
+      elsewhere (event scene); trace the caller at lr 0x827e30e8.
