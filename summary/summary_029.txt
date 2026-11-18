@@ -1,0 +1,58 @@
+================================================================================
+LostOdysseyRecomp - Nintendo Switch 2 port
+Summary - TURN 29: the opening Matinee is prepared but never told to Play
+================================================================================
+Build: NRO md5 5d154f9a32a75daaa8348496b380e607 (Desktop copy matches).
+ELF: build/moviediag_turn29_5d154f9a.elf. kaiHEN fix untouched.
+USER: no sign-in message this time; same hang after New Game.
+LOGS READ (runtime-1795026380449069.log)
+  * Movie start 18.601 s (user started quickly). One event group
+    (0x4323e20, 4 tracks, from lr 0x825776f0): blocked by the movie track
+    (#3) on call 1, all ready on call 7 (18.663 s). Never blocked again.
+  * "guest alias views: C and E hold no data" at 17.6, 30.8, 42.5, 50.7 s:
+    the game does not use the C/E views here. Memory aliasing ruled out.
+  * No "cinematic bars" line at all: no Matinee ever started playing.
+DECODED (with gpu/cinematic_bars.cpp, which already names these as Unreal
+Engine 3 Matinee functions)
+  * sub_82374E28 = Matinee tick; state byte +120 (0x78), jump table
+    0x82374E7C: 1 EA4, 2 FBC (play, updates actors via vtable +368),
+    3 F38 (prepare loop), 4 F24 (start prepare -> 3), 5 F80, 6 F6C,
+    7 ED8, 8 -> nothing (prepared, waiting), 9 FEC, 10 EEC.
+    State 3: sub_825776A0 (each actor's timeline vtable +272 = group
+    prepare sub_82578048) until all ready, then state 8 and +60 |=
+    0x20000000 (prepared).
+  * sub_8280DD20 = Matinee Play: from 8 or 1, if prepared start playing
+    (eventually state 2), else state 6. Callers: sub_82B31720 (script task
+    start), sub_828F8420, sub_828F8550, sub_82A2BEC0, sub_82B31A50,
+    sub_8234B9B8, sub_82360150, sub_82374E28.
+  * So the Matinee sits prepared in state 8 and the script never calls Play.
+    The movie's 2 -> 3 "ready" tick only runs while playing, so it never
+    comes and the cutscene never starts. Something in the scenario script
+    before the Play is waiting (the flashing loading icon).
+OTHER FINDING (not acted on yet)
+  Normal-path __finally funclets (parent: addi r12,r31,N; bl funclet;
+  funclet: addi r31,r12,-N): 28 in total, 3 fixed in cpu/guest_seh_finally.
+  The other 25 also read zeroed parent registers: 82B7AFA8 82B7B0C8 82B7B564
+  82B7BAC8 82B7BBF4 82B7C0B8 82B7E4A0 82B81F38 82B820C4 82B852B4 82B85C08
+  82B85E6C 82B860CC 82B87C54 82B87F8C (CRT range, calls 0x82b7b7c8 /
+  0x82b863f0 / 0x82b7ae18 / 0x82b819c8 / 0x82b7b810, likely stream/lock
+  unlocks) and 82DF1D94 82DF1F7C 82DF2118 82DF24E4 82DF2884 82DF2AC8
+  82DF4164 82DF4600 82DF61D8 82DF6888. List: summary/finally_funclets_turn29.txt
+  (normal-path funclets and the parent registers they read). Candidate for a
+  general recompiler fix.
+CHANGES (gpu/cinematic_bars.cpp)
+  * Trace (LO_MATINEE_TRACE=0 disables): "matinee: <obj> state a -> b
+    flags60 +84 +100 +256" on each state change of a ticked Matinee;
+    "matinee: play <obj> lr state a -> b flags60 result" on each Play;
+    "script task: <task> id state a -> b block lr result" per task state.
+    300 lines max in total.
+  * Experiment, OFF by default: LO_MATINEE_FORCE_PLAY=1 calls Play (the
+    hooked sub_8280DD20) once on a Matinee that has been in state 8 with
+    the prepared flag for 5 s while a native movie shows no frame for 5 s.
+NEXT
+  Run 1 (env unchanged): read the matinee/script task lines: the Matinee
+  should reach state 8 and the last script task before the stall shows
+  what the script is waiting for.
+  Run 2: add LO_MATINEE_FORCE_PLAY=1. If the cutscene then plays and the
+  game continues, the hang is the missing Play; keep tracing the script for
+  a proper fix (the forced Play skips whatever the script waited for).

@@ -4,7 +4,10 @@
 #include <movie/movie_player.h>
 #include <os/logger.h>
 #include <atomic>
+#include <chrono>
+#include <cstdlib>
 #include <mutex>
+#include <unordered_map>
 #include <unordered_set>
 
 extern "C" PPC_FUNC(__imp__sub_828F7840);
@@ -72,6 +75,43 @@ void Matinee(uint32_t object, uint8_t* base)
 }
 }
 
+// Switch 2 New Game hang (2026-11-18, summary_029): the opening Matinee is
+// prepared (state 8, +60 bit 0x20000000) but its Play (sub_8280DD20) never
+// comes, so its mv_01v movie track is never ticked again and the movie never
+// starts. Diagnostics: Matinee state changes, Play calls and script task
+// starts are logged (LO_MATINEE_TRACE=0 turns them off). Experiment, off by
+// default: LO_MATINEE_FORCE_PLAY=1 calls Play on a Matinee that has sat
+// prepared in state 8 for 5 s while a cutscene movie shows no frame.
+namespace
+{
+bool MatineeTrace()
+{
+    static const bool enabled = [] {
+        const char* v = std::getenv("LO_MATINEE_TRACE");
+        return !(v && v[0] == '0');
+    }();
+    return enabled;
+}
+bool MatineeForcePlay()
+{
+    static const bool enabled = [] {
+        const char* v = std::getenv("LO_MATINEE_FORCE_PLAY");
+        return v && v[0] == '1';
+    }();
+    return enabled;
+}
+std::mutex traceMutex;
+uint32_t traceLines = 0;
+constexpr uint32_t kTraceLines = 300;
+struct MatineeWatch
+{
+    uint8_t state = 0xFF;
+    std::chrono::steady_clock::time_point preparedSince{};
+    bool forced = false;
+};
+std::unordered_map<uint32_t, MatineeWatch> watches; // protected by traceMutex
+}
+
 void gpu::cinematic_bars::UpdatePause(uint8_t* base)
 {
     // Both native pause draws (823184B0 / 82376BD8) gate on this byte.
@@ -122,11 +162,27 @@ PPC_FUNC(sub_828F7840)
 }
 PPC_FUNC(sub_82B31720)
 {
-    const uint32_t task = ctx.r3.u32;
+    const uint32_t task = ctx.r3.u32, lr = uint32_t(ctx.lr);
+    const uint8_t before = Object(task) ? PPC_LOAD_U8(task + 1) : 0xFF;
     const bool starting = Object(task) && PPC_LOAD_U8(task + 1) == 2 && !PPC_LOAD_U8(0x832CB774);
     if (starting) Track(tasks, task, true, base);
     __imp__sub_82B31720(ctx, base);
     if (starting && !(ctx.r3.u32 & 0xFF)) Track(tasks, task, false, base);
+    if (MatineeTrace())
+    {
+        // Script tasks (switch2 diagnostics): log each task once per state it is seen in.
+        static std::unordered_map<uint32_t, uint8_t> seen;
+        std::lock_guard lock(traceMutex);
+        auto [it, inserted] = seen.try_emplace(task, before);
+        if ((inserted || it->second != before) && traceLines < kTraceLines)
+        {
+            ++traceLines;
+            it->second = before;
+            LOG_NOTICE("script task: {:#x} id={:#x} state {} -> {} block={} lr={:#x} result={}", task,
+                Object(task) ? PPC_LOAD_U32(task + 4) : 0, before, Object(task) ? PPC_LOAD_U8(task + 1) : 0xFF,
+                PPC_LOAD_U8(0x832CB774), lr, ctx.r3.u32 & 0xFF);
+        }
+    }
 }
 PPC_FUNC(sub_82B322D8)
 {
@@ -146,20 +202,69 @@ PPC_FUNC(sub_82B31538)
 // Preparation states 4/8/10/11 never activate bars by themselves.
 PPC_FUNC(sub_8280DD20)
 {
-    const uint32_t object = ctx.r3.u32;
+    const uint32_t object = ctx.r3.u32, lr = uint32_t(ctx.lr);
+    const uint8_t before = Object(object) ? PPC_LOAD_U8(object + 0x78) : 0xFF;
     if (Object(object))
     {
-        const uint8_t state = PPC_LOAD_U8(object + 0x78);
+        const uint8_t state = before;
         if (state == 1 || state == 8 || state == 9) Track(matinees, object, true, base);
     }
     __imp__sub_8280DD20(ctx, base);
     Matinee(object, base);
+    if (MatineeTrace())
+    {
+        std::lock_guard lock(traceMutex);
+        if (traceLines < kTraceLines)
+        {
+            ++traceLines;
+            LOG_NOTICE("matinee: play {:#x} lr={:#x} state {} -> {} flags60={:#x} result={}", object, lr, before,
+                Object(object) ? PPC_LOAD_U8(object + 0x78) : 0xFF, Object(object) ? PPC_LOAD_U32(object + 60) : 0,
+                ctx.r3.u32 & 0xFF);
+        }
+    }
 }
 PPC_FUNC(sub_82374E28)
 {
     const uint32_t object = ctx.r3.u32;
     __imp__sub_82374E28(ctx, base);
     Matinee(object, base);
+    if (!MatineeTrace() || !Object(object)) return;
+    const uint8_t state = PPC_LOAD_U8(object + 0x78);
+    const uint32_t flags = PPC_LOAD_U32(object + 60);
+    bool force = false;
+    {
+        std::lock_guard lock(traceMutex);
+        auto& watch = watches[object];
+        const auto now = std::chrono::steady_clock::now();
+        if (watch.state != state)
+        {
+            if (traceLines < kTraceLines)
+            {
+                ++traceLines;
+                LOG_NOTICE("matinee: {:#x} state {} -> {} flags60={:#x} +84={} +100={} +256={}", object, watch.state,
+                    state, flags, PPC_LOAD_U32(object + 84), PPC_LOAD_U32(object + 100), PPC_LOAD_U32(object + 256));
+            }
+            watch.state = state;
+            watch.preparedSince = now;
+        }
+        if (MatineeForcePlay() && !watch.forced && state == 8 && (flags & 0x20000000u) &&
+            now - watch.preparedSince >= std::chrono::seconds(5) && movie::NativeMovieStallMs() >= 5000)
+        {
+            watch.forced = true;
+            force = true;
+        }
+    }
+    if (force)
+    {
+        LOG_WARNING("matinee: {:#x} prepared for 5 s without Play while the cutscene movie waits; calling Play "
+                    "(LO_MATINEE_FORCE_PLAY=1)", object);
+        const PPCRegister r3 = ctx.r3;
+        const uint64_t lr = ctx.lr;
+        ctx.r3.u64 = object;
+        sub_8280DD20(ctx, base); // the hooked Play above: bars and trace see it
+        ctx.r3 = r3;
+        ctx.lr = lr;
+    }
 }
 PPC_FUNC(sub_82810800)
 {
