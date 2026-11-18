@@ -385,8 +385,8 @@ namespace debug_menu
                     if (!settings::quit_action::PushQuit())
                     {
                         ToggleOverlayLocked();
-                        SetOverlayStatus(Pick(language, L"Quit could not be queued: hold L + R + Plus + Minus",
-                            L"无法排入退出请求：请按住 L + R + + + -", L"No se pudo salir: mantén L + R + Más + Menos"));
+                        SetOverlayStatus(Pick(language, L"Quit could not be queued: press HOME and close the game",
+                            L"无法排入退出请求：请按 HOME 键并关闭游戏", L"No se pudo salir: pulsa HOME y cierra el juego"));
                     }
                     return;
                 }
@@ -692,9 +692,9 @@ namespace debug_menu
                     Pick(language, L"Ends the game and returns to the homebrew menu. Unsaved progress is lost.",
                         L"结束游戏并返回自制软件菜单。未保存的进度将丢失。",
                         L"Cierra el juego y vuelve al menú homebrew. Se pierde el progreso sin guardar."),
-                    Pick(language, L"If the game is frozen, hold L + R + Plus + Minus instead.",
-                        L"如果游戏卡死，请改为按住 L + R + + + -。",
-                        L"Si el juego está bloqueado, mantén L + R + Más + Menos."),
+                    Pick(language, L"If the game is frozen, press HOME and close it instead.",
+                        L"如果游戏卡死，请改为按 HOME 键关闭游戏。",
+                        L"Si el juego está bloqueado, pulsa HOME y ciérralo."),
                 };
                 for (int line = 0; line < 2; ++line)
                     r.DrawWString(panelX + (panelW - r.MeasureWString(help[line])) / 2, helpY + line * 22, help[line],

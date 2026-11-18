@@ -4368,10 +4368,10 @@ PPC_FUNC(sub_822F19B0)
         // SDL_EVENT_QUIT, the GPU owner thread stops the command processor and
         // leaves through EndProcessToHbmenu (next load sdmc:/hbmenu.nro, applet
         // exit lock released, libnx's application exit). If there is no event
-        // queue the watchdog's L + R + Plus + Minus and HOME -> X still exit.
+        // queue, HOME -> X (polled by the watchdog thread) still exits.
         if (!quit_action::PushQuit())
-            status = Tr(L"The quit could not be queued. Try again, or hold L + R + Plus + Minus.",
-                        L"無法排入退出要求。請再試一次，或按住 L + R + + + -。");
+            status = Tr(L"The quit could not be queued. Try again, or press HOME and close the game.",
+                        L"無法排入退出要求。請再試一次，或按 HOME 鍵關閉遊戲。");
     }
 #endif
     if ((input & 0x1000) && tab == 3 && row == SystemImportRow)

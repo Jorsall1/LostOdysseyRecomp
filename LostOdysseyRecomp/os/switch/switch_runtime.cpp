@@ -618,7 +618,7 @@ bool ShouldEndThisThread()
     __builtin_unreachable();
 }
 
-// Every exit path ends here: the L+R+Plus+Minus watchdog, the title's Quit,
+// Every exit path ends here: the title's Quit,
 // Settings and debug menu "Quit to hbmenu", HOME -> X, and the crash paths.
 [[noreturn]] void EndProcessToHbmenu()
 {
@@ -1411,8 +1411,7 @@ void SetScreenAwake(uint32_t mask, uint32_t reasons)
 }
 
 #if defined(__SWITCH2__)
-// Below: L + R + Plus + Minus held for 1.5 s flushes the logs and leaves to the
-// HOME menu even when the guest, the render thread or a loading screen hangs.
+// Below: the watchdog thread (HOME -> X while the game hangs, guest diagnostics).
 void StartExitWatchdog();
 #endif
 
@@ -1630,57 +1629,28 @@ void ForceExitWithoutTeardown()
 #if defined(__SWITCH2__)
 namespace
 {
-// L + R + Plus + Minus, held together: the way out of a frozen game. The pad is
-// read on its own libnx thread straight from HID's shared memory, so the
-// combination still works while the applet's HOME handling (SDL runs it on the
-// event thread, which a hung GPU or guest thread can keep out of the loop) and
-// every guest thread are stuck.
+// The watchdog thread: HOME -> X while the game is stuck, and the 15 s / 40 s
+// guest diagnostics. It runs on its own libnx thread, so both still work while
+// SDL's event thread, the GPU and every guest thread are stuck. (The old
+// L + R + Plus + Minus quit combo is gone: L + R opens the debug menu, which
+// has Quit to hbmenu.)
 Thread g_exitWatchThread;
 bool g_exitWatchStarted = false;
 constexpr uint64_t kExitWatchPollNs = 100'000'000ull; // 100 ms
-constexpr auto kExitWatchHold = std::chrono::milliseconds(1500);
-// Time the normal quit (SDL_EVENT_QUIT -> GPU owner cleanup -> exit_code=0) gets
-// before this thread ends the process itself. 4 s, not 2: the GPU worker leaves
-// a WAIT_REG_MEM within microseconds of RequestStopForExit and the owner's
-// Shutdown then finishes in well under a second on a healthy build, so this is
-// pure headroom for a slow first-ever GPU teardown (Vulkan device destroy, SD
-// flush) - and it keeps the live-thread std::exit below as the last resort it is
-// meant to be, instead of racing a teardown that was still making progress.
-constexpr auto kExitWatchGrace = std::chrono::milliseconds(4000);
 // A guest thread dump 15 s in, whether or not the GPU stalled: a screen that
 // stops progressing with frames still presenting (the 100% loading bar) leaves
 // no other trace of which guest thread is waiting and on what.
 constexpr auto kGuestDumpAfter = std::chrono::seconds(15);
 constexpr auto kSecondGuestDumpAfter = std::chrono::seconds(40);
 
-// The watchdog's way out. It has already asked the game to quit the normal way
-// (SDL_EVENT_QUIT), and the GPU owner's cleanup did not finish in time, so the
-// teardown happens here: logs drained, audio muted, exit unlocked, libnx's own
-// application exit (EndProcessToHbmenu).
-[[noreturn]] void ExitToHbmenu()
-{
-    EndProcessToHbmenu();
-}
-
 void ExitWatchdogMain(void*)
 {
-    // Own pad state, so it does not depend on SDL's controller handling having
-    // started or on the main thread ever running again.
-    hidInitialize();
-    padConfigureInput(1, HidNpadStyleSet_NpadStandard);
-    PadState pad;
-    padInitializeDefault(&pad);
-    constexpr uint64_t combo = HidNpadButton_L | HidNpadButton_R | HidNpadButton_Plus | HidNpadButton_Minus;
-    std::chrono::steady_clock::time_point heldSince{};
-    bool quitting = false;
-    std::chrono::steady_clock::time_point quitSince{};
     const auto started = std::chrono::steady_clock::now();
     int guestDumps = 0;
     for (;;)
     {
         svcSleepThread(int64_t(kExitWatchPollNs)); // a kernel sleep: nothing else has to run
         const auto now = std::chrono::steady_clock::now();
-
         // The GPU-stall watchdog in gpu/command_processor.cpp only dumps when
         // swaps stop. A fade or loading bar that keeps presenting while the
         // guest waits never reaches it, so dump here as well: at 15 s, and at
@@ -1703,28 +1673,6 @@ void ExitWatchdogMain(void*)
                 std::fprintf(stderr, "[watchdog] guest diagnostics %d done\n", guestDumps);
             }
         }
-
-        if (quitting)
-        {
-            if (now - quitSince < kExitWatchGrace)
-                continue;
-            // stderr here: this file does not include os/logger.h (libnx's Mutex
-            // and Event typedefs collide with the runtime's), and stderr goes to
-            // stderr.log and the network log.
-            std::fprintf(stderr, "[watchdog] the quit did not finish within 4 s: ending the process for hbmenu "
-                                 "(applet exit unlocked, libnx teardown)\n");
-            ExitToHbmenu();
-        }
-
-        padUpdate(&pad);
-        const bool comboHeld = (padGetButtons(&pad) & combo) == combo;
-        if (!comboHeld)
-            heldSince = {};
-        else if (heldSince == std::chrono::steady_clock::time_point{})
-            heldSince = now;
-        const bool comboDone = comboHeld && heldSince != std::chrono::steady_clock::time_point{} &&
-                               now - heldSince >= kExitWatchHold;
-
         // HOME -> X: am asks the applet to exit. SDL's Switch driver turns that
         // into SDL_EVENT_QUIT - the clean shutdown that logged exit_code=0 - but
         // only while the main loop pumps events, which a hung game never does;
@@ -1732,22 +1680,12 @@ void ExitWatchdogMain(void*)
         // the game stays a normal quit even when the renderer is stuck.
         const bool appletQuit = !appletMainLoop();
         // HOME -> X, whichever thread took the message: close for the system
-        // (CloseForHomeMenu), not the quit to hbmenu below.
+        // (CloseForHomeMenu), not the quit to hbmenu.
         if (appletQuit || g_homeCloseRequested.load(std::memory_order_acquire))
         {
             std::fprintf(stderr, "[watchdog] HOME -> X: the system asked the game to close; releasing the exit lock\n");
             CloseForHomeMenu();
         }
-        if (!comboDone)
-            continue;
-
-        quitting = true;
-        quitSince = now;
-        std::fprintf(stderr, "[watchdog] %s: asking the game to quit cleanly (SDL_EVENT_QUIT); "
-                             "if it does not finish in 4 s the process ends here\n",
-                     comboDone ? "L+R+Plus+Minus held for 1.5 s" : "the applet requested exit (HOME -> X)");
-        if (!settings::quit_action::PushQuit())
-            quitSince -= std::chrono::milliseconds(1500); // no event queue: go to the teardown sooner
     }
 }
 } // namespace

@@ -9,6 +9,9 @@
 #include <mutex>
 #include <string>
 #include <vector>
+#include <unwind.h>
+#include <iterator>
+#include <utility>
 #include <os/logger.h>
 #include <kernel/memory.h>
 #include <patches/occlusion_history.h>
@@ -208,12 +211,81 @@ bool render_fence::LongWait()
     return since && NowMs() - since >= 250;
 }
 
+// Host call stack of a fence waiter (Switch 2 loading hold, turn 19). The guest
+// back chain stops at the first function that saves LR through __savegprlr
+// (the recompiler drops that store), so the 15 s dump only reached
+// 0x82484c24 for [Guest Main]. Every guest function is a host function with
+// its own .eh_frame entry, so the host unwinder walks the whole chain. Each
+// frame is printed as the guest function that contains it (nearest
+// PPCFuncMappings entry below the host PC; overridden functions resolve to
+// their wrapper's neighbour, so check them against the raw offset) and the
+// offset from _start for addr2line against the build's ELF.
+extern "C" void _start();
+namespace
+{
+    struct HostTrace
+    {
+        uintptr_t pcs[64];
+        int count = 0;
+    };
+
+    _Unwind_Reason_Code CollectHostFrame(_Unwind_Context* context, void* arg)
+    {
+        auto* trace = static_cast<HostTrace*>(arg);
+        if (trace->count >= int(std::size(trace->pcs)))
+            return _URC_END_OF_STACK;
+        trace->pcs[trace->count++] = uintptr_t(_Unwind_GetIP(context));
+        return _URC_NO_REASON;
+    }
+
+    uint32_t GuestFunctionAt(uintptr_t pc)
+    {
+        static const std::vector<std::pair<uintptr_t, uint32_t>> sorted = [] {
+            std::vector<std::pair<uintptr_t, uint32_t>> v;
+            for (size_t i = 0; PPCFuncMappings[i].guest != 0; i++)
+                if (PPCFuncMappings[i].host)
+                    v.emplace_back(reinterpret_cast<uintptr_t>(PPCFuncMappings[i].host), PPCFuncMappings[i].guest);
+            std::sort(v.begin(), v.end());
+            return v;
+        }();
+        auto it = std::upper_bound(sorted.begin(), sorted.end(), std::make_pair(pc, UINT32_MAX));
+        return it == sorted.begin() ? 0 : std::prev(it)->second;
+    }
+
+    // Three traces: 12 s, 20 s and 30 s after the first fence wait.
+    void MaybeLogFenceWaiterStack(const PPCContext& ctx)
+    {
+        static const uint64_t first = NowMs();
+        static std::atomic<int> taken{0};
+        constexpr uint64_t kAtMs[] = {12000, 20000, 30000};
+        const int index = taken.load(std::memory_order_relaxed);
+        if (index >= int(std::size(kAtMs)) || NowMs() - first < kAtMs[index])
+            return;
+        int expected = index;
+        if (!taken.compare_exchange_strong(expected, index + 1, std::memory_order_acq_rel))
+            return;
+        HostTrace trace;
+        _Unwind_Backtrace(CollectHostFrame, &trace);
+        const uintptr_t start = reinterpret_cast<uintptr_t>(&_start);
+        std::string line;
+        for (int i = 0; i < trace.count; ++i)
+        {
+            const uintptr_t pc = trace.pcs[i];
+            const uint32_t guest = GuestFunctionAt(pc - 1);
+            line += fmt::format(" {:#x}+{:#x}", guest, pc - start);
+        }
+        LOG_WARNING("fence waiter host stack {} at {} s: pcr={:#x} lr={:#x} frames={} (guest fn+host offset):{}",
+            index + 1, (NowMs() - first) / 1000, ctx.r13.u32, uint32_t(ctx.lr), trace.count, line);
+    }
+}
+
 // FRenderCommandFence::Wait: this guest loop repeatedly invokes Sleep(0) while
 // a shared value exceeds its threshold. Keep its original reads and comparison;
 // opt in only this call tree. Guest thread exit uses longjmp: no objects with
 // destructors here.
 PPC_FUNC(sub_82322478)
 {
+    MaybeLogFenceWaiterStack(ctx);
     if (g_fenceWaiters.fetch_add(1, std::memory_order_acq_rel) == 0)
         g_fenceWaitSinceMs.store(NowMs(), std::memory_order_release);
     GuestLockHold::Park();
