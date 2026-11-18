@@ -1,0 +1,62 @@
+================================================================================
+LostOdysseyRecomp - Nintendo Switch 2 port
+Summary - TURN 20: turn-19 log read; one copy of each log; fence wait dump
+================================================================================
+NRO md5 d3bd38a02060ccf6c86338f78189cb66 (Desktop copy matches). Commit 86b3f03a.
+ELF for addr2line: build/hangdiag_turn20_d3bd38a0.elf (turn-19 ELF deleted).
+kaiHEN fix (5cde9314) untouched.
+
+LOG READ (runtime-1795012123454119.log, stderr.log)
+  * stderr.log WAS rewritten: Switch Initialize opens it with "w" every launch
+    (the old one was renamed stderr.previous.log and moved to state/logs).
+    Same size as last time because the output is the same.
+  * Note: the "build: revision=" line still says 89c9a930-dirty; it is set at
+    CMake configure time, so it does not track later commits.
+  * No "fence waiter host stack" line. Reason: Guest Main entered ONE fence
+    wait at about 3.7 s and never returned; the trace was taken on entry only,
+    and the 12 s threshold was not reached at any entry.
+  * This changes the picture from summary_017/018: Guest Main is not cycling
+    frame by frame. It sits in a single FRenderCommandFence::Wait from
+    FlushRenderingCommands (sub_82485C18 <- sub_82485030 <- sub_82484BE8),
+    while the rendering thread keeps finding its command ring empty and draws
+    the wheel. Either the fence command never reached the ring, or it ran
+    and the counter did not drop to the threshold, or the rendering thread
+    reads the ring wrong (wrap logic in sub_82485CD8).
+  * 3.736 s: GuestLockHold handed heap lock 0x510610 (recursion 422) from
+    Guest Main to the blocked thread during that wait, so it is the same wait.
+
+CHANGES
+  Logs (Switch only)
+    * os/switch/switch_runtime.cpp Initialize: removes stderr.previous.log,
+      crash.log, crash_report.txt, hang.log, exit.log and cpu-samples.bin from
+      sdmc:/switch/LostOdysseyRecomp at launch; stderr.log is opened "w" (no
+      more rename). early_boot.log was already "w".
+    * main.cpp: no more ArchiveSessionFiles on Switch (nothing left to move).
+    * os/log_file.cpp: kKeptOthers 9 -> 0 on Switch, so state/logs keeps only
+      the current runtime-<digits>.log and shader-<digits>.jsonl. Old
+      stderr-/crash-/hang-/exit- companions there are pruned on the next
+      launch. The name still carries the session number.
+  cpu/poll_wait.cpp (diagnostics only)
+    * Every FRenderCommandFence::Wait records, on entry: counter address,
+      value, threshold, pcr, lr and the host stack (_Unwind_Backtrace), in one
+      of 4 slots, cleared on return.
+    * Overrides sub_822D6BB0 (fence enqueue) and sub_823B6650 (fence execute)
+      and records events: enqueue (counter, write ptr before/after, counter
+      after), execute (command, counter, counter after, read ptr), wait
+      begin/end. Last 32 kept.
+    * render_fence::CommandBegin records every queued command the rendering
+      thread runs (command, vtable, execute fn, read ptr). Last 32 kept.
+    * DumpFenceWaiters(), called by the watchdog at 15 s and 40 s: ring
+      0x8336A7A4 pointers (+0 start, +8 write, +12 end, +20 read), the
+      threaded-rendering flag, each open wait with its counter's current
+      value and host stack, then both event lists.
+TEST
+  Same env.txt. Wait past 45 s on the loading screen, HOME -> X. Send
+  state/logs/runtime-*.log (only one now) and stderr.log.
+WHAT TO LOOK FOR
+  * "fence wait open N ms ... counter@X = V": V > threshold means the fence
+    command did not run (or ran and something re-incremented).
+  * Last fence events: is there an "enqueue" for counter X right before the
+    hang, did its write pointer move, and is there an "execute" for it?
+  * Ring: write == read with the enqueue's write-after != read means the
+    rendering thread skipped it.
