@@ -1,0 +1,59 @@
+================================================================================
+LostOdysseyRecomp - Nintendo Switch 2 port
+Summary - TURN 23: New Game hangs in the first cutscene movie (mv_01v)
+================================================================================
+Build: NRO md5 dc36be81df5edd7fb0546c6ebd9308ea (commit 5b7bf66f, Desktop copy
+matches). ELF: build/moviediag_turn23_dc36be81.elf. kaiHEN fix untouched.
+USER REPORT
+  Settings flicker when starting a new game, a green flash while loading, then
+  the game sits on the loading screen.
+LOGS READ ("lo project" folder: runtime-1795017220442131.log, stderr.log,
+exit.log, early_boot.log, env.txt)
+  * env.txt now has only LO_GUEST_AFFINITY=1 (LO_KERNEL_TRACE removed).
+  * exit.log: HOME -> X, clean. No crash, fatal or exception lines.
+  * Boot and title screen fine (SEH finally fix active, no heap lock handover).
+  * 59.8 s settings menu closed; 62.5 s New Game: fast load of battle 1
+    (u10_b1_scrw) finished in 434 ms; xenon_battle/scr/obj/event.fpd opened.
+  * 64.758 s "native movie: mv_01v.wmv 1280x720 video track 3 ... player
+    0x1ccef10". After that, nothing about the movie for 99 s:
+      - no "first frame at", no "finished", no "failed" line;
+      - audio peak=0 in every 10 s report (the guest player plays the movie
+        sound, so the guest player itself is not progressing);
+      - 60 fps presenting, draws=3-4 per frame (the movie quad / black);
+      - Guest Main 91-94% CPU the whole time (was ~6% on the title screen),
+        one Guest 82beca90 thread ~24%; no Movie Decoder thread in the top
+        list (its 6-frame queue is probably full and it waits).
+  * So the hang is the cutscene, not a loading screen: Guest Main spins while
+    the WMV player never delivers a frame or sound. The green flash fits the
+    movie's Y/U/V textures still being zero (YUV 0,0,0 = green).
+  * The dynamic-resolution steps (612 -> 1080 rows during the movie) and
+    "new color target" lines are expected; the earlier Settings frames
+    (draws=145, 150 ms hitches while pipelines compiled) are the likely
+    "flicker".
+  * No dump covers the movie: the watchdog dumps only at 15 s and 40 s.
+CHANGES (diagnostics only)
+  movie/wmv_stream.{h,cpp}: Status(queued, frontPtsMs, ended).
+  movie/movie_hooks.cpp
+    * Per-movie counters in the GetNextFrame hook (sub_823F0FA8): calls,
+      no-new-frame, guest-wrote, errors, last result, movie time.
+    * Logs the first 3 GetNextFrame results, then "native movie: <name>
+      status (no frame yet): ..." every 2 s until a frame is shown.
+    * movie::NativeMovieStallMs() / movie::LogNativeMovieState().
+  os/switch/switch_runtime.cpp (watchdog)
+    * When a native movie has shown no frame for 10 s and again at 30 s:
+      movie status, DumpGuestThreadStates, DumpHangWatch,
+      DumpGuestHotStacks (Guest Main's spin loop), DumpFenceWaiters.
+      stderr: "[watchdog] movie without a frame for N ms" / "movie
+      diagnostics N done".
+WHAT TO LOOK FOR NEXT
+  * No "GetNextFrame #1" line: the movie update never asks for a frame; the
+    player is stuck before playback (open/preroll/read callback). Hot stacks
+    then show where.
+  * GetNextFrame calls with only errors / no-new: the guest player has no
+    samples; check the read callback trace (LO_TRACE_MOVIE=1 logs reads that
+    waited) and the stream cache.
+  * Host decoded 0: the host decoder or demuxer is stuck.
+TEST
+  env.txt: keep LO_GUEST_AFFINITY=1, add LO_TRACE_MOVIE=1.
+  New Game, wait on the stuck screen at least 40 s, then HOME -> X.
+  Optional A/B run: LO_NATIVE_MOVIES=0 (guest decoder only).
