@@ -34,6 +34,7 @@
 #endif
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -88,6 +89,11 @@ struct Movie
     uint32_t lastPts = 0;
     bool loggedEnd = false;
     bool failed = false;
+    // Diagnostics (2026-11-18: mv_01v never showed a frame after New Game).
+    std::chrono::steady_clock::time_point openedAt = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point lastStatusAt{};
+    uint32_t calls = 0, noNew = 0, guestWrote = 0, errors = 0;
+    uint32_t lastResult = 0, lastTimeMs = 0;
 #if LO_PLATFORM_SWITCH
     uint32_t guestVideoThread = 0;
     int guestVideoPriority = -1;
@@ -238,6 +244,22 @@ void LogEnd(Movie& movie, const char* why)
                decoded, seconds > 0 ? decoded / seconds : 0.0, movie.shown, movie.late,
                movie.stream->LastError().empty() ? "" : ", error: ", movie.stream->LastError());
 }
+
+// Caller holds g_mutex.
+void LogStatus(Movie& movie, const char* why)
+{
+    size_t queued = 0;
+    uint32_t frontPts = 0;
+    bool ended = false;
+    if (movie.stream) movie.stream->Status(queued, frontPts, ended);
+    const auto age = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - movie.openedAt);
+    LOG_WARNING("native movie: {} status ({}): {} ms since start, GetNextFrame calls {} (no new {}, guest wrote {}, "
+                "errors {}, last result {:#x}), movie time {} ms, shown {}, host decoded {}, queued {} (first pts {}), "
+                "decoder ended {}, error '{}'",
+                movie.name, why, age.count(), movie.calls, movie.noNew, movie.guestWrote, movie.errors, movie.lastResult,
+                movie.lastTimeMs, movie.shown, movie.stream ? movie.stream->DecodedFrames() : 0, queued, frontPts, ended,
+                movie.stream ? movie.stream->LastError() : std::string());
+}
 }
 
 // Movie start: open the video on the host as well.
@@ -332,6 +354,27 @@ PPC_FUNC(sub_823F0FA8)
         PPC_STORE_U32(desc + 4, flags);
         const uint32_t result = ctx.r3.u32;
         PPC_STORE_U32(desc + 8, 0); // never "late": the caller would loop
+        {
+            std::lock_guard lock(g_mutex);
+            if (g_movie && g_movie->player == player)
+            {
+                Movie& m = *g_movie;
+                ++m.calls;
+                m.lastResult = result;
+                if (int32_t(result) < 0) ++m.errors;
+                else if (result == kNoNewFrame) ++m.noNew;
+                else if (result != kEndOfMovie) ++m.guestWrote;
+                if (m.calls <= 3)
+                    LOG_NOTICE("native movie: {} GetNextFrame #{} result {:#x}", m.name, m.calls, result);
+                // Every 2 s until the first frame is shown.
+                const auto now = std::chrono::steady_clock::now();
+                if (m.shown == 0 && now - m.lastStatusAt >= std::chrono::seconds(2))
+                {
+                    m.lastStatusAt = now;
+                    LogStatus(m, "no frame yet");
+                }
+            }
+        }
         if (int32_t(result) < 0 || result == kEndOfMovie)
         {
             if (result == kEndOfMovie)
@@ -352,6 +395,7 @@ PPC_FUNC(sub_823F0FA8)
             movie->startNs = now;
         }
         const uint32_t timeMs = uint32_t(std::min<uint64_t>(MovieTimeNs(*movie, now) / 1000000, 0xFFFFFFFFu));
+        movie->lastTimeMs = timeMs;
         bool fresh = false;
         const movie::VideoFrame* frame = movie->stream->FrameAt(timeMs, fresh);
         // A guest frame the player just wrote (result 0) is replaced by the
@@ -464,6 +508,20 @@ bool movie::NativeMoviesEnabled()
     return Enabled();
 }
 
+uint32_t movie::NativeMovieStallMs()
+{
+    std::lock_guard lock(g_mutex);
+    if (!g_movie || g_movie->shown || g_movie->loggedEnd) return 0;
+    const auto age = std::chrono::steady_clock::now() - g_movie->openedAt;
+    return uint32_t(std::chrono::duration_cast<std::chrono::milliseconds>(age).count());
+}
+
+void movie::LogNativeMovieState()
+{
+    std::lock_guard lock(g_mutex);
+    if (g_movie) LogStatus(*g_movie, "watchdog");
+}
+
 void movie::RestoreGuestVideoPriority(uint32_t player)
 {
 #if LO_PLATFORM_SWITCH
@@ -484,6 +542,15 @@ void movie::RestoreGuestVideoPriority(uint32_t player)
 bool movie::NativeMoviesEnabled()
 {
     return false;
+}
+
+uint32_t movie::NativeMovieStallMs()
+{
+    return 0;
+}
+
+void movie::LogNativeMovieState()
+{
 }
 
 void movie::RestoreGuestVideoPriority(uint32_t)

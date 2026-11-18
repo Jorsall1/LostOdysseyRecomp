@@ -240,6 +240,14 @@ const VideoFrame* WmvStream::FrameAt(uint32_t timeMs, bool& fresh)
     return current_.get();
 }
 
+void WmvStream::Status(size_t& queued, uint32_t& frontPtsMs, bool& ended)
+{
+    std::lock_guard lock(mutex_);
+    queued = queue_.size();
+    frontPtsMs = queue_.empty() ? 0 : queue_.front()->ptsMs;
+    ended = ended_;
+}
+
 bool WmvStream::Finished()
 {
     std::lock_guard lock(mutex_);

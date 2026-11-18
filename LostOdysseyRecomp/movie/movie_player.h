@@ -21,6 +21,10 @@ bool NativeMoviesEnabled();
 // The movie is being released or closed: the guest video pump of player (FLO_MOVIE +20) gets the game's
 // priority back if LO_MOVIE_GUEST_VIDEO_PRIORITY lowered it, since the close waits for that thread.
 void RestoreGuestVideoPriority(uint32_t player);
+// Diagnostics: milliseconds since the current native movie started without a frame shown (0: none, shown or ended),
+// and a log line with its GetNextFrame and host decoder counters.
+uint32_t NativeMovieStallMs();
+void LogNativeMovieState();
 // guestMovie is the FLO_MOVIE object, name the video's file name stem (mv_00v).
 // Resolves the mod asset and opens it on a decode thread; no-op without one.
 void StartReplacement(uint32_t guestMovie, std::string_view name);

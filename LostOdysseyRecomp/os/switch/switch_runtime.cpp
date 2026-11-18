@@ -73,6 +73,7 @@ void DumpHangWatch();                                 // kernel/imports.cpp: the
 void DumpGuestHotStacks();                            // kernel/imports.cpp: stacks of the threads not blocked
 void DumpGuestAliasUsage();                           // kernel/imports.cpp: what the C/E views hold
 void DumpFenceWaiters();                              // cpu/poll_wait.cpp: open render fence waits, ring, last events
+namespace movie { uint32_t NativeMovieStallMs(); void LogNativeMovieState(); } // movie/movie_hooks.cpp
 
 namespace os::switch_platform
 {
@@ -1679,6 +1680,27 @@ void ExitWatchdogMain(void*)
                 DumpGuestAliasUsage();
                 DumpFenceWaiters();
                 std::fprintf(stderr, "[watchdog] guest diagnostics %d done\n", guestDumps);
+            }
+        }
+        // A cutscene movie that has shown no frame 10 s and 30 s after it
+        // started (2026-11-18: mv_01v after New Game, 100 s of no picture and
+        // no sound while frames kept presenting). Same dump, once each.
+        static int movieDumps = 0;
+        if (movieDumps < 2 && !g_endHostThreads.load(std::memory_order_acquire) &&
+            !g_homeCloseRequested.load(std::memory_order_acquire))
+        {
+            const uint32_t stallMs = movie::NativeMovieStallMs();
+            if (stallMs >= (movieDumps == 0 ? 10000u : 30000u))
+            {
+                ++movieDumps;
+                std::fprintf(stderr, "[watchdog] movie without a frame for %u ms: guest thread states\n", stallMs);
+                movie::LogNativeMovieState();
+                DumpGuestThreadStates();
+                DumpHangWatch();
+                DumpGuestHotStacks();
+                DumpFenceWaiters();
+                movie::LogNativeMovieState();
+                std::fprintf(stderr, "[watchdog] movie diagnostics %d done\n", movieDumps);
             }
         }
         // HOME -> X: am asks the applet to exit. SDL's Switch driver turns that

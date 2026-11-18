@@ -44,6 +44,8 @@ public:
     uint32_t DecodedFrames() const { return decoded_.load(); }
     double DecodeSeconds() const { return decodeNs_.load() / 1e9; }
     std::string LastError();
+    // Diagnostics: frames waiting in the queue, the first one's pts, decoder done.
+    void Status(size_t& queued, uint32_t& frontPtsMs, bool& ended);
 
 private:
     void Run();
