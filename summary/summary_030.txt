@@ -1,0 +1,81 @@
+================================================================================
+LostOdysseyRecomp - Nintendo Switch 2 port
+Summary - TURN 30: the PPC sources were made by a stale XenonRecomp; regenerated
+================================================================================
+Build: NRO md5 abad5bf1f9bd598b5c73466ee4e8ad5f (Desktop copy matches).
+ELF: build/regen_turn30_abad5bf1.elf. kaiHEN fix untouched. No runtime source
+changed this turn; only LostOdysseyRecompLib/ppc/ (git-ignored) was regenerated.
+
+LOGS READ ("lo project/test1", "test2")
+  test1 (LO_GUEST_AFFINITY=1, LO_TRACE_MOVIE=1), runtime-1795027766450210.log:
+    * Matinee 0x2bd1680: 255 -> 10 (78.86 s), 10 -> 4 (80.21), 4 -> 3, 3 -> 8
+      prepared (80.43, flags60 0x28000000). No "matinee: play", no
+      "script task" line and no "cinematic bars: rt=true" for the whole run.
+    * Game keeps running at 60 fps showing the loading icon (draws=3).
+    * Clean exit through HOME -> X (exit.log).
+  test2 (+ LO_MATINEE_FORCE_PLAY=1), runtime-1795028058454642.log:
+    * Forced Play at 61.63 s: Matinee 8 -> 1 -> 2, movie track ticks resume,
+      mv_01v first frame at 61.69 s, updates #1-#7 to 61.792 s. Then the
+      log stops: no error, no crash log, no exit.log. The console went down.
+    * Sync logging is on (LO_SWITCH_SYNC_LOG default), so 61.792 s is close to
+      the real end. Nothing in the log names the cause. The run skipped
+      whatever the script waited for, so it says nothing about a normal run.
+      Keep LO_MATINEE_FORCE_PLAY off.
+
+STATIC DECODE (why Play never comes)
+  * sub_82B327F8 (script task load, from sub_82AD6C90) creates the Matinee
+    (sub_82810448 -> state 10) and sets task+1 = 1.
+  * sub_82B322D8 (task tick): task state 1 + Matinee state 8/9 -> task 2.
+  * sub_82AD6088 (task start, from the scenario script via sub_82AE07D8 /
+    sub_82AFAE10): task 2 and 0x832CB774 == 0: if 0x832CB701 == 4 start it
+    (sub_82B31720 -> Play), else start the fade (sub_828F7840 at lr
+    0x82AD616C) and store the id in manager+152; sub_82384F18 starts it once
+    the fade is done. In test1 none of this ran: the script never asked.
+  * sub_8234B9B8 (other Matinee user, state 45/46) is not it: it sets
+    flags60 0x40000000, which this Matinee never had.
+
+ROOT CAUSE FOUND: stale generator output
+  * The XenonRecomp binary that made ppc/ (out/build/tools/..., 2026-11-16
+    11:37:06, clang) predates the source it claims to come from
+    (recompiler.cpp 11:56:54) and has no "non_volatile_in_context" support at
+    all (string absent from the binary). ppc/ was generated with it at
+    11:37:11. So, in the build that ran on the console:
+    1. Every function in the toml's non_volatile_in_context list (190 of
+       them) got r14-r31 as zeroed C++ locals: all MSVC __finally funclets,
+       setjmp 0x82DF34A0, the hand-written codecs 0x82F8xxxx-0x8312xxxx,
+       and the callers host hooks read (sub_82AD6088 for
+       cinematic_bars at 0x82AD616C, battle_script_timer, asset_failure,
+       occlusion_history). Turn 21's heap-lock leak and turn 29's 25
+       "funclets reading zeroed registers" are this one bug.
+    2. CRT memset sub_82B7BC40 was cut at 0x82B7BCD0: for a count with
+       (n & 3) == 2 or 3 it wrote only the first trailing byte and returned
+       (the rest went into stub functions nothing calls). Any memset with
+       such a size left 1-2 bytes of old data.
+    3. fast_memory and argument_as_local from the toml were not applied.
+  * Upstream / Switch 1 builds use the current generator, which is why the
+    same game code works there.
+
+CHANGES
+  * Built XenonRecomp from the patched tools/XenonRecomp with GCC (clang is no
+    longer installed): out/build/tools_gcc, configured with
+    -DXENON_RECOMP_USE_ALIAS (same alias-style output as before) . The binary
+    contains non_volatile_in_context.
+  * python3 -B tools/ppc_codegen.py generate --executable
+    out/build/tools_gcc/XenonRecomp/XenonRecomp  (fences added; OK).
+  * Old sources kept in out/ppc_backup_turn30/ (restore by copying back).
+  * Checked in the new output: sub_82AD6088, funclets 82B7AFA8 / 823AD544,
+    setjmp 82DF34A0 and 823ACCB0 keep r14-r31 in ctx; parents write ctx.r12
+    before calling the funclet; memset sub_82B7BC40 now includes the tail.
+    Function set: 62620 (old 62622, minus the two memset stubs).
+    Instruction lists are otherwise identical; only codegen style changed.
+  * cpu/guest_seh_finally.cpp overrides kept: they do what the now-correct
+    funclets do, one unlock each, so there is no double unlock.
+
+NEXT
+  Run with env.txt = LO_GUEST_AFFINITY=1, LO_TRACE_MOVIE=1 (no
+  LO_MATINEE_FORCE_PLAY). Expect "cinematic bars: rt=true", "script task"
+  and "matinee: play" lines after New Game, and the opening movie to play.
+  If it still hangs, the trace now reads real registers, so the next step is
+  logging sub_82AD6088 calls (id, task state, 0x832CB774, 0x832CB701).
+  Suggested guard (not done): fail the build when a function on
+  non_volatile_in_context is generated with local r14-r31.
