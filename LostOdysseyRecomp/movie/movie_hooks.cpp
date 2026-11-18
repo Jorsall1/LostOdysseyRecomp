@@ -54,6 +54,7 @@ extern "C" PPC_FUNC(__imp__sub_82CF8140);
 extern "C" PPC_FUNC(__imp__sub_82815208);
 extern "C" PPC_FUNC(__imp__sub_82813A50);
 extern "C" PPC_FUNC(__imp__sub_827E2DD0);
+extern "C" PPC_FUNC(__imp__sub_827DDAA0);
 
 namespace
 {
@@ -112,7 +113,7 @@ std::unique_ptr<Movie> g_movie;
 // Diagnostics: calls of the movie stream job (sub_82815208) and stream read requests (sub_82813A50).
 std::atomic<uint32_t> g_jobTicks{0}, g_streamRequests{0};
 // Diagnostics: event timeline movie track ticks (sub_827E2DD0) and the last time passed to it.
-std::atomic<uint32_t> g_trackTicks{0};
+std::atomic<uint32_t> g_trackTicks{0}, g_prepareCalls{0};
 std::atomic<float> g_trackTime{0.f};
 
 // Archive and offset of a movie file on the current disc, from its LO.fpi.
@@ -589,6 +590,35 @@ PPC_FUNC(sub_827E2DD0)
                    n, track, owner, lr, now, f32(owner + 60), count, count ? f32(entries) : 0.f,
                    count ? f32(entries + 4) : 0.f, count ? f32(entries + 8) : 0.f, m, m ? int16_t(PPC_LOAD_U16(m + 104)) : -1);
     __imp__sub_827E2DD0(ctx, base);
+}
+
+// Diagnostics: the movie track's "prepare" step (track vtable +356). r3 = track, r5 = owner, f1 = time. It runs
+// the owner's +272 and the track tick (+312, sub_827E2DD0) and returns 1 when the track is ready: no movie, or
+// M+104 == 3. 2026-11-18: called 3-4 times right after the movie start, then never again, so M+104 stays 2.
+// Logs the first 12 calls with the guest caller chain, so the loop that stops calling it can be found.
+PPC_FUNC(sub_827DDAA0)
+{
+    const uint32_t track = ctx.r3.u32, owner = ctx.r5.u32, lr = uint32_t(ctx.lr);
+    const double now = ctx.f1.f64;
+    std::string chain;
+    for (uint32_t frame = ctx.r1.u32, i = 0; i < 12 && frame >= 0x1000 && frame < 0x7C000000; ++i)
+    {
+        const uint32_t caller = PPC_LOAD_U32(frame);
+        if (caller <= frame || caller >= 0x7C000000) break;
+        const uint32_t ret = PPC_LOAD_U32(caller - 8);
+        if (ret < 0x82000000 || ret >= 0x83400000) break;
+        chain += fmt::format(" {:#x}", ret);
+        frame = caller;
+    }
+    __imp__sub_827DDAA0(ctx, base);
+    const uint32_t n = ++g_prepareCalls;
+    if (n <= 12)
+    {
+        const uint32_t m = PPC_LOAD_U32(owner + 64);
+        LOG_NOTICE("native movie: track prepare #{} track={:#x} owner={:#x} time={:.3f} -> {} M={:#x} state104={} lr={:#x} "
+                   "callers:{}",
+                   n, track, owner, now, ctx.r3.u32 & 0xFF, m, m ? int16_t(PPC_LOAD_U16(m + 104)) : -1, lr, chain);
+    }
 }
 
 bool movie::NativeMoviesEnabled()

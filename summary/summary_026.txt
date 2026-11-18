@@ -1,0 +1,35 @@
+================================================================================
+LostOdysseyRecomp - Nintendo Switch 2 port
+Summary - TURN 26: A/B test: hang is NOT caused by the native movie decoder
+================================================================================
+Build: NRO md5 eb1cdf07d2be97dac00d9e0a33e3064b (Desktop copy matches).
+ELF: build/moviediag_turn26_eb1cdf07.elf. kaiHEN fix untouched.
+LOGS READ ("lo project/test1" = LO_GUEST_AFFINITY=1 + LO_TRACE_MOVIE=1,
+runtime-1795022309436506.log; "test2" = same + LO_NATIVE_MOVIES=0,
+runtime-1795022675460872.log). Both: HOME -> X, clean exit.
+RESULT
+  * test2 (game's own WMV decoder, our movie code off) hangs exactly like
+    test1. The native movie hooks are not the cause.
+  * Both runs: movie track tick (sub_827E2DD0) called only 3-4 times, all
+    from lr 0x827ddafc, then never again:
+      test1 57.578 s #1 (M=0 -> creates and starts M), #2 state104=0,
+            #3 state104=1, #4 state104=1 (57.683 s); player created 57.723 s
+            (state104 = 2); no tick after that.
+      test2 54.153 s #1, #2, #3 (54.240 s), then nothing.
+  * Track data: 1 entry, values 5.0 / 0.0 / 200.2 (preload 5 s before
+    start time 0, length 200.2 s). The time passed in is -0.0 every call,
+    previous time -10000 on the first call.
+  * The tick's caller is sub_827DDAA0 = the movie track's "prepare" step
+    (track vtable +356, vtable base 0x8200e430; tick is +312). It calls
+    owner->vtable[+272], then the tick, and returns ready =
+    (owner+64 == 0) || (M+104 == 3). Only the tick moves M+104 from 2 to 3.
+    So whoever calls prepare stops calling it after 3-4 frames, before the
+    movie is ready, and the event then waits forever for "ready".
+CHANGES (diagnostics only)
+  movie/movie_hooks.cpp: PPC_FUNC sub_827DDAA0 logs its first 12 calls:
+  track, owner, time, result, M, M+104, lr and up to 12 guest callers
+  (back chain from r1). That gives the loop that stops calling it.
+NEXT
+  One run, env.txt without LO_NATIVE_MOVIES=0 (native movies on). Find the
+  caller chain in the "track prepare" lines, decode that loop and its exit
+  condition (why it stops after 3-4 frames on Switch 2).
