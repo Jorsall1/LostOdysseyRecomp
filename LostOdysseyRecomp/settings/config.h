@@ -93,10 +93,8 @@ inline constexpr uint32_t SwitchSceneHeights[] = {360, 432, 504, 540, 576, 648, 
 // row offers it). The release env.txt sets no height, so these rows decide it. Switch 2 renders 1440 rows docked
 // (supersampled down to its 1920x1080 output) and 1080 rows on its 1080p handheld screen.
 #ifdef __SWITCH2__
-// 2026-11-18: the first battle needed 29 ms of GPU at 684 rows handheld and dynamic resolution fell rung by rung to
-// 432, rebuilding the scene targets at each step. The default is now a fixed 720 rows handheld and 1080 docked;
-// the Maximum resolution row still offers 1080 / 1440.
-inline constexpr uint32_t SwitchAutomaticHeight(bool docked) { return docked ? 1080 : 720; }
+// Fixed by default (dynamic resolution off, 2026-11-18): 1080 rows handheld, 1440 docked, at 60 FPS.
+inline constexpr uint32_t SwitchAutomaticHeight(bool docked) { return docked ? 1440 : 1080; }
 #else
 inline constexpr uint32_t SwitchAutomaticHeight(bool docked) { return docked ? 540 : 540; }
 #endif

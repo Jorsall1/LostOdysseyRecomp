@@ -1,0 +1,27 @@
+================================================================================
+LostOdysseyRecomp - Nintendo Switch 2 port
+Summary - TURN 33: default scene 1080 rows handheld, 1440 docked, 60 FPS
+================================================================================
+Build: NRO md5 bbc20ceaa5f472bc66cc5ccf965d62a4 (Desktop copy matches).
+ELF: build/res_turn33_bbc20cea.elf. kaiHEN fix untouched.
+
+USER REQUEST: default resolution 1080p handheld and 1440p docked, 60 FPS both.
+
+CHANGES (Switch 2 only)
+  * settings/config.h: SwitchAutomaticHeight = 1440 docked, 1080 handheld
+    (turn 32 had 1080 / 720). Dynamic resolution stays off by default and
+    in every preset (turn 32). Frame rate: already 60 by default and in every
+    Switch 2 preset; unchanged.
+  * settings/menu.cpp: preset help text says 1080p handheld / 1440p docked.
+
+NOTES
+  * A saved settings.ini keeps its own Maximum resolution and frame rate rows:
+    Automatic (0) picks up the new heights; an explicit height or 30 FPS does
+    not. Choosing a preset in Graphics resets them.
+  * Turn 31 measured 13-15 ms of battle GPU at 832x468 handheld. 1080 rows is
+    about 5x the pixels: expect well over 16.7 ms in battle until the GPU
+    cost is reduced.
+  * Desktop env.txt unchanged: LO_GUEST_AFFINITY=1, LO_DYNAMIC_RESOLUTION=0.
+
+NEXT: as turn 32 (battle screenshot, settings menu screenshot, then the texture
+A/B runs one line at a time).
