@@ -1,0 +1,63 @@
+================================================================================
+LostOdysseyRecomp - Nintendo Switch 2 port
+Summary - TURN 32: battle defaults (fixed resolution), movie green flash, texture A/B switch
+================================================================================
+Build: NRO md5 90c5e22665f7d1973f382543c58ef7fb (Desktop copy matches).
+ELF: build/battle_turn32_90c5e226.elf. kaiHEN fix untouched.
+Includes turn 31's diagnostics (dummy texture lines, stutter samples), which have
+not run on the console yet. Desktop env.txt written (see NEXT).
+
+REQUEST (user, from another assistant's list)
+  1. black 3D textures in battle, 2. stutter and the fall to 432 rows,
+  3. settings menu overlay glitch and a green flash on the load screen.
+
+LOG (runtime-1795032121429506.log, battle from 257.8 s), re-read
+  * Dynamic resolution: 1216x684 at 258.9 s, then one rung a second to
+    832x468 (264.9 s) and 768x432 (287.4 s), GPU 29 -> 16 ms. Each step logs
+    ~20 "new color/depth target" lines (scene targets rebuilt); the hitches at
+    257.8-260 s (51-76 ms) coincide.
+  * The 47 ms frames at 266-282 s have no resolution change: cp_idle 43 ms of
+    each, the guest is late. Not caused by dynamic resolution. Turn 31's
+    stutter samples will say where the guest is.
+  * Occlusion "zero" (78909 at f15000, 178387 at f15600) are results the host
+    already measured as 0 ("ready"). Draws inside a measured query are never
+    skipped as no-op (renderer.cpp, `measured`). docs/notes/occlusion-queries.md
+    reports 80 % zero in rooms. Not shown to be wrong; kept.
+  * No texture creation/format/upload warnings. Descriptor reuse, texinfo
+    specialisation, BC on NVK and the mip chain are all unproven: A/B below.
+
+CHANGES
+  * gpu/dynamic_resolution.h: stepping down jumps straight to the height whose
+    pixels fit the budget (height * sqrt(budget * 0.8 / busy), rounded down to
+    a rung, at least one rung) instead of one or two rungs a second. 1080 rows
+    at 29 ms -> 720 in one rebuild instead of nine.
+  * settings/config.h, graphics_menu.h, menu.cpp (Switch 2 only):
+    - Automatic scene height 720 rows handheld, 1080 docked (was 1080/1440).
+    - Default dynamicResolution false, minimum 0; every preset is a fixed
+      height (Quality / Balanced / Performance differ in effects only).
+      Dynamic resolution stays a menu row. Preset help text updated.
+    - A saved settings.ini keeps its own values; env.txt LO_DYNAMIC_RESOLUTION=0
+      overrides it.
+  * movie/movie_hooks.cpp: before a native movie's first host frame, the
+    player's Y/U/V textures are set once to black (Y 0, U/V 128) and reported
+    as a new picture. Zeroed planes decode to green: the likely green flash
+    between the loading screen and the movie.
+  * gpu/renderer.cpp: LO_TEXTURE_NO_MIPS=1 loads the base level only (A/B for
+    a broken mip upload: 3D surfaces sample lower mips, the HUD level 0).
+
+NOT DONE
+  * Settings menu overlay glitch: nothing in the log; needs a screenshot or a
+    description of what is wrong.
+  * Black textures: no fix without the A/B result.
+  * Expected cost: at 832x468 the battle GPU took 13-15 ms handheld; 720 rows
+    is ~2.4x the pixels, so ~30 ms. A fixed 720 may not hold 60 in battle;
+    Frame rate 30 or Dynamic resolution on (now one jump) are the options.
+
+NEXT (user)
+  Desktop env.txt (copy to sdmc:/switch/LostOdysseyRecomp/env.txt):
+    LO_GUEST_AFFINITY=1, LO_DYNAMIC_RESOLUTION=0
+  Run 1 as is: battle screenshot, ~30 s of battle, settings menu screenshot.
+  Then one line added each run:
+    LO_TEXTURE_NO_MIPS=1 / LO_TEXTURE_BC=0 / LO_DESCRIPTOR_REUSE=0 /
+    LO_TEXINFO_SPEC=0 / LO_TRIM_VARYINGS=0
+  The setting that fixes the textures names the faulty path.

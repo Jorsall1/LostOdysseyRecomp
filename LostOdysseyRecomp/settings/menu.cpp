@@ -2112,7 +2112,11 @@ void Publish(uint8_t *base, uint32_t config)
                            L"設定輸出尺寸；全螢幕使用桌面尺寸。");
             break;
         case GraphicsRow::Preset:
-#if LO_PLATFORM_SWITCH
+#if defined(__SWITCH2__)
+            next.help = Tr(L"All use FSR at 60 FPS and a fixed 720p handheld / 1080p docked scene. Quality: every effect. Balanced: depth of field 50%, no bloom. "
+                           L"Performance: also no dynamic shadows, motion blur or depth of field.",
+                           L"皆使用 FSR、60 FPS，固定掌機 720p／主機 1080p。品質：所有效果。平衡：景深 50%，無光暈。效能：另關閉動態陰影、動態模糊與景深。");
+#elif LO_PLATFORM_SWITCH
             next.help = Tr(L"All use FSR at 30 FPS. Quality: fixed 540p, every effect. Balanced: dynamic 360-540p, depth of field 50%, no bloom. "
                            L"Performance: also no dynamic shadows, motion blur or depth of field.",
                            L"皆使用 FSR、30 FPS。品質：固定 540p，所有效果。平衡：動態 360-540p，景深 50%，無光暈。效能：另關閉動態陰影、動態模糊與景深。");

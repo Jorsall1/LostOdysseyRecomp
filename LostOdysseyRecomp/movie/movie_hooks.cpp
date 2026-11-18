@@ -103,6 +103,7 @@ struct Movie
     std::chrono::steady_clock::time_point lastStatusAt{};
     uint32_t calls = 0, noNew = 0, guestWrote = 0, errors = 0;
     uint32_t lastResult = 0, lastTimeMs = 0;
+    bool blanked = false;     // Y/U/V textures set to black before the first frame
 #if LO_PLATFORM_SWITCH
     uint32_t guestVideoThread = 0;
     int guestVideoPriority = -1;
@@ -442,14 +443,32 @@ PPC_FUNC(sub_823F0FA8)
         // A guest frame the player just wrote (result 0) is replaced by the
         // host's current frame; without a host frame nothing is shown new.
         const bool guestWrote = result != kNoNewFrame;
+        const uint32_t y = PPC_LOAD_U32(desc + 12), u = PPC_LOAD_U32(desc + 16), v = PPC_LOAD_U32(desc + 20);
+        const uint32_t yPitch = PPC_LOAD_U32(desc + 36), uPitch = PPC_LOAD_U32(desc + 40), vPitch = PPC_LOAD_U32(desc + 44);
         if (!frame || (!fresh && !guestWrote))
         {
+            // Until the host's first frame the guest draws the player's textures as they are: zeroed memory, which
+            // YUV turns into green (Switch 2, the green flash between the loading screen and mv_01v, 2026-11-18).
+            // Make them black once: Y 0, U and V 128.
+            const uint32_t bw = movie->stream->Width(), bh = movie->stream->Height();
+            if (!movie->blanked && movie->shown == 0 && y && u && v && bw && bh && yPitch >= bw && uPitch >= bw / 2 &&
+                vPitch >= bw / 2)
+            {
+                movie->blanked = true;
+                for (uint32_t row = 0; row < bh; ++row)
+                    std::memset(base + y + size_t(row) * yPitch, 0, bw);
+                for (uint32_t row = 0; row < bh / 2; ++row)
+                {
+                    std::memset(base + u + size_t(row) * uPitch, 128, bw / 2);
+                    std::memset(base + v + size_t(row) * vPitch, 128, bw / 2);
+                }
+                ctx.r3.u64 = 0; // a new (black) picture: the guest uploads it
+                return;
+            }
             ctx.r3.u64 = kNoNewFrame;
             return;
         }
         const uint32_t w = frame->width, h = frame->height;
-        const uint32_t y = PPC_LOAD_U32(desc + 12), u = PPC_LOAD_U32(desc + 16), v = PPC_LOAD_U32(desc + 20);
-        const uint32_t yPitch = PPC_LOAD_U32(desc + 36), uPitch = PPC_LOAD_U32(desc + 40), vPitch = PPC_LOAD_U32(desc + 44);
         if (!y || !u || !v || yPitch < w || uPitch < w / 2 || vPitch < w / 2)
         {
             ctx.r3.u64 = kNoNewFrame;

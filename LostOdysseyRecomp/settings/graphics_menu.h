@@ -146,7 +146,12 @@ inline constexpr uint32_t PresetChoiceCount = 3; // Custom is shown, never chose
 inline void ApplyPreset(Config& config, Preset preset)
 {
     const bool low = preset == Preset::Performance;
+#ifdef __SWITCH2__
+    // Switch 2: every preset renders a fixed scene height (no mid-battle target rebuilds, 2026-11-18).
+    const bool dynamic = false;
+#else
     const bool dynamic = preset != Preset::Quality;
+#endif
 #ifdef __SWITCH2__
     config.frameRate = 60;
 #else

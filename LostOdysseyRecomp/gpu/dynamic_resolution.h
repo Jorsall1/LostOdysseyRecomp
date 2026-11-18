@@ -1,5 +1,6 @@
 #pragma once
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <string_view>
@@ -100,8 +101,13 @@ namespace gpu::dynamic_resolution
             if (busyMs > budgetMs * DownAt) {
                 upStrikes = 0;
                 if (++downStrikes >= 2 && height > minimum && nowNs - lastChange >= DownHoldNs) {
-                    // Two rungs when far over budget.
-                    const uint32_t steps = busyMs > budgetMs * 1.25 ? 2u : 1u;
+                    // Straight to the height whose pixels fit the budget (GPU time follows the pixel count, the
+                    // square of the height), at least one rung. Each change rebuilds the scene targets, so one
+                    // jump costs one rebuild where rung by rung cost one a second (Switch 2's first battle,
+                    // 2026-11-18: nine rebuilds from 1080 to 432 rows, each a hitch).
+                    const double fit = double(height) * std::sqrt(budgetMs * UpBelow / busyMs);
+                    const uint32_t target = fit > 0 ? uint32_t(fit) / step * step : 0;
+                    const uint32_t steps = std::max(1u, target < height ? (height - target + step - 1) / step : 1u);
                     height = height - std::min(steps * step, height - minimum);
                     Changed(nowNs, changed);
                 }

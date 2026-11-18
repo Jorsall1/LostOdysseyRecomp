@@ -93,7 +93,10 @@ inline constexpr uint32_t SwitchSceneHeights[] = {360, 432, 504, 540, 576, 648, 
 // row offers it). The release env.txt sets no height, so these rows decide it. Switch 2 renders 1440 rows docked
 // (supersampled down to its 1920x1080 output) and 1080 rows on its 1080p handheld screen.
 #ifdef __SWITCH2__
-inline constexpr uint32_t SwitchAutomaticHeight(bool docked) { return docked ? 1440 : 1080; }
+// 2026-11-18: the first battle needed 29 ms of GPU at 684 rows handheld and dynamic resolution fell rung by rung to
+// 432, rebuilding the scene targets at each step. The default is now a fixed 720 rows handheld and 1080 docked;
+// the Maximum resolution row still offers 1080 / 1440.
+inline constexpr uint32_t SwitchAutomaticHeight(bool docked) { return docked ? 1080 : 720; }
 #else
 inline constexpr uint32_t SwitchAutomaticHeight(bool docked) { return docked ? 540 : 540; }
 #endif
@@ -226,9 +229,16 @@ struct Config
     // A fresh settings.ini starts on the Balanced preset (graphics_menu.h): FSR, dynamic resolution 360-540 rows,
     // depth of field at 50% and no bloom. A saved settings.ini keeps its own values.
     bool switchFsr = true;
+#if defined(__SWITCH2__)
+    // Switch 2: the Balanced preset keeps a fixed scene height (graphics_menu.h); Dynamic resolution is a choice.
+    bool dynamicResolution = false;
+    uint32_t maximumHeight[2] = {0, 0};
+    uint32_t minimumHeight[2] = {0, 0};
+#else
     bool dynamicResolution = true;
     uint32_t maximumHeight[2] = {0, 0};
     uint32_t minimumHeight[2] = {SwitchPresetMinimumHeight, SwitchPresetMinimumHeight};
+#endif
 #else
     bool switchFsr = false;
     bool dynamicResolution = false;

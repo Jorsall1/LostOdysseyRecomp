@@ -9554,7 +9554,10 @@ void main()
                 // textures with a base level load a mip chain.
                 uint32_t mipAddress = (fetch[5] >> 12) << 12;
                 if (!mipAddress && packedMips && PackedMipLevel(width, height) == 0) mipAddress = base;
-                const uint32_t mipLevels = base && mipAddress && tiled && dimension == 1
+                // LO_TEXTURE_NO_MIPS=1 (A/B, Switch 2 black battle textures 2026-11-18):
+                // load the base level only, to tell a broken mip upload from the rest.
+                static const bool noMips = [] { const char* v = getenv("LO_TEXTURE_NO_MIPS"); return v && v[0] == '1'; }();
+                const uint32_t mipLevels = !noMips && base && mipAddress && tiled && dimension == 1
                     ? std::min<uint32_t>((fetch[4] >> 6) & 0xF, std::bit_width(std::max(width, height)) - 1) : 0;
                 if (bindingInfo) {
                     *bindingInfo = {};
