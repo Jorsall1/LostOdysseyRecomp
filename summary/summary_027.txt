@@ -1,0 +1,51 @@
+================================================================================
+LostOdysseyRecomp - Nintendo Switch 2 port
+Summary - TURN 27: movie track IS ready; the event stops before it plays
+================================================================================
+Build: NRO md5 074bad72341366dbb93d8160201912ac (Desktop copy matches).
+ELF: build/moviediag_turn27_074bad72.elf. kaiHEN fix untouched.
+USER REPORT
+  First New Game: message "sign-in settings changed, returning to start
+  screen". Second New Game: same hang as before.
+LOGS READ (runtime-1795024053456059.log; env LO_GUEST_AFFINITY=1,
+LO_TRACE_MOVIE=1). HOME -> X, clean exit.
+FINDINGS
+  * Track prepare (sub_827DDAA0) results, all from lr 0x825780a8:
+      #1 81.091 s -> 0 (M created, state104=0)
+      #2 81.126 s -> 0 (state104=1, first 3 MiB loading)
+      #3 81.180 s -> 1 READY (state104=3)
+    The guest back chain is empty: recompiled functions keep LR in a local
+    (r12), they do not store it on the stack, so frame walks stop early.
+  * sub_82375B18 (movie preload, game thread) decoded:
+      state 0: request the first 3 MiB (info+22=1, +24=M+88 buffer, +28 =
+               0x300000, +40 = 0) -> state 1
+      state 1: when info+20 == 2: set up the caches (sub_82813500,
+               sub_82814240), M+104 = 3, sub_82815938 (queues the player
+               create on the rendering thread).
+    Then sub_82815060 (rendering thread, 81.220 s) sets M+104 = 2. The next
+    track tick would see 2, set 3 and call owner->vtable[+280](M) (movie
+    ready notification). That tick never comes: total track ticks = 3.
+  * So the movie track's prepare finished normally. After it, the event
+    never calls the movie track again (neither prepare nor any other path
+    that ticks it, e.g. sub_827DD898). The event is stuck between its
+    prepare phase and playing: probably another track or group is not
+    ready (the flashing loading icon).
+  * sub_82578048 = an event group's prepare (in at least 7 vtables:
+    0x820043e0, 0x82004b0c, 0x82009db4, 0x82009ed4, 0x8202a250, 0x82031820,
+    0x82067744): loops its tracks' prepare (vtable +356) and returns 0 at
+    the first not ready.
+  * "Sign-in settings changed" message: kernel/xam.cpp
+    XamNotifyCreateListener queues XN_SYS_SIGNINCHANGED (user mask 1) on
+    the game's first system listener, as Xenia does. If the game reads it
+    late, it treats it as a sign-in change and returns to the title. Not
+    logged without LO_KERNEL_TRACE. Separate issue, look at it later.
+CHANGES (diagnostics only)
+  movie/movie_hooks.cpp: PPC_FUNC sub_82578048 re-implements the group
+  prepare call for call (same order, registers, lr, a 128-byte frame) and
+  logs "event group prepare: group owner lr time tracks -> result, blocked
+  by track #i <ptr> vtable <v> prepare <fn>" when a group's result or
+  blocking track changes (max 300 lines), plus a count every 600 calls.
+  LO_EVENT_PREPARE_TRACE=0 runs the original instead.
+NEXT
+  Same test. The "event group prepare" lines name the track the event waits
+  for (its vtable and prepare function); decode that one next.

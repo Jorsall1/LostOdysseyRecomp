@@ -55,6 +55,7 @@ extern "C" PPC_FUNC(__imp__sub_82815208);
 extern "C" PPC_FUNC(__imp__sub_82813A50);
 extern "C" PPC_FUNC(__imp__sub_827E2DD0);
 extern "C" PPC_FUNC(__imp__sub_827DDAA0);
+extern "C" PPC_FUNC(__imp__sub_82578048);
 
 namespace
 {
@@ -618,6 +619,78 @@ PPC_FUNC(sub_827DDAA0)
         LOG_NOTICE("native movie: track prepare #{} track={:#x} owner={:#x} time={:.3f} -> {} M={:#x} state104={} lr={:#x} "
                    "callers:{}",
                    n, track, owner, now, ctx.r3.u32 & 0xFF, m, m ? int16_t(PPC_LOAD_U16(m + 104)) : -1, lr, chain);
+    }
+}
+
+// Diagnostics: an event group's prepare (sub_82578048, shared by several group classes). r3 = group (+64 track
+// list, +68 count), r5 = owner (+68 per-track owner list, +72 count), f1 = time. Calls each track's prepare
+// (vtable +356) in order and returns 0 at the first one not ready, 1 when all are (or the counts differ).
+// Re-implemented here call for call (same order, same registers, same lr) so the track that keeps the event
+// from starting can be named. Logged when a group's result or blocking track changes (up to 300 lines).
+PPC_FUNC(sub_82578048)
+{
+    static const bool trace = [] {
+        const char* value = std::getenv("LO_EVENT_PREPARE_TRACE");
+        return !value || !*value || *value != '0';
+    }();
+    if (!trace)
+    {
+        __imp__sub_82578048(ctx, base);
+        return;
+    }
+    const uint32_t group = ctx.r3.u32, owner = ctx.r5.u32, lr = uint32_t(ctx.lr);
+    const double now = ctx.f1.f64;
+    const int32_t count = int32_t(PPC_LOAD_U32(group + 68));
+    uint32_t result = 1, blocking = 0, blockingIndex = 0;
+    if (count == int32_t(PPC_LOAD_U32(owner + 72)) && count > 0)
+    {
+        const uint32_t savedR1 = ctx.r1.u32;
+        ctx.r1.u32 = savedR1 - 128; // the frame the original allocates
+        for (int32_t i = 0; i < count; ++i)
+        {
+            const uint32_t track = PPC_LOAD_U32(PPC_LOAD_U32(group + 64) + uint32_t(i) * 4);
+            ctx.r3.u64 = track;
+            ctx.r5.u64 = PPC_LOAD_U32(PPC_LOAD_U32(owner + 68) + uint32_t(i) * 4);
+            ctx.f1.f64 = now;
+            const uint32_t fn = PPC_LOAD_U32(PPC_LOAD_U32(track) + 356);
+            ctx.lr = 0x825780A8;
+            g_memory.FindFunction(fn)(ctx, base);
+            if ((ctx.r3.u32 & 0xFF) == 0)
+            {
+                result = 0;
+                blocking = track;
+                blockingIndex = uint32_t(i);
+                break;
+            }
+        }
+        ctx.r1.u32 = savedR1;
+    }
+    ctx.r3.u64 = result;
+    ctx.lr = lr;
+
+    static std::mutex logMutex;
+    static std::map<uint32_t, std::pair<uint32_t, uint32_t>> last; // group -> (result, blocking track)
+    static uint32_t lines = 0, calls = 0;
+    std::lock_guard lock(logMutex);
+    ++calls;
+    auto& state = last[group];
+    const std::pair<uint32_t, uint32_t> current{result + 1, blocking}; // result + 1: a new group always logs
+    if (state != current && lines < 300)
+    {
+        ++lines;
+        const uint32_t vtable = blocking ? PPC_LOAD_U32(blocking) : 0;
+        LOG_NOTICE("event group prepare: group={:#x} owner={:#x} lr={:#x} time={:.3f} tracks={} -> {}{} (call {})", group,
+                   owner, lr, now, count, result,
+                   blocking ? fmt::format(", blocked by track #{} {:#x} vtable {:#x} prepare {:#x}", blockingIndex, blocking,
+                                          vtable, vtable ? PPC_LOAD_U32(vtable + 356) : 0)
+                            : std::string(),
+                   calls);
+    }
+    state = current;
+    if (calls % 600 == 0 && lines < 300)
+    {
+        ++lines;
+        LOG_NOTICE("event group prepare: {} calls, {} groups seen", calls, last.size());
     }
 }
 
