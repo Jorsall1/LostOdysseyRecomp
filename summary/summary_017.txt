@@ -1,0 +1,48 @@
+================================================================================
+LostOdysseyRecomp - Nintendo Switch 2 port
+Summary - TURN 17: kaiHEN fix confirmed; hang log (runtime-1795006793382560.log)
+================================================================================
+KAIHEN
+  * User confirmed on hardware: after LO, holding R returns to hbmenu.
+  * Fix committed as 5cde9314. AGENTS.md now has a "do not regress" rule:
+    no SetCurrentProcess on smGetService sessions on Switch 2.
+HANG LOG (fc076893 build, env LO_GUEST_AFFINITY=1 LO_KERNEL_TRACE=1)
+  * Same as summary_010: last reads xenon_loc/xenon_sys; xenon_snd.fpd
+    (1.79 GB) OPENED at 3.456 s on t9975 and never read; MmAllocatePhysical
+    run on t8260 ending 3.877 s (0x7c01000 + 0x10000 buffers); then no kernel
+    call for 40 s. Audio peak=0 throughout. This build had no new hang
+    diagnostics, so nothing new beyond the code reading below.
+  * 3.624 s: GuestLockHold handed over heap section 0x510610 (recursion 422)
+    from Guest Main during a fence wait (the 2026-11-16 deadlock workaround).
+CODE READING (the game is Unreal Engine 3; render_fence.h names
+FRenderCommandFence::Wait)
+  * Guest Main = UE3 game thread. Each frame it runs sub_82485030:
+    FlushRenderingCommands (sub_82485C18: sub_822D6BB0 enqueues a fence
+    command {vtable 0x8200112C, &counter} on the render queue 0x8336A7A4 when
+    the loading flag *(0x83318040) != 0, then sub_82322478 spins
+    while counter > 0), then drains the pending-object list, spinning while
+    vtable slot 288 (IsReadyForFinishDestroy) says busy.
+    vtable 0x8200112C = [0x825AFD50 dtor, 0x823B6650 execute: atomic
+    decrement of counter]. Read from private/image_disc1.bin.
+  * The rendering thread (sub_824856A0) consumes 0x8336A7A4 and, when empty,
+    draws the wheel (sub_823B63E0) every frame: the 60 fps / draws=3 frames.
+  * So the game thread and the render thread are BOTH alive and cycling.
+    The fence wait in every dump is only where the sample lands. The loading
+    itself is what has stopped: a background producer never finishes.
+  * Candidates at 15 s:
+      - KeWaitForSingleObject obj=0x55e3c4 via sub_827C12E0 (lr 0x827c139c),
+        waiting since ~2.0 s (before xenon_snd.fpd was opened);
+      - obj=0x55e374, same wrapper, re-entered continuously (timed waits);
+      - [Guest 82cc4d98] obj=0x832e0140 in sub_82CC4D98 (audio side);
+      - sub_82B606B8 -> sub_82CC3AD8 KeWaitForMultipleObjects obj=0x56d850
+        (also the 0x82cc audio code).
+    Two of the four are in the 0x82CC audio/XAudio code, and the stall begins
+    right after the sound archive is opened, with audio peak=0 the whole run.
+NEXT (proposed, not started)
+  Diagnostic build:
+    1. Log every KeSetEvent/KeReleaseSemaphore/KeWait on 0x55e3c4, 0x55e374,
+       0x832e0140 and 0x56d850 with guest lr and guest thread, plus the host
+       tid -> guest thread name in the 15 s dump (t9975 and t8260 unnamed).
+    2. Log the per-object slot-288 "busy" answers in sub_82485030 (the probe
+       comment exists in ppc_recomp.24.cpp but printed nothing).
+    3. The C/E-view scan from summary_014 at 15 s.
