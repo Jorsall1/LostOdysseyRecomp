@@ -73,6 +73,8 @@ void DumpHangWatch();                                 // kernel/imports.cpp: the
 void DumpGuestHotStacks();                            // kernel/imports.cpp: stacks of the threads not blocked
 void DumpGuestAliasUsage();                           // kernel/imports.cpp: what the C/E views hold
 void DumpFenceWaiters();                              // cpu/poll_wait.cpp: open render fence waits, ring, last events
+void LogStutterSample(int sample, uint32_t hitches);  // kernel/imports.cpp: the runtime-log header of a stutter sample
+namespace perf_stats { uint32_t HitchCount(); }      // debug/perf_stats.cpp: hitches since the start
 namespace movie { uint32_t NativeMovieStallMs(); void LogNativeMovieState(); } // movie/movie_hooks.cpp
 
 namespace os::switch_platform
@@ -1702,6 +1704,43 @@ void ExitWatchdogMain(void*)
                 DumpFenceWaiters();
                 movie::LogNativeMovieState();
                 std::fprintf(stderr, "[watchdog] movie diagnostics %d done\n", movieDumps);
+            }
+        }
+        // Stutter (2026-11-18, first battle: stretches of ~47 ms frames with the
+        // command processor idle 43 ms of each, so the guest was late, not the
+        // GPU): when 8 or more hitches come within 3 s, sample the guest stacks
+        // (1.5 s), the fence waits and the C/E views. Three times at most, 30 s
+        // apart. LO_STUTTER_SAMPLES=0 turns it off.
+        static const bool stutterSamples = [] {
+            const char* v = std::getenv("LO_STUTTER_SAMPLES");
+            return !(v && v[0] == '0');
+        }();
+        static int stutterDumps = 0;
+        static uint32_t hitchMark = 0;
+        static auto hitchMarkAt = now, lastStutterDump = now - std::chrono::seconds(30);
+        if (stutterSamples && stutterDumps < 3 && !g_endHostThreads.load(std::memory_order_acquire) &&
+            !g_homeCloseRequested.load(std::memory_order_acquire))
+        {
+            const uint32_t hitches = perf_stats::HitchCount();
+            if (now - hitchMarkAt >= std::chrono::seconds(3))
+            {
+                hitchMark = hitches;
+                hitchMarkAt = now;
+            }
+            else if (hitches - hitchMark >= 8 && now - lastStutterDump >= std::chrono::seconds(30))
+            {
+                ++stutterDumps;
+                lastStutterDump = now;
+                std::fprintf(stderr, "[watchdog] stutter: %u hitches in under 3 s; sampling guest stacks\n",
+                             hitches - hitchMark);
+                LogStutterSample(stutterDumps, hitches - hitchMark);
+                DumpGuestThreadStates();
+                DumpGuestHotStacks();
+                DumpFenceWaiters();
+                DumpGuestAliasUsage();
+                hitchMark = perf_stats::HitchCount();
+                hitchMarkAt = std::chrono::steady_clock::now();
+                std::fprintf(stderr, "[watchdog] stutter sample %d done\n", stutterDumps);
             }
         }
         // HOME -> X: am asks the applet to exit. SDL's Switch driver turns that

@@ -35,6 +35,8 @@ void SceneSize(uint32_t width, uint32_t height);
 
 // For the performance overlay: draws since the start, and the GPU clock the perf line last read (MHz; 0 unknown).
 uint64_t TotalDraws();
+// Hitches since the start (all of them, not only the logged ones). Any thread.
+uint32_t HitchCount();
 uint32_t GpuClockMhz();
 
 // For the debug server's info: the map's name as one word ("-" when there is none) and the last perf: line (empty

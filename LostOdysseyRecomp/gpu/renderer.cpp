@@ -11779,6 +11779,22 @@ void main()
                                 failedPlan = true;
                                 return;
                             }
+                            // Switch 2 black textures (2026-11-18, first battle): the
+                            // first 48 slots that fall back to the black dummy, with
+                            // the fetch constant, so a missing texture can be told
+                            // from one that sampled black. Intentional post blur
+                            // dummies are not listed.
+                            if (!unusedPostBlur)
+                            {
+                                static std::atomic<uint32_t> dummyLogged{0};
+                                if (dummyLogged.fetch_add(1, std::memory_order_relaxed) < 48)
+                                    LOG_INFO("renderer: dummy texture f{} vs={:016x} ps={:016x} stage={} slot={} declared={} "
+                                             "type={} fmt={} dim={} tiled={} base={:#x} size={}x{} fetch={:08x} {:08x} {:08x} {:08x} {:08x} {:08x}",
+                                        frame, key.vs, key.ps, s == ps ? "ps" : "vs", slot, declared, fetch[0] & 3, fetch[1] & 0x3F,
+                                        (fetch[5] >> 9) & 3, (fetch[0] >> 31) & 1, (fetch[1] >> 12) << 12,
+                                        (fetch[2] & 0x1FFF) + 1, ((fetch[2] >> 13) & 0x1FFF) + 1,
+                                        fetch[0], fetch[1], fetch[2], fetch[3], fetch[4], fetch[5]);
+                            }
                             // Descriptor sets are pooled and reused, so a slot the
                             // shader reads must always be written: otherwise it keeps
                             // the texture some earlier draw left there.

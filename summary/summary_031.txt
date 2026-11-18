@@ -1,0 +1,55 @@
+================================================================================
+LostOdysseyRecomp - Nintendo Switch 2 port
+Summary - TURN 31: New Game works; first battle has black/missing textures and stutter
+================================================================================
+Build: NRO md5 e6f63adc58004c742dd7be82d7c02909 (Desktop copy matches).
+ELF: build/battlediag_turn31_e6f63adc.elf. kaiHEN fix untouched.
+
+USER REPORT (build abad5bf1, regenerated PPC from turn 30)
+  The opening movie plays and the game reaches the first battle. Textures are
+  missing or black, and the battle stutters. No crash; closed with HOME -> X.
+
+LOG READ ("lo project/test2", runtime-1795032121429506.log, env
+LO_GUEST_AFFINITY=1 + LO_TRACE_MOVIE=1)
+  * "scene ready: battle 1 after 196.2 s" at 257.8 s: the opening is fixed.
+  * No renderer warning at all: no "unsupported texture format", "texture
+    creation failed", "upload extent invalid". Textures are created; whatever
+    is black is not a failed host texture.
+  * Stutter: 263-282 s, runs of ~47 ms frames, cp_idle_ms ~43 of each, GPU
+    10-15 ms. The command processor waits for the game: the guest is late.
+    Guest_Main 73-79 %, rendering thread (Guest 82beca90) 42 %; no shader
+    or pipeline builds (variants built 2840/2840). perf: fps 52.1, p95 46.9.
+    cpu_mhz 1101 (handheld).
+  * GPU time on entering the battle 29 ms -> dynamic resolution fell to 432
+    rows. Later frames 13-17 ms GPU.
+  * occlusion history in battle: reads 191914, ready 178285, zero 178387.
+    Most deferred reads already have the host count and it is 0. The notes
+    (docs/notes/occlusion-queries.md) show 80 % zero in rooms is normal, so
+    this is not proven wrong. Before turn 30 this hook read zeroed caller
+    registers (sub_823CE960 is on non_volatile_in_context), so every object
+    shared one key; now each has its own.
+  * C/E alias scans only ran at 17 s and 42 s (no data). GPU reads textures
+    through A (0xA0000000 + physical); physical allocations hand out A. A
+    texture written through C/E would read black on the heap backend, so
+    the scan now also runs during stutter (below).
+
+CHANGES (diagnostics)
+  * gpu/renderer.cpp: the first 48 texture slots that fall back to the black
+    dummy texture are logged ("renderer: dummy texture f... vs ps stage slot
+    declared type fmt dim tiled base size fetch[6]"). Intentional post-blur
+    dummies are skipped.
+  * debug/perf_stats: HitchCount() (all hitches, logged or not).
+  * os/switch/switch_runtime.cpp watchdog: when 8+ hitches come within 3 s,
+    a "stutter sample" (thread states, 1.5 s hot stacks, fence waits, C/E
+    alias scan). 3 at most, 30 s apart. LO_STUTTER_SAMPLES=0 disables.
+  * kernel/imports.cpp: LogStutterSample (header line in the runtime log).
+
+NEXT (user)
+  Run 1: env.txt = LO_GUEST_AFFINITY=1 only. Reach the battle, take a console
+  screenshot of the black textures, play ~30 s. Read "dummy texture",
+  "stutter sample", hot stacks and alias lines.
+  A/B runs, one setting each added to run 1's env:
+    LO_TEXTURE_BC=0      (BC textures decoded on the CPU instead of NVK BC)
+    LO_TRIM_VARYINGS=0   (no vertex-output trimming, Switch Vulkan only)
+    LO_TEXINFO_SPEC=0    (no texture-specialised shader variants)
+  Whichever makes the textures right names the faulty path.

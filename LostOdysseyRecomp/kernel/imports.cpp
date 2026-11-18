@@ -1,5 +1,6 @@
 #include <discord/presence.h>
 #include <stdafx.h>
+#include <debug/perf_stats.h>
 #include <settings/config.h>
 #include <vector>
 #include <algorithm>
@@ -634,8 +635,12 @@ void DumpGuestAliasUsage()
     GuestAddressSpace::DescribeAliasUsage(text, sizeof(text));
     LOG_WARNING("guest alias views: {}", text);
 }
+// The header of a stutter sample (os/switch/switch_runtime.cpp, ExitWatchdogMain).
+void LogStutterSample(int sample, uint32_t hitches)
+{
+    LOG_WARNING("stutter sample {}: {} hitches in under 3 s (last {})", sample, hitches, perf_stats::LastPerfLine());
+}
 #endif
-
 static inline void CloseKernelObject(XDISPATCHER_HEADER& header)
 {
     if (header.WaitListHead.Flink != OBJECT_SIGNATURE)

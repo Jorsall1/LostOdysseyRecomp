@@ -79,6 +79,7 @@ const Config& GetConfig()
 std::atomic<uint64_t> g_cpIdleNs{0};
 std::atomic<uint64_t> g_draws{0};
 std::atomic<uint32_t> g_lastDraws{0};
+std::atomic<uint32_t> g_hitchTotal{0}; // every hitch, logged or not (HitchCount)
 std::atomic<uint64_t> g_sceneSize{0}; // width << 32 | height
 std::atomic<uint32_t> g_gpuMhz{0};
 
@@ -663,6 +664,8 @@ void Present(const PresentSample& sample)
             g_window.intervals.push_back(intervalMs);
         g_window.hitches += hitch;
     }
+    if (hitch)
+        g_hitchTotal.fetch_add(1, std::memory_order_relaxed);
     if (hitch && perf && hitchesLogged < config.hitchLimit)
     {
         ++hitchesLogged;
@@ -704,6 +707,10 @@ std::string LastPerfLine()
     return g_lastLine;
 }
 
+uint32_t HitchCount()
+{
+    return g_hitchTotal.load(std::memory_order_relaxed);
+}
 uint64_t TotalDraws()
 {
     return g_draws.load(std::memory_order_relaxed);
