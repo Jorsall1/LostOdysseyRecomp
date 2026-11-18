@@ -967,6 +967,11 @@ uint8_t* Allocate()
     // reaches guest memory through A (XMA, GPU copies, the unbacked-read
     // repair) keeps working; the hardware-alias paths are the documented loss.
     Diag("backend: heap (no svcMap*, A/C/E are distinct ranges of one %#zx MiB block)", kSize >> 20);
+    // Cleared so that DescribeAliasUsage can tell what the game wrote through
+    // C or E from leftover heap contents. Heap memory is already backed on
+    // Horizon, so this only costs the stores (1 GiB, once).
+    std::memset(s_base + kStarts[2], 0, kSize - kStarts[2]);
+    EarlyLog("allocate: C and E views cleared");
 #endif
     // The guest null page stays unmapped: chunk 0 is committed from 0x1000.
     return s_base;
@@ -1193,6 +1198,75 @@ size_t CommittedBytes()
 {
     std::lock_guard lock(s_mutex);
     return s_committedBytes;
+}
+
+void DescribeAliasUsage(char* out, size_t size)
+{
+    if (!out || size == 0)
+        return;
+    out[0] = 0;
+    if (!s_base || s_backend != Backend::Heap)
+    {
+        std::snprintf(out, size, "not the heap backend (C and E alias A)");
+        return;
+    }
+    size_t length = 0;
+    auto append = [&](const char* format, auto... args)
+    {
+        if (length + 1 >= size)
+            return;
+        const int written = std::snprintf(out + length, size - length, format, args...);
+        if (written > 0)
+            length = std::min(size - 1, length + size_t(written));
+    };
+    uint32_t used = 0;
+    uint64_t usedWords = 0;
+    for (int view = 2; view <= 3; ++view)
+    {
+        const uint64_t viewStart = kStarts[view];
+        const uint64_t viewEnd = view == 2 ? kStarts[3] : kSize;
+        // E+y is physical y+0x1000, so its A counterpart is one page higher.
+        const uint64_t toA = view == 2 ? viewStart - kStarts[1] : viewStart - kStarts[1] - kPage;
+        for (uint64_t chunk = viewStart; chunk < viewEnd; chunk += kChunk)
+        {
+            const auto* words = reinterpret_cast<const uint64_t*>(s_base + chunk);
+            const size_t count = kChunk / sizeof(uint64_t);
+            size_t nonzero = 0, first = count, differ = 0;
+            for (size_t i = 0; i < count; ++i)
+            {
+                if (words[i] == 0)
+                    continue;
+                if (first == count)
+                    first = i;
+                ++nonzero;
+                const uint64_t a = chunk + i * 8 - toA;
+                if (a + 8 > kStarts[2] || std::memcmp(s_base + a, &words[i], 8) != 0)
+                    ++differ;
+            }
+            if (!nonzero)
+                continue;
+            ++used;
+            usedWords += nonzero;
+            if (used <= 24)
+            {
+                const uint64_t at = chunk + first * 8;
+                const uint64_t a = at - toA;
+                uint64_t value = 0, aValue = 0;
+                std::memcpy(&value, s_base + at, 8);
+                if (a + 8 <= kStarts[2])
+                    std::memcpy(&aValue, s_base + a, 8);
+                append("%s%c+%#llx: %zu words, %zu differ from A, first %#llx = %016llx (A %#llx = %016llx)",
+                    used == 1 ? "" : "; ", view == 2 ? 'C' : 'E', (unsigned long long)(chunk - viewStart), nonzero,
+                    differ, (unsigned long long)at, (unsigned long long)__builtin_bswap64(value),
+                    (unsigned long long)a, (unsigned long long)__builtin_bswap64(aValue));
+            }
+        }
+    }
+    if (used == 0)
+        append("C and E hold no data (the game has not written through them)");
+    else
+        append(" | %u chunks of 2 MiB with data, %llu non-zero words%s", used, (unsigned long long)usedWords,
+            used > 24 ? " (first 24 listed)" : "");
 }
 
 const char* DiagnosticsText()

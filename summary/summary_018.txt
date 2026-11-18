@@ -1,0 +1,55 @@
+================================================================================
+LostOdysseyRecomp - Nintendo Switch 2 port
+Summary - TURN 18: hang diagnostic build
+================================================================================
+NRO md5 39483ef6437c5dc9dc01f91fdd1c9665 (Desktop copy matches). Build OK.
+The kaiHEN fix (5cde9314, RawInitialize -> fsOpenSdCardFileSystem) is untouched.
+EXTRA FINDING WHILE READING CODE
+  * sub_827C12E0 (the waiters on 0x55e374 / 0x55e3c4) is the ENTRY function of
+    two D3D worker threads: wait on event (obj+32) until their queue
+    (obj+56 != obj+60) has work; 30 ms timed waits on one of them, none on the
+    other. Their empty backtraces are correct (thread roots). They are
+    probably idle, not the hang.
+  * sub_82485920 = loading screen begin (sets *(0x83318040) = 1),
+    sub_82485A08 = end (flushes, clears it). Callers: sub_8235A9C0 (both),
+    sub_827C6A50 (begin), sub_827C8018 (end).
+  * The existing slot-288 probe in sub_82485030 printed nothing in either
+    run, so Guest Main's pending-object purge is not where it waits.
+CHANGES (diagnostics only; no game behaviour change except C/E cleared at boot)
+  kernel/imports.cpp
+    * ThreadWaitState: hostTag (the runtime log's tXXXX) and timeoutMs. The
+      dump prints " timeout=none|Nms host=tXXXX" per thread.
+    * GuestBacktrace() helper (shared by the dump and the sampler).
+    * HangWatch: 24 watched keys (guest address for Ke*, handle for Nt*),
+      seeded 0x55e3c4, 0x55e374, 0x832e0140, 0x56d850. The dump adds any
+      object waited on >= 5 s ("(now watched)"). Every wait, KeSetEvent,
+      KeResetEvent, NtSetEvent, NtPulseEvent, NtClearEvent, KeReleaseSemaphore,
+      NtReleaseSemaphore and host KernelSignalEventHandle on a watched key logs
+      "watch: <op> <key> by [thread] tXXXX pcr= lr=" (32 lines per key).
+    * DumpGuestHotStacks(): 300 samples every 5 ms of every thread not parked
+      in a wait older than 200 ms; top 6 (liveLr + 8 callers) per thread.
+    * DumpHangWatch(): each key's event state and logged-operation count.
+    * DumpGuestAliasUsage() -> GuestAddressSpace::DescribeAliasUsage.
+  kernel/guest_address_space_switch.cpp / .h
+    * Switch 2 heap backend: C and E (1 GiB) memset to 0 right after the heap
+      window is ready (early_boot.log "allocate: C and E views cleared").
+    * DescribeAliasUsage: per 2 MiB C/E chunk with non-zero words: count,
+      how many differ from A at the same physical offset (E+y = A+y+0x1000),
+      first word and its A counterpart. Up to 24 chunks listed.
+  cpu/poll_wait.cpp
+    * PPC_FUNC overrides of sub_82485920 / sub_82485A08:
+      "loading screen begin|end: caller lr= pcr= flag=" (64 lines max).
+  os/switch/switch_runtime.cpp
+    * Watchdog: diagnostics at 15 s AND 40 s (DumpGuestThreadStates,
+      DumpHangWatch, DumpGuestHotStacks, DumpGuestAliasUsage), skipped once an
+      exit or HOME -> X has started. stderr gets "[watchdog] guest
+      diagnostics N done". Each pass takes about 2 s on the watchdog thread.
+TEST
+  Same env.txt. Let it sit on the loading screen for at least 50 s (past the
+  40 s pass), then HOME -> X. Send runtime-*.log, stderr.log, early_boot.log.
+WHAT TO LOOK FOR
+  * "guest hot stacks": Guest Main's dominant stack = the polling loop.
+  * "watch:" lines: is any watched object ever signaled after its waiter
+    started?
+  * "loading screen begin/end": begin with no end, and which caller.
+  * "guest alias views": any C/E data at all, and whether it differs from A.

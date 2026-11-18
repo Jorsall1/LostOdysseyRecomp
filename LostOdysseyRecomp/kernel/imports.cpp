@@ -20,6 +20,7 @@
 #include "xex_loader.h"
 #include "guest_printf.h"
 #include "critical_section.h"
+#include "guest_address_space.h"
 #include "io/file_system.h"
 #include <gpu/command_processor.h>
 #include <apu/audio.h>
@@ -55,6 +56,8 @@ struct ThreadWaitState
     uint64_t since = 0;
     PPCContext* ctx = nullptr; // live context, read racily for diagnostics only
     char name[32] = {};        // host thread name ("Guest 82beca90"), when known
+    uint32_t hostTag = 0;      // the "tXXXX" the runtime log prints for this thread
+    uint32_t timeoutMs = 0;    // of the current wait; INFINITE when it has none
 };
 
 static Mutex g_waitStatesMutex;
@@ -84,6 +87,7 @@ static ThreadWaitState& CurrentWaitState()
         guard.state = new ThreadWaitState();
         guard.state->threadId = GuestThread::GetCurrentThreadId();
         guard.state->ctx = g_ppcContext;
+        guard.state->hostTag = os::logger::ThreadTag();
 #if LO_PLATFORM_SWITCH
         os::switch_cpu_profiler::TryGetCurrentThreadName(guard.state->name, sizeof(guard.state->name));
 #endif
@@ -160,6 +164,65 @@ std::string TakeGuestWaitProfile(size_t top)
     return out;
 }
 
+// ---------------------------------------------------------------------------
+// Hang watch (Switch 2 loading hold, 2026-11-18): every wait on, and every
+// signal or reset of, a watched object is logged with the guest caller and
+// the thread, so a stalled waiter shows whether anyone ever signals it.
+// Seeded with the objects threads sat on in both hung runs (dumps of
+// runtime-1795003050370953 and -1795006793382560); the 15 s and 40 s dumps
+// add every object a thread has waited on for 5 s or more. Keys are guest
+// addresses for Ke* objects and handles for Nt* ones, as the dump prints them.
+// ---------------------------------------------------------------------------
+namespace HangWatch
+{
+    constexpr int kSlots = 24;
+    constexpr uint32_t kLogsPerObject = 32;
+    std::atomic<uint32_t> g_keys[kSlots] = {0x55e3c4, 0x55e374, 0x832e0140, 0x56d850};
+    std::atomic<uint32_t> g_logs[kSlots];
+
+    int Find(uint32_t key)
+    {
+        if (key == 0)
+            return -1;
+        for (int i = 0; i < kSlots; ++i)
+            if (g_keys[i].load(std::memory_order_relaxed) == key)
+                return i;
+        return -1;
+    }
+
+    // True when the key was not watched before.
+    bool Add(uint32_t key)
+    {
+        if (key == 0 || Find(key) >= 0)
+            return false;
+        for (auto& slot : g_keys)
+        {
+            uint32_t empty = 0;
+            if (slot.compare_exchange_strong(empty, key, std::memory_order_acq_rel))
+                return true;
+        }
+        return false;
+    }
+
+    void Note(uint32_t key, const char* operation)
+    {
+        const int index = Find(key);
+        if (index < 0)
+            return;
+        const uint32_t count = g_logs[index].fetch_add(1, std::memory_order_relaxed);
+        if (count >= kLogsPerObject)
+            return;
+        char name[32] = "?";
+#if LO_PLATFORM_SWITCH
+        os::switch_cpu_profiler::TryGetCurrentThreadName(name, sizeof(name));
+#endif
+        LOG_WARNING("watch: {} {:#x} by [{}] t{:04x} pcr={:#x} lr={:#x}{}", operation, key, name,
+            os::logger::ThreadTag(), g_ppcContext ? g_ppcContext->r13.u32 : 0,
+            g_ppcContext ? uint32_t(g_ppcContext->lr) : 0,
+            count + 1 == kLogsPerObject ? " (last line for this object)" : "");
+    }
+}
+
 struct WaitScope
 {
     ThreadWaitState& st;
@@ -180,6 +243,8 @@ struct WaitScope
         st.pcr = g_ppcContext ? g_ppcContext->r13.u32 : 0;
         st.r1 = g_ppcContext ? g_ppcContext->r1.u32 : 0;
         st.since = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        st.timeoutMs = INFINITE;
+        HangWatch::Note(object, what);
     }
     ~WaitScope()
     {
@@ -195,6 +260,26 @@ struct WaitScope
     }
 };
 
+// Guest backtrace: back chain at [r1], saved LR at [caller_r1 - 8]. Read
+// racily from a running thread's stack, for diagnostics only. An empty one
+// means the frame is the thread's entry function.
+static std::string GuestBacktrace(uint32_t frame, int depth)
+{
+    std::string bt;
+    for (int i = 0; i < depth && frame >= 0x1000 && frame < 0x7C000000; i++)
+    {
+        uint32_t caller = *reinterpret_cast<be<uint32_t>*>(g_memory.Translate(frame));
+        if (caller <= frame || caller >= 0x7C000000)
+            break;
+        uint32_t ret = *reinterpret_cast<be<uint32_t>*>(g_memory.Translate(caller - 8));
+        if (ret < 0x82000000 || ret >= 0x83400000)
+            break;
+        bt += fmt::format(" {:#x}", ret);
+        frame = caller;
+    }
+    return bt;
+}
+
 void DumpGuestThreadStates()
 {
     uint64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -208,20 +293,13 @@ void DumpGuestThreadStates()
         if (running && (liveLr == 0x82BECACC || liveLr == 0)) // idle pool thread / unknown
             continue;
 
-        // Guest backtrace: back chain at [r1], saved LR at [caller_r1 - 8].
-        std::string bt;
-        uint32_t frame = running ? liveR1 : st->r1;
-        for (int i = 0; i < 12 && frame >= 0x1000 && frame < 0x7C000000; i++)
-        {
-            uint32_t caller = *reinterpret_cast<be<uint32_t>*>(g_memory.Translate(frame));
-            if (caller <= frame || caller >= 0x7C000000)
-                break;
-            uint32_t ret = *reinterpret_cast<be<uint32_t>*>(g_memory.Translate(caller - 8));
-            if (ret < 0x82000000 || ret >= 0x83400000)
-                break;
-            bt += fmt::format(" {:#x}", ret);
-            frame = caller;
-        }
+        std::string bt = GuestBacktrace(running ? liveR1 : st->r1, 12);
+        // An object waited on for 5 s or more is watched from now on (HangWatch).
+        if (!running && st->object != 0 && now - st->since >= 5000 && HangWatch::Add(st->object))
+            bt += " (now watched)";
+        if (!running)
+            bt += st->timeoutMs == INFINITE ? " timeout=none" : fmt::format(" timeout={}ms", st->timeoutMs);
+        bt += fmt::format(" host=t{:04x}", st->hostTag);
         // A thread in front of a guest critical section: OwningThread holds the
         // owner's PCR, so the dump names the thread that holds the lock. Without
         // it a stall dump cannot tell a holder blocked in a kernel call (it is
@@ -237,6 +315,67 @@ void DumpGuestThreadStates()
         LOG_WARNING("  tid={:#x} [{}] pcr={:#x} {} obj={:#x}{} lr={:#x} liveLr={:#x} for {} ms bt:{}", st->threadId, st->name[0] ? st->name : "?", st->pcr, st->what, st->object, holder, st->lr, liveLr, running ? 0 : now - st->since, bt);
     }
 }
+
+// The guest stacks of the threads that are NOT parked in a long kernel wait,
+// sampled every 5 ms for 1.5 s. A thread that polls (Sleep(0) loops, frame
+// ticks that keep asking "done yet?") never shows up as blocked in the dump
+// above; its most common stacks name the loop it is in. Diagnostics only: the
+// live context and stack are read without stopping the thread.
+void DumpGuestHotStacks()
+{
+    struct Totals
+    {
+        std::string name;
+        uint32_t hostTag = 0;
+        uint32_t samples = 0;
+        std::map<std::string, uint32_t> chains;
+    };
+    std::map<uint32_t, Totals> threads;
+    constexpr int kSamples = 300;
+    for (int sample = 0; sample < kSamples; ++sample)
+    {
+        const uint64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        {
+            std::lock_guard lock(g_waitStatesMutex);
+            for (auto* st : g_waitStates)
+            {
+                if (!st->ctx)
+                    continue;
+                const bool running = st->what[0] == 'r';
+                if (!running && now - st->since > 200)
+                    continue; // parked: already named by the dump
+                const uint32_t liveLr = uint32_t(st->ctx->lr);
+                if (liveLr == 0 || liveLr == 0x82BECACC) // idle pool thread / unknown
+                    continue;
+                Totals& totals = threads[st->threadId];
+                if (totals.samples == 0)
+                {
+                    totals.name = st->name[0] ? st->name : "?";
+                    totals.hostTag = st->hostTag;
+                }
+                ++totals.samples;
+                std::string chain = fmt::format("{:#x}{}", liveLr, running ? "" : fmt::format(" ({})", st->what));
+                chain += GuestBacktrace(st->ctx->r1.u32, 8);
+                ++totals.chains[chain];
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    LOG_WARNING("guest hot stacks ({} samples over 1.5 s, threads not parked in a long wait; liveLr then callers):", kSamples);
+    for (auto& [threadId, totals] : threads)
+    {
+        std::vector<std::pair<uint32_t, const std::string*>> sorted;
+        for (auto& [chain, count] : totals.chains)
+            sorted.emplace_back(count, &chain);
+        std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+        LOG_WARNING("  tid={:#x} [{}] host=t{:04x}: {} samples, {} distinct stacks", threadId, totals.name,
+            totals.hostTag, totals.samples, sorted.size());
+        for (size_t i = 0; i < sorted.size() && i < 6; ++i)
+            LOG_WARNING("    {:5.1f}%  {}", 100.0 * sorted[i].first / totals.samples, *sorted[i].second);
+    }
+}
+
 
 // ---------------------------------------------------------------------------
 // Guest critical sections handed over while a thread is parked in a fence wait
@@ -451,6 +590,52 @@ struct Mutant final : KernelObject, HostObject<XDISPATCHER_HEADER>
     bool Release() { return state.Release(g_ppcContext->r13.u32); }
 };
 
+// The watch list with the state of each object (event objects only) and how
+// many waits, signals and resets it has logged.
+void DumpHangWatch()
+{
+    std::string text;
+    for (int i = 0; i < HangWatch::kSlots; ++i)
+    {
+        const uint32_t key = HangWatch::g_keys[i].load(std::memory_order_relaxed);
+        if (key == 0)
+            continue;
+        std::string state = "?";
+        if (key >= 0x7C000000)
+        {
+            if (auto event = GetKernelObject<Event>(key))
+                state = event->IsSignaled() ? "event set" : "event clear";
+            else
+                state = "handle (not an event)";
+        }
+        else if (key >= 0x1000 && key + sizeof(XDISPATCHER_HEADER) <= PPC_MEMORY_SIZE)
+        {
+            auto* header = reinterpret_cast<XDISPATCHER_HEADER*>(g_memory.Translate(key));
+            if (header->Type == 0 || header->Type == 1)
+            {
+                auto event = TryQueryKernelObject<Event>(*header);
+                state = !event ? "event (never used by the kernel)" : event->IsSignaled() ? "event set" : "event clear";
+            }
+            else
+                state = fmt::format("type {}", unsigned(header->Type));
+        }
+        text += fmt::format("\n  {:#x}: {}, {} logged operations", key, state,
+            HangWatch::g_logs[i].load(std::memory_order_relaxed));
+    }
+    LOG_WARNING("hang watch:{}", text.empty() ? std::string(" (empty)") : text);
+}
+
+#if LO_PLATFORM_SWITCH
+// Which C (0xC0000000) and E (0xE0000000) view chunks the guest has written.
+// On the Switch 2 heap backend these are separate memory, not aliases of A.
+void DumpGuestAliasUsage()
+{
+    static char text[4096];
+    GuestAddressSpace::DescribeAliasUsage(text, sizeof(text));
+    LOG_WARNING("guest alias views: {}", text);
+}
+#endif
+
 static inline void CloseKernelObject(XDISPATCHER_HEADER& header)
 {
     if (header.WaitListHead.Flink != OBJECT_SIGNATURE)
@@ -489,6 +674,7 @@ void KernelSignalEventHandle(uint32_t handle)
 {
     if (handle == 0 || handle == GUEST_INVALID_HANDLE_VALUE)
         return;
+    HangWatch::Note(handle, "host set");
     if (auto event = GetKernelObject<Event>(handle)) event->Set();
 }
 
@@ -510,6 +696,7 @@ static uint32_t NtSetEvent(uint32_t handle, be<uint32_t>* previousState)
     static const bool traceEvents = getenv("LO_TRACE_EVENTS") != nullptr;
     if (traceEvents)
         LOG_KERNEL("handle={:#x} lr={:#x}", handle, uint32_t(g_ppcContext->lr));
+    HangWatch::Note(handle, "NtSetEvent");
     auto ev = GetKernelObject<Event>(handle);
     if (!ev) return STATUS_INVALID_HANDLE;
     if (previousState)
@@ -520,6 +707,7 @@ static uint32_t NtSetEvent(uint32_t handle, be<uint32_t>* previousState)
 
 static uint32_t NtPulseEvent(uint32_t handle, be<uint32_t>* previousState)
 {
+    HangWatch::Note(handle, "NtPulseEvent");
     auto ev = GetKernelObject<Event>(handle);
     if (!ev) return STATUS_INVALID_HANDLE;
     if (previousState)
@@ -532,6 +720,7 @@ static uint32_t NtPulseEvent(uint32_t handle, be<uint32_t>* previousState)
 
 static uint32_t NtClearEvent(uint32_t handle)
 {
+    HangWatch::Note(handle, "NtClearEvent");
     auto event = GetKernelObject<Event>(handle);
     if (!event) return STATUS_INVALID_HANDLE;
     event->Reset();
@@ -543,12 +732,14 @@ static bool KeSetEvent(XKEVENT* pEvent, uint32_t Increment, bool Wait)
     static const bool traceEvents = getenv("LO_TRACE_EVENTS") != nullptr;
     if (traceEvents)
         LOG_KERNEL("event={:#x} lr={:#x}", g_memory.MapVirtual(pEvent), uint32_t(g_ppcContext->lr));
+    HangWatch::Note(g_memory.MapVirtual(pEvent), "KeSetEvent");
     bool result = QueryKernelObject<Event>(*pEvent)->Set();
     return result;
 }
 
 static bool KeResetEvent(XKEVENT* pEvent)
 {
+    HangWatch::Note(g_memory.MapVirtual(pEvent), "KeResetEvent");
     return QueryKernelObject<Event>(*pEvent)->Reset();
 }
 
@@ -558,6 +749,7 @@ static uint32_t KeWaitForSingleObject(XDISPATCHER_HEADER* Object, uint32_t WaitR
     if (Alertable && DeliverUserApcs())
         return STATUS_USER_APC;
     const uint32_t timeout = GuestTimeoutToMilliseconds(Timeout);
+    scope.st.timeoutMs = timeout;
     auto obj = ResolveWaitObject(Object);
     if (!obj)
         return STATUS_TIMEOUT;
@@ -586,7 +778,8 @@ static uint32_t KeWaitForMultipleObjects(uint32_t Count, xpointer<XDISPATCHER_HE
     if (Alertable && DeliverUserApcs()) return STATUS_USER_APC;
     WaitObjectList objects;
     for (size_t i = 0; i < Count; ++i) objects[i] = ResolveWaitObject(Objects[i]);
-    return WaitObjects({objects.data(), Count}, WaitType, GuestTimeoutToMilliseconds(Timeout));
+    scope.st.timeoutMs = GuestTimeoutToMilliseconds(Timeout);
+    return WaitObjects({objects.data(), Count}, WaitType, scope.st.timeoutMs);
 }
 static uint32_t NtWaitForSingleObjectEx(uint32_t Handle, uint32_t WaitMode, uint32_t Alertable, be<int64_t>* Timeout)
 {
@@ -594,7 +787,8 @@ static uint32_t NtWaitForSingleObjectEx(uint32_t Handle, uint32_t WaitMode, uint
     if (Alertable && DeliverUserApcs()) return STATUS_USER_APC;
     if (Handle == CURRENT_THREAD_HANDLE) return STATUS_TIMEOUT;
     auto object = GetKernelObject(Handle);
-    return object ? object->Wait(GuestTimeoutToMilliseconds(Timeout)) : STATUS_INVALID_HANDLE;
+    scope.st.timeoutMs = GuestTimeoutToMilliseconds(Timeout);
+    return object ? object->Wait(scope.st.timeoutMs) : STATUS_INVALID_HANDLE;
 }
 static uint32_t NtWaitForMultipleObjectsEx(uint32_t Count, be<uint32_t>* Handles, uint32_t WaitType, uint32_t WaitMode, uint32_t Alertable, be<int64_t>* Timeout)
 {
@@ -603,7 +797,8 @@ static uint32_t NtWaitForMultipleObjectsEx(uint32_t Count, be<uint32_t>* Handles
     if (Alertable && DeliverUserApcs()) return STATUS_USER_APC;
     WaitObjectList objects;
     for (size_t i = 0; i < Count; ++i) objects[i] = GetKernelObject(Handles[i]);
-    return WaitObjects({objects.data(), Count}, WaitType, GuestTimeoutToMilliseconds(Timeout));
+    scope.st.timeoutMs = GuestTimeoutToMilliseconds(Timeout);
+    return WaitObjects({objects.data(), Count}, WaitType, scope.st.timeoutMs);
 }
 
 static uint32_t NtCreateSemaphore(be<uint32_t>* Handle, XOBJECT_ATTRIBUTES* ObjectAttributes, uint32_t InitialCount, uint32_t MaximumCount)
@@ -615,6 +810,7 @@ static uint32_t NtCreateSemaphore(be<uint32_t>* Handle, XOBJECT_ATTRIBUTES* Obje
 
 static uint32_t NtReleaseSemaphore(uint32_t Handle, uint32_t ReleaseCount, be<int32_t>* PreviousCount)
 {
+    HangWatch::Note(Handle, "NtReleaseSemaphore");
     auto semaphore = GetKernelObject<Semaphore>(Handle);
     if (!semaphore) return STATUS_INVALID_HANDLE;
     uint32_t previousCount;
@@ -634,6 +830,7 @@ static void KeInitializeSemaphore(XKSEMAPHORE* semaphore, uint32_t count, uint32
 
 static uint32_t KeReleaseSemaphore(XKSEMAPHORE* semaphore, uint32_t increment, uint32_t adjustment, uint32_t wait)
 {
+    HangWatch::Note(g_memory.MapVirtual(semaphore), "KeReleaseSemaphore");
     auto object = QueryKernelObject<Semaphore>(semaphore->Header);
     uint32_t previous;
     object->Release(adjustment, &previous);

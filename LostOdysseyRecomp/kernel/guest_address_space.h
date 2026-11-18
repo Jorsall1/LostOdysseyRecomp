@@ -79,6 +79,11 @@ struct RepairInfo
     char layout[320];         // the chunk's memory blocks: "start-end tTYPE pPERM, ..."
 };
 RepairInfo LastRepair();
+// Switch 2 heap backend: C and E are cleared at boot, so any non-zero word
+// there was written by the game (or the host) through those views. Writes a
+// one-line summary of the 2 MiB C/E chunks holding data, each compared with
+// the same physical offset in A. Reads up to 1 GiB; diagnostics only.
+void DescribeAliasUsage(char* out, size_t size);
 // Logs LastRepair() as an error (patches/unbacked_guest_reads.cpp); the first few only.
 void LogRepair(const char* who);
 // One line with the Switch 2 syscall hints, memory regions and backend probe

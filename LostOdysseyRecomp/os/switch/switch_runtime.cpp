@@ -69,6 +69,9 @@ namespace apu { void StopDriverForExit(); }           // apu/audio.cpp: ends the
 namespace perf_stats { void StopMonitorForExit(); }   // debug/perf_stats.cpp: joins the perf: line thread
 namespace apu::xma { void Shutdown(); }               // apu/xma.cpp: stops the decoder worker
 void DumpGuestThreadStates();                         // kernel/imports.cpp: what every guest thread waits on
+void DumpHangWatch();                                 // kernel/imports.cpp: the watched objects and their state
+void DumpGuestHotStacks();                            // kernel/imports.cpp: stacks of the threads not blocked
+void DumpGuestAliasUsage();                           // kernel/imports.cpp: what the C/E views hold
 
 namespace os::switch_platform
 {
@@ -1648,6 +1651,7 @@ constexpr auto kExitWatchGrace = std::chrono::milliseconds(4000);
 // stops progressing with frames still presenting (the 100% loading bar) leaves
 // no other trace of which guest thread is waiting and on what.
 constexpr auto kGuestDumpAfter = std::chrono::seconds(15);
+constexpr auto kSecondGuestDumpAfter = std::chrono::seconds(40);
 
 // The watchdog's way out. It has already asked the game to quit the normal way
 // (SDL_EVENT_QUIT), and the GPU owner's cleanup did not finish in time, so the
@@ -1671,20 +1675,33 @@ void ExitWatchdogMain(void*)
     bool quitting = false;
     std::chrono::steady_clock::time_point quitSince{};
     const auto started = std::chrono::steady_clock::now();
-    bool dumpedGuestThreads = false;
+    int guestDumps = 0;
     for (;;)
     {
         svcSleepThread(int64_t(kExitWatchPollNs)); // a kernel sleep: nothing else has to run
         const auto now = std::chrono::steady_clock::now();
 
-        if (!dumpedGuestThreads && now - started >= kGuestDumpAfter)
+        // The GPU-stall watchdog in gpu/command_processor.cpp only dumps when
+        // swaps stop. A fade or loading bar that keeps presenting while the
+        // guest waits never reaches it, so dump here as well: at 15 s, and at
+        // 40 s, after the objects the first dump added to the hang watch have
+        // had 25 s to be signaled. Each pass also samples the stacks of the
+        // threads that are not blocked (DumpGuestHotStacks, 1.5 s) and scans
+        // the C/E views (DumpGuestAliasUsage).
+        if (guestDumps < 2 && now - started >= (guestDumps == 0 ? kGuestDumpAfter : kSecondGuestDumpAfter))
         {
-            dumpedGuestThreads = true;
-            // The GPU-stall watchdog in gpu/command_processor.cpp only dumps
-            // when swaps stop. A fade or loading bar that keeps presenting while
-            // the guest waits never reaches it, so dump once here as well.
-            std::fprintf(stderr, "[watchdog] guest thread states after 15 s (frames may still be presenting)\n");
-            DumpGuestThreadStates();
+            ++guestDumps;
+            if (!g_endHostThreads.load(std::memory_order_acquire) &&
+                !g_homeCloseRequested.load(std::memory_order_acquire))
+            {
+                std::fprintf(stderr, "[watchdog] guest thread states after %d s (frames may still be presenting)\n",
+                             guestDumps == 1 ? 15 : 40);
+                DumpGuestThreadStates();
+                DumpHangWatch();
+                DumpGuestHotStacks();
+                DumpGuestAliasUsage();
+                std::fprintf(stderr, "[watchdog] guest diagnostics %d done\n", guestDumps);
+            }
         }
 
         if (quitting)

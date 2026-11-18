@@ -276,3 +276,31 @@ PPC_FUNC(sub_823B63E0)
 
 // GpuPoll for the title GPU timestamp wait lives in debug/gpu_wait_trace.cpp.
 // That file already owns PPC_FUNC(sub_823B62A0) and PPC_FUNC(sub_827B6278).
+
+// Loading screen begin / end (Switch 2 loading hold, 2026-11-18). sub_82485920
+// sets the loading flag *(0x83318040) = 1 that keeps the rendering thread in
+// its loading-screen loop (sub_824856A0); sub_82485A08 flushes the rendering
+// commands and clears it. Both are called from sub_8235A9C0 and from the
+// 0x827C6A50 / 0x827C8018 paths. A hang with a begin and no end means the
+// code that ends the load never ran; the callers name which path started it.
+extern "C" PPC_FUNC(__imp__sub_82485920);
+extern "C" PPC_FUNC(__imp__sub_82485A08);
+static void LogLoadingScreen(const char* what, PPCContext& ctx)
+{
+    static std::atomic<uint32_t> logged{0};
+    if (logged.fetch_add(1, std::memory_order_relaxed) >= 64)
+        return;
+    uint8_t* const base = g_memory.base;
+    LOG_WARNING("loading screen {}: caller lr={:#x} pcr={:#x} flag={}", what, uint32_t(ctx.lr), ctx.r13.u32,
+        PPC_LOAD_U32(0x83318040));
+}
+PPC_FUNC(sub_82485920)
+{
+    LogLoadingScreen("begin", ctx);
+    __imp__sub_82485920(ctx, base);
+}
+PPC_FUNC(sub_82485A08)
+{
+    LogLoadingScreen("end", ctx);
+    __imp__sub_82485A08(ctx, base);
+}
