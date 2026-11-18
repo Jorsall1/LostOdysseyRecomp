@@ -21,8 +21,8 @@ pdata 0x8223f440, called through a vtable)
     * time passes preload: allocate M (sub_82814C30), start (sub_82815248).
     * every tick: sub_82375b18(M); if M+104 == 2 -> M+104 = 3 and
       owner->vtable[+280](M) (tells the owner the movie is ready).
-    * time reaches start: M+16 = 1, sub_82b5caa0, byte 0x8324797C... (r25
-      -31964:31020) = 1 (movie playing); then sub_823efbe0(M, time) / the
+    * time reaches start: M+16 = 1, sub_82b5caa0, byte 0x8324792C (r25
+      -31964 + 31020) = 1 (movie playing); then sub_823efbe0(M, time) / the
       render command that plays it.
     * time reaches end: release (sub_82814570).
   Since M+104 never became 3, this tick has not run since the player was
