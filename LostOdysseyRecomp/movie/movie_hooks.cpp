@@ -25,6 +25,7 @@
 
 #include <os/logger.h>
 #include <os/thread_name.h>
+#include <kernel/memory.h>
 #include <kernel/io/file_system.h>
 #include <host_ui/host_ui.h>
 #include <modding/fpi_index.h>
@@ -48,6 +49,8 @@ extern "C" PPC_FUNC(__imp__sub_823F0FA8);
 extern "C" PPC_FUNC(__imp__sub_82CE9248);
 extern "C" PPC_FUNC(__imp__sub_82CE9FD8);
 extern "C" PPC_FUNC(__imp__sub_82CF8140);
+extern "C" PPC_FUNC(__imp__sub_82815208);
+extern "C" PPC_FUNC(__imp__sub_82813A50);
 
 namespace
 {
@@ -80,6 +83,7 @@ struct Movie
 {
     std::unique_ptr<movie::WmvStream> stream;
     std::string name;
+    uint32_t object = 0;      // guest movie object M (diagnostics)
     uint32_t player = 0;      // guest player object (M+20)
     bool started = false;     // first frame requested
     uint64_t startNs = 0;     // game time of the first request
@@ -102,6 +106,8 @@ struct Movie
 
 std::mutex g_mutex;
 std::unique_ptr<Movie> g_movie;
+// Diagnostics: calls of the movie stream job (sub_82815208) and stream read requests (sub_82813A50).
+std::atomic<uint32_t> g_jobTicks{0}, g_streamRequests{0};
 
 // Archive and offset of a movie file on the current disc, from its LO.fpi.
 struct Location
@@ -259,6 +265,31 @@ void LogStatus(Movie& movie, const char* why)
                 movie.name, why, age.count(), movie.calls, movie.noNew, movie.guestWrote, movie.errors, movie.lastResult,
                 movie.lastTimeMs, movie.shown, movie.stream ? movie.stream->DecodedFrames() : 0, queued, frontPts, ended,
                 movie.stream ? movie.stream->LastError() : std::string());
+    // The movie object's stream state (see sub_828143C8 / sub_82813A50): M+104 player state (2 = created), M+108
+    // stream step 0-3, info (M+44) +20 load status (2 = done), +22 request (1 = pending, 255 = released),
+    // +24 destination, +28 size, +36 file size, +40 offset; caches M+48 / M+76: +12 buffer, +20 loaded, +24 end.
+    const uint32_t m = movie.object;
+    auto r32 = [](uint32_t a) -> uint32_t {
+        return g_memory.base && a >= 0x10000 && a < 0xFFFFFFF0u ? __builtin_bswap32(*reinterpret_cast<const uint32_t*>(g_memory.base + a)) : 0;
+    };
+    auto r16 = [](uint32_t a) -> uint32_t {
+        return g_memory.base && a >= 0x10000 && a < 0xFFFFFFF0u ? __builtin_bswap16(*reinterpret_cast<const uint16_t*>(g_memory.base + a)) : 0;
+    };
+    if (!m) return;
+    const uint32_t info = r32(m + 44);
+    LOG_WARNING("native movie: {} object M={:#x} flags8={:#x} state104={} step108={} info={:#x} status20={} request22={} "
+                "dest24={:#x} size28={:#x} file36={:#x} offset40={:#x} cache48 buf={:#x} loaded={:#x} end={:#x} "
+                "cache76 buf={:#x} loaded={:#x} end={:#x} jobTicks={} requests={}",
+                movie.name, m, r32(m + 8) >> 24, int16_t(r16(m + 104)), r32(m + 108), info, info ? r16(info + 20) : 0,
+                info ? r16(info + 22) : 0, info ? r32(info + 24) : 0, info ? r32(info + 28) : 0, info ? r32(info + 36) : 0,
+                info ? r32(info + 44) : 0, r32(m + 48 + 12), r32(m + 48 + 20), r32(m + 48 + 24), r32(m + 76 + 12),
+                r32(m + 76 + 20), r32(m + 76 + 24), g_jobTicks.load(), g_streamRequests.load());
+    std::string words;
+    for (uint32_t i = 0; i < 128; i += 4) words += fmt::format(" {:08x}", r32(m + i));
+    LOG_WARNING("native movie: M+0..127:{}", words);
+    words.clear();
+    for (uint32_t i = 0; i < 68 && info; i += 4) words += fmt::format(" {:08x}", r32(info + i));
+    LOG_WARNING("native movie: info+0..67:{}", words);
 }
 }
 
@@ -316,6 +347,7 @@ PPC_FUNC(sub_82815060)
         return;
     }
     movie->player = player;
+    movie->object = m;
     movie->stream->Start(DecoderThreadSetup);
     LOG_NOTICE("native movie: {} {}x{} video track {} at {}+{:#x}, player {:#x}", movie->name, movie->stream->Width(),
                movie->stream->Height(), videoTrack, location.archive, location.offset, player);
@@ -501,6 +533,33 @@ PPC_FUNC(sub_82CF8140)
     (void)lower;
 #endif
     __imp__sub_82CF8140(ctx, base);
+}
+
+// Diagnostics (2026-11-18, mv_01v stuck after New Game): the movie's stream job, run by the game's job threads.
+// It returns at once while M+104 < 2 (player not created), else steps the stream state machine (sub_828143C8).
+PPC_FUNC(sub_82815208)
+{
+    const uint32_t m = ctx.r3.u32;
+    const uint32_t ticks = ++g_jobTicks;
+    if (ticks <= 3)
+        LOG_NOTICE("native movie: stream job #{} M={:#x} state104={} step108={}", ticks, m,
+                   int16_t(PPC_LOAD_U16(m + 104)), PPC_LOAD_U32(m + 108));
+    __imp__sub_82815208(ctx, base);
+}
+
+// Stream read request: r3 = M, r4 = cache (M+48 / M+76), r5 = 0 issue / 1 collect. Returns 1 when issued/collected.
+PPC_FUNC(sub_82813A50)
+{
+    const uint32_t m = ctx.r3.u32, cache = ctx.r4.u32, mode = ctx.r5.u32;
+    __imp__sub_82813A50(ctx, base);
+    const uint32_t n = ++g_streamRequests;
+    if (n <= 12)
+    {
+        const uint32_t info = PPC_LOAD_U32(m + 44);
+        LOG_NOTICE("native movie: stream request #{} M={:#x} cache=+{} mode={} -> {} (loaded {:#x} of {:#x}, status20={} request22={})",
+                   n, m, cache - m, mode, ctx.r3.u32, PPC_LOAD_U32(cache + 20), info ? PPC_LOAD_U32(info + 36) : 0,
+                   info ? PPC_LOAD_U16(info + 20) : 0, info ? PPC_LOAD_U16(info + 22) : 0);
+    }
 }
 
 bool movie::NativeMoviesEnabled()
