@@ -64,10 +64,10 @@ index b2149f3..63ab2c6 100644
          // adds such pipelines to its binary archive. Vulkan caches every pipeline.
 diff --git a/plume_spirv_trim.h b/plume_spirv_trim.h
 new file mode 100644
-index 0000000..4159125
+index 0000000..4ae36d7
 --- /dev/null
 +++ b/plume_spirv_trim.h
-@@ -0,0 +1,418 @@
+@@ -0,0 +1,449 @@
 +//
 +// LostOdysseyRecomp: removes vertex shader outputs that the paired fragment
 +// shader never reads.
@@ -87,6 +87,7 @@ index 0000000..4159125
 +
 +#pragma once
 +
++#include <atomic>
 +#include <cstdint>
 +#include <unordered_map>
 +#include <unordered_set>
@@ -485,9 +486,39 @@ index 0000000..4159125
 +        out.insert(out.end(), words.begin() + insertAt, words.end());
 +        return true;
 +    }
++    // LostOdysseyRecomp (turn 63, Switch 2): the translated shaders fetch vertices through the vertex arena's device
++    // address and clamp the byte offset at 1 GiB - N (N = 4, 8, 12, 16 for Load..Load4; common_hlsl_text.inc), which
++    // is right only for a 1 GiB arena. The Switch 2 arena is 512 MiB, so an out-of-range fetch (a guest index past its
++    // buffer) read up to 512 MiB past the arena's end through a raw address: a GPU MMU fault, the channel error that
++    // stopped the GPU. The renderer sets the arena size here before it creates shaders; with an arena under 1 GiB,
++    // every 32-bit integer OpConstant 1 GiB - N becomes arenaBytes - N, so the clamp (and its out-of-range test) stays
++    // inside the arena. Returns the constants changed.
++    inline std::atomic<uint32_t> vertexArenaBytes{ 0 };
++    inline uint32_t ClampVertexArenaFetch(std::vector<uint32_t> &words) {
++        constexpr uint32_t kGiB = 1u << 30;
++        const uint32_t arena = vertexArenaBytes.load(std::memory_order_relaxed);
++        if (arena < 64 || arena >= kGiB) return 0;
++        std::vector<Instruction> instructions;
++        if (!Parse(words, instructions)) return 0;
++        constexpr uint32_t kOpConstant = 43;
++        std::unordered_set<uint32_t> int32Types;
++        uint32_t changed = 0;
++        for (const auto &ins : instructions) {
++            if (ins.opcode == op::TypeInt && ins.count == 4 && words[ins.offset + 2] == 32) {
++                int32Types.insert(words[ins.offset + 1]);
++            } else if (ins.opcode == kOpConstant && ins.count == 4 && int32Types.count(words[ins.offset + 1])) {
++                uint32_t &value = words[ins.offset + 3];
++                if (value == kGiB - 4u || value == kGiB - 8u || value == kGiB - 12u || value == kGiB - 16u) {
++                    value = arena - (kGiB - value);
++                    ++changed;
++                }
++            }
++        }
++        return changed;
++    }
 +};
 diff --git a/plume_vulkan.cpp b/plume_vulkan.cpp
-index 3f15073..6097208 100644
+index 3f15073..eef6efb 100644
 --- a/plume_vulkan.cpp
 +++ b/plume_vulkan.cpp
 @@ -9,6 +9,11 @@
@@ -606,7 +637,7 @@ index 3f15073..6097208 100644
      VulkanShader::VulkanShader(VulkanDevice *device, const void *data, uint64_t size, const char *entryPointName, RenderShaderFormat format) {
          assert(device != nullptr);
          assert(data != nullptr);
-@@ -1412,23 +1507,61 @@ namespace plume {
+@@ -1412,23 +1507,72 @@ namespace plume {
          this->format = format;
          this->entryPointName = (entryPointName != nullptr) ? std::string(entryPointName) : std::string();
  
@@ -615,6 +646,17 @@ index 3f15073..6097208 100644
 +        std::vector<uint32_t> words;
 +        if ((size % 4) == 0) {
 +            words.assign(reinterpret_cast<const uint32_t *>(data), reinterpret_cast<const uint32_t *>(data) + (size / 4));
++        }
++        if (!words.empty()) {
++            // Vertex fetch clamp to the arena size (see spirv_trim::ClampVertexArenaFetch; Switch 2: 512 MiB).
++            static std::atomic<uint32_t> clampModules{ 0 }, clampConstants{ 0 };
++            if (const uint32_t changed = spirv_trim::ClampVertexArenaFetch(words)) {
++                const uint32_t modules = ++clampModules, total = (clampConstants += changed);
++                if ((modules <= 2) || ((modules % 500) == 0)) {
++                    std::fprintf(stderr, "[arena] %u shaders with the vertex fetch clamp at %u MiB (%u constants)\n", modules,
++                        spirv_trim::vertexArenaBytes.load(std::memory_order_relaxed) >> 20, total);
++                }
++            }
 +        }
 +        if (leanSpirvEnabled() && !words.empty()) {
 +            static std::atomic<uint32_t> leanModules{ 0 }, leanDecorations{ 0 };
@@ -671,7 +713,7 @@ index 3f15073..6097208 100644
      void VulkanShader::setName(const std::string &name) {
          setObjectName(device->vk, VK_OBJECT_TYPE_SHADER_MODULE, uint64_t(vk), name);
      }
-@@ -1554,7 +1687,7 @@ namespace plume {
+@@ -1554,7 +1698,7 @@ namespace plume {
              VkPipelineShaderStageCreateInfo stageInfo = {};
              stageInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
              stageInfo.stage = VK_SHADER_STAGE_VERTEX_BIT;
@@ -680,7 +722,7 @@ index 3f15073..6097208 100644
              stageInfo.pName = vertexShader->entryPointName.c_str();
              stageInfo.pSpecializationInfo = pSpecInfo;
              stages.emplace_back(stageInfo);
-@@ -1576,7 +1709,7 @@ namespace plume {
+@@ -1576,7 +1720,7 @@ namespace plume {
              VkPipelineShaderStageCreateInfo stageInfo = {};
              stageInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
              stageInfo.stage = VK_SHADER_STAGE_FRAGMENT_BIT;
@@ -689,7 +731,7 @@ index 3f15073..6097208 100644
              stageInfo.pName = pixelShader->entryPointName.c_str();
              stageInfo.pSpecializationInfo = pSpecInfo;
              stages.emplace_back(stageInfo);
-@@ -2080,7 +2213,7 @@ namespace plume {
+@@ -2080,7 +2224,7 @@ namespace plume {
          });
  
          // Pre-rasterization: depth bias enable is static (it needs extended dynamic state 2).
@@ -698,7 +740,7 @@ index 3f15073..6097208 100644
          const VkShaderModule geometryModule = (desc.geometryShader != nullptr) ? static_cast<const VulkanShader *>(desc.geometryShader)->vk : VK_NULL_HANDLE;
          const VkBool32 depthClamp = !desc.depthClipEnabled;
          const VkBool32 depthBias = (desc.depthBias != 0) || (desc.depthBiasClamp != 0.0f) || (desc.slopeScaledDepthBias != 0.0f);
-@@ -2097,6 +2230,7 @@ namespace plume {
+@@ -2097,6 +2241,7 @@ namespace plume {
              VkPipelineShaderStageCreateInfo stages[2];
              uint32_t stageCount = 0;
              stages[stageCount++] = libraryStage(desc.vertexShader, VK_SHADER_STAGE_VERTEX_BIT);
@@ -706,7 +748,7 @@ index 3f15073..6097208 100644
              if (desc.geometryShader != nullptr) {
                  stages[stageCount++] = libraryStage(desc.geometryShader, VK_SHADER_STAGE_GEOMETRY_BIT);
              }
-@@ -3286,6 +3420,11 @@ namespace plume {
+@@ -3286,6 +3431,11 @@ namespace plume {
              if (desc.colorAttachmentsCount == 0) {
                  width = uint32_t(depthAttachment->desc.width);
                  height = depthAttachment->desc.height;
@@ -718,7 +760,7 @@ index 3f15073..6097208 100644
              }
  
              depthReference.attachment = uint32_t(attachments.size());
-@@ -3466,27 +3605,58 @@ namespace plume {
+@@ -3466,27 +3616,58 @@ namespace plume {
          vkDestroyQueryPool(device->vk, vk, nullptr);
      }
  
@@ -750,7 +792,7 @@ index 3f15073..6097208 100644
 +        if (count == 0) {
 +            return;
 +        }
-+
+ 
 +        // Queries left unused since the last reset are unavailable, so
 +        // VK_NOT_READY is expected; read the availability of each one.
 +        if (values.size() < results.size() * 2) {
@@ -768,7 +810,7 @@ index 3f15073..6097208 100644
 +            results[i] = (values[i * 2 + 1] != 0) ? values[i * 2] : ResultUnavailable;
 +        }
 +    }
- 
++
 +    void VulkanQueryPool::queryResults() {
 +        if (occlusion) {
 +            queryResultsFirst(uint32_t(results.size()));
@@ -792,7 +834,7 @@ index 3f15073..6097208 100644
          if (res != VK_SUCCESS) {
              PLUME_LOG_ERROR("Vulkan", "vkGetQueryPoolResults", LogErrorDomain::VkResult, res, "");
              return;
-@@ -5069,7 +5239,8 @@ namespace plume {
+@@ -5069,7 +5250,8 @@ namespace plume {
          }
  
          VkPhysicalDeviceTimelineSemaphoreFeatures timelineFeatures = {};

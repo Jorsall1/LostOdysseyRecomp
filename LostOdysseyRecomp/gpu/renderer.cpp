@@ -165,9 +165,18 @@ static void PinWorkerThread(const char* what)
 #include <plume_render_interface.h>
 #include <plume_render_interface_builders.h>
 #include <plume_vulkan.h>
+#include <plume_spirv_trim.h>
 #ifdef _WIN32
 #include <plume_d3d12.h>
 #endif
+namespace {
+    // The SPIR-V vertex fetch clamps at 1 GiB (common_hlsl_text.inc); a smaller arena (Switch 2: 512 MiB) has
+    // plume rewrite that clamp to the arena's size in every module it creates. Set before main, so before any shader.
+    const bool g_vertexArenaClampSet = [] {
+        plume::spirv_trim::vertexArenaBytes.store(uint32_t(gpu::render_arena::kVertexArenaSize), std::memory_order_relaxed);
+        return true;
+    }();
+}
 #if LO_PLATFORM_MACOS
 #include <plume_metal.h>
 namespace plume {
@@ -2844,7 +2853,8 @@ namespace gpu::renderer
                 uint64_t vertexArenaAddress; // SPIR-V vertex fetch (common_hlsl.h)
             };
             static_assert(offsetof(SharedConstants,vertexArenaAddress)==xenos::VertexArenaAddressOffset);
-            // The shaders clamp vertex fetches at 1 GiB (common_hlsl.h).
+            // The shaders clamp vertex fetches at 1 GiB (common_hlsl.h); a smaller arena has plume rewrite that clamp
+            // (plume_spirv_trim.h ClampVertexArenaFetch, set at the top of this file).
             static_assert(gpu::render_arena::kVertexArenaSize <= 1073741824ull);
 
             static_assert(offsetof(SharedConstants,ndcScale)==160);

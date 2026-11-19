@@ -1,0 +1,67 @@
+================================================================================
+LostOdysseyRecomp - Nintendo Switch 2 port
+Summary - TURN 63: GPU stop still there with OunceVK 20261118 (debug sync 2
+read this time); cause found: SPIR-V vertex fetch clamped at 1 GiB, Switch 2
+vertex arena is 512 MiB; clamp rewritten to the arena size
+================================================================================
+Build: NRO md5 4c4dfa976b746841d40863cdc0118b70 (Desktop copy matches).
+ELF build/arenaclamp_turn63.elf. Driver: OunceVK 2d6a8aec (turn 62).
+kaiHEN fix untouched (libounce unchanged).
+LOGS READ (Desktop\lo project\crash 1, crash 2; same runtime log copied in
+both folders, stderr differs)
+  * Same shape as every stop since turn 37: game menu at 24 draws, the menu's
+    closing frame (13 draws, starts with an EDRAM transfer) then the first
+    3D frame (280 draws, 28 occlusion queries, 1.5 MiB uploads). 1920x1080
+    handheld (DR at 1080).
+  * crash 1 (no debug file): batch 6954 REFUSED, "context failed at
+    nvkmd_nvgpu_native_ctx.c:738".
+  * crash 2 ("native debug sync flags: 2" printed, so the file was read):
+    "completion join failed: status 7".
+DRIVER SOURCE (ouncevk 2d6a8ae, nvkmd_nvgpu_native_completion.c)
+  completion_join checks the counter, then verify (marker + guards), then the
+  channel health ioctl; when the channel has an error AND the marker was not
+  written it reports status 7 (VERIFY), not 8. After a channel error the
+  kernel moves the counter on, so the batch "reaches" its target without
+  writing its marker. So 7, 8, 793 (submit refused on a dead channel) are all
+  one event: the GPU faulted. Debug flag 2 (L2 invalidate per batch) changed
+  nothing, as expected: our readback buffer (HOST_CACHED) already makes every
+  batch flush and invalidate L2.
+CAUSE
+  common_hlsl_text.inc (the SPIR-V vertex fetch used by every published pack):
+  XeVertexDeviceBuffer.Load*(a) reads arenaAddress + min(a, 1 GiB - N) with a
+  raw device address. Its comment says "the arena is exactly 1 GiB". On
+  Switch 2 kVertexArenaSize is 512 MiB (render_arena_policy.h, halved for
+  RAM), so any fetch whose byte offset lands between 512 MiB and 1 GiB (an
+  index past its buffer, or a buffer copy near the arena's end) read up to
+  512 MiB past the end of the buffer: unmapped GPU memory, an MMU fault, the
+  channel error. PC/Android have a 1 GiB arena and never read outside it.
+  The pack (portable_vk.lospv, all 716 zstd blocks decompressed and scanned)
+  holds these clamp constants as OpConstant 0x3FFFFFFC / F8 / F4 / F0.
+  Why menus: not proven which draw goes out of range. The stops cluster on the
+  frame where the game rebuilds the scene (menu close, map load, after
+  Settings), which is where stale or new geometry first gets drawn.
+CHANGES
+  * thirdparty/plume/plume_spirv_trim.h: ClampVertexArenaFetch +
+    vertexArenaBytes. With an arena under 1 GiB, every 32-bit OpConstant equal
+    to 1 GiB - 4/8/12/16 becomes arena - 4/8/12/16, so both the address clamp
+    and the "out of range reads 0" test stay inside the arena.
+  * thirdparty/plume/plume_vulkan.cpp VulkanShader: applies it to every module
+    before vkCreateShaderModule (so also to the trimmed-output variants);
+    stderr "[arena] N shaders with the vertex fetch clamp at 512 MiB (M
+    constants)" for the first two and every 500th module.
+  * gpu/renderer.cpp: sets vertexArenaBytes = kVertexArenaSize before main
+    (static initializer), so before any shader. Desktop (1 GiB) unchanged.
+  * tools/patches/plume-switch-perf.patch regenerated; the 5-patch chain on
+    d890ac8 reproduces the six plume files byte for byte.
+TESTS
+  * Host test on a real pack module: 4 constants changed, none of 1 GiB - N
+    left, 512 MiB - 4 / - 16 present; arena unset -> 0 changes.
+  * Switch 2 build ok. Not on hardware yet.
+  * Shader modules change, so the driver recompiles each pipeline once (first
+    run slower, like after the driver update).
+NEXT (user)
+  * Delete sdmc:/config/ouncevk/debug-sync.txt (not needed now).
+  * Same test: equip an item, close the menu, several times; also Settings
+    and a map change. stderr.log should show the "[arena]" line.
+  * If it still stops, send the logs.
+================================================================================
