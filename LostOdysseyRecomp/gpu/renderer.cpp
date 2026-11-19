@@ -584,6 +584,8 @@ namespace gpu::renderer
             uint32_t guestWidth = 0, guestHeight = 0;
             resolution::Size resolutionSize{};
             bool shadowMap = false;
+            // Released by a render size change and kept alive until the next one (renderer stepGraveyard).
+            bool graveyard = false;
             uint32_t ScaleX(uint32_t value) const { return resolution::ScaleX(value, resolutionSize.width); }
             uint32_t ScaleY(uint32_t value) const { return resolution::Scale(value, resolutionSize.height); }
             uint32_t depthMsaa = 0;
@@ -1196,6 +1198,17 @@ namespace gpu::renderer
                 ~LibraryPrecompile() { stop = true; if (thread.joinable()) thread.join(); }
             } libraryPrecompile;
             std::unordered_map<RenderTargetKey, std::unique_ptr<HostTexture>, RenderTargetKeyHash> renderTargets;
+            // The targets the last render size change released. Three GPU stops (turns 37, 43, 45) came on the batch
+            // that first rebuilt the scene depth/colour targets after seconds of menu frames that followed a size
+            // change, so a pointer kept from before the change is the suspect: the old images stay alive (and valid
+            // for the GPU) until the next change, which drains the GPU first, and Transition() reports any use.
+            std::vector<std::unique_ptr<HostTexture>> stepGraveyard;
+            void BuryTarget(std::unique_ptr<HostTexture> tex)
+            {
+                if (!tex) return;
+                tex->graveyard = true;
+                stepGraveyard.push_back(std::move(tex));
+            }
             std::unordered_map<TextureKey, std::unique_ptr<HostTexture>, TextureKeyHash> textures;
             // Changes on every insert into or erase from `textures`; an iterator
             // remembered at an unchanged version is still valid.
@@ -6421,6 +6434,13 @@ void main()
             }
             void Transition(HostTexture& tex, RenderTextureLayout layout, RenderBarrierStages stages)
             {
+                if (tex.graveyard) [[unlikely]] {
+                    static uint32_t reported = 0;
+                    if (reported++ < 8)
+                        LOG_ERROR("renderer: f{} uses a target released by the last render size change (guest {}x{} "
+                            "physical {}x{} serial {}, layout {} -> {}); kept alive", frame, tex.guestWidth,
+                            tex.guestHeight, tex.width, tex.height, tex.allocationSerial, uint32_t(tex.layout), uint32_t(layout));
+                }
                 if (transferDebt.target)
                     SettleTransferDebtFor(tex, layout == RenderTextureLayout::COLOR_WRITE || layout == RenderTextureLayout::COPY_DEST ||
                         layout == RenderTextureLayout::GENERAL || layout == RenderTextureLayout::DEPTH_WRITE);
@@ -8909,6 +8929,8 @@ void main()
                         activePlan.requestedUpscaler == upscaling::Upscaler::Off &&
                         activePlan.frameGeneration == upscaling::FrameGeneration::Off;
                     size_t keptTargets = 0;
+                    // The GPU is drained here: the previous change's released targets can go now.
+                    stepGraveyard.clear();
                     if (sceneStepOnly) {
                         const uint32_t oldArea = std::min(internalSize.height, uint32_t((uint64_t(internalSize.width) * 9) / 16));
                         const resolution::Size oldAreaSize{uint32_t((uint64_t(oldArea) * 16) / 9), oldArea};
@@ -8916,6 +8938,7 @@ void main()
                         for (auto it = renderTargets.begin(); it != renderTargets.end();) {
                             const auto& size = it->second ? it->second->resolutionSize : internalSize;
                             if (!it->second || size == internalSize || size == oldAreaSize || size == oldLegacy) {
+                                BuryTarget(std::move(it->second));
                                 it = renderTargets.erase(it);
                             } else {
                                 ++keptTargets;
@@ -8926,6 +8949,7 @@ void main()
                         if (loggedKeeps++ < 8)
                             LOG_INFO("renderer: scene size step keeps {} fixed-size targets", keptTargets);
                     } else {
+                        for (auto& [key, tex] : renderTargets) BuryTarget(std::move(tex));
                         renderTargets.clear();
                     }
                     ++targetEpoch;

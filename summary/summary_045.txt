@@ -1,0 +1,40 @@
+================================================================================
+LostOdysseyRecomp - Nintendo Switch 2 port
+Summary - TURN 45: GPU stop after turning FSR off in Settings (third stop of
+the same shape); released render targets kept alive until the next resize
+================================================================================
+Build: NRO md5 682b4ac9303d6af24fd1c94dbe8aba97 (Desktop copy matches;
+includes turn 43's light-screen hold and docked 1440 -> 720).
+ELF: build/graveyard_turn45_682b4ac9.elf. kaiHEN fix untouched. Not on HW.
+CRASH LOG (lo project/crash, runtime-1795061803441535.log; the user ran the
+turn 42 NRO, not turn 43)
+  * 1262.81 s dynamic resolution step 612 -> 648 while the GPU was at 4.7 ms
+    (the game's menu screen). Scene targets rebuilt EXCEPT the scene depth
+    (base 0x0 fmt 1) and colour fmt 10: the menu frames never asked for them.
+  * 1265.6 Settings opened, 1284.2 saved (FSR off: "Switch upscaler
+    bilinear"), 1286.9 closed; 3 s more of 23-25-draw frames.
+  * 1289.908/1289.919 "new depth target base=0x0 fmt=1" and "new color target
+    base=0x2d0 fmt=10" (first time at 648), then batch 75603 (13 draws, the
+    transition frame) NOT completed and 75604 (326 draws) REFUSED, raw_vk -4.
+    stderr: "context failed at nvkmd_nvgpu_native_ctx.c:738".
+  * FSR is not the cause: turn 43's stop had FSR on. Common to turns 37, 43,
+    45: a size change, then seconds of menu frames, then the batch that first
+    rebuilds the scene depth/colour targets faults. Steps taken during 3D
+    play (dozens) never fault: there the targets are rebuilt at once.
+  * Suspect: a pointer to a target destroyed at the size change, still held
+    and used when 3D resumes (GPU reads/writes a freed image: channel fault;
+    turn 37's overwritten arena record fits freed memory reused).
+CHANGE (gpu/renderer.cpp)
+  * Targets released at a render size change go to stepGraveyard (alive,
+    valid images) instead of being destroyed; the graveyard is cleared at the
+    next size change, after its GPU drain. HostTexture::graveyard marks them.
+  * Transition() logs "renderer: fN uses a target released by the last render
+    size change (guest WxH physical WxH serial N, layout a -> b); kept alive"
+    (8 at most). That line names the stale use if the theory holds.
+  * Memory: one previous set of scene targets (tens of MiB).
+  * With turn 43 (no steps on light screens) the trigger is also avoided.
+TESTS: settings ctest 11/11; Switch 2 build ok.
+NEXT (user)
+  * Repeat: field -> Settings -> change FSR / any Graphics row -> Save ->
+    close; and save-screen -> field. Send logs; grep "released by the last
+    render size change" even if nothing crashes.
