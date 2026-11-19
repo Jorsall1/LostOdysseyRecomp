@@ -6571,20 +6571,42 @@ void main()
                     ops.empty() || ops[0].rects.empty() ? -1 : ops[0].rects[0].right,
                     ops.empty() || ops[0].rects.empty() ? -1 : ops[0].rects[0].bottom);
                 static const bool traceClearCall = getenv("LO_TRACE_CLEAR_CALL") != nullptr;
+                // NVK writes 6 command words per clear rectangle into one reserved
+                // push (nvk_cmd_clear.c emit_clear_rects) and never splits it. Its
+                // command memory comes in 64 KiB blocks, so more than 2730 rectangles
+                // in one vkCmdClearAttachments write past the block into the next
+                // command buffer's commands (cross-pitch EDRAM depth clears map to one
+                // rectangle per tile: 2880 for a 1280x720 4x MSAA area). The GPU then
+                // stops with a PBDMA method error. NVK_CMD_BUFFER_MAX_PUSH (512 words)
+                // is the size it supports, so calls carry at most 80 rectangles.
+                static constexpr size_t kMaxClearRects = 80;
                 thread_local std::vector<RenderRect> rects;
                 for (const auto& op : ops) {
                     rects.clear();
                     for (const auto& r : op.rects) rects.push_back({r.left, r.top, r.right, r.bottom});
-                    const RenderRect* data = rects.empty() ? nullptr : rects.data();
-                    if (IsDepthTarget(tex)) {
-                        if (traceClearCall)
-                            LOG_INFO("clear begin f{} allocation={} size={}x{} count={} z={}", frame, tex.allocationSerial, tex.width, tex.height, rects.size(), op.depth);
-                        commandList->clearDepthStencil((op.aspects & pending_clear::Depth) != 0,
-                            (op.aspects & pending_clear::Stencil) != 0, op.depth, op.stencil, data, uint32_t(rects.size()));
-                        if (traceClearCall) LOG_INFO("clear end");
-                    } else
-                        commandList->clearColor(0, RenderColor(op.color[0], op.color[1], op.color[2], op.color[3]),
-                            data, uint32_t(rects.size()));
+                    if (rects.size() > largestClearRects) {
+                        largestClearRects = rects.size();
+                        if (largestClearRects > kMaxClearRects)
+                            LOG_INFO("renderer: clear of {} rectangles split into {} calls of at most {} (largest so far)",
+                                largestClearRects, (largestClearRects + kMaxClearRects - 1) / kMaxClearRects, kMaxClearRects);
+                    }
+                    const bool depth = IsDepthTarget(tex);
+                    if (depth && traceClearCall)
+                        LOG_INFO("clear begin f{} allocation={} size={}x{} count={} z={}", frame, tex.allocationSerial, tex.width, tex.height, rects.size(), op.depth);
+                    // An empty list means the whole target: one call.
+                    size_t first = 0;
+                    do {
+                        const size_t count = std::min(kMaxClearRects, rects.size() - first);
+                        const RenderRect* data = count ? rects.data() + first : nullptr;
+                        if (depth)
+                            commandList->clearDepthStencil((op.aspects & pending_clear::Depth) != 0,
+                                (op.aspects & pending_clear::Stencil) != 0, op.depth, op.stencil, data, uint32_t(count));
+                        else
+                            commandList->clearColor(0, RenderColor(op.color[0], op.color[1], op.color[2], op.color[3]),
+                                data, uint32_t(count));
+                        first += count;
+                    } while (first < rects.size());
+                    if (depth && traceClearCall) LOG_INFO("clear end");
                 }
                 consecutiveResolveCopies.Invalidate();
             }
@@ -10348,6 +10370,8 @@ void main()
             static constexpr size_t kDepthClearMaps = 1024;
             std::unordered_map<DepthClearMapKey, std::vector<pending_clear::Rect>, DepthClearMapKeyHash> depthClearMaps;
             std::vector<DepthClearRect> depthClearScratch;
+            // Most rectangles one queued clear has had (ReplayClears logs each new maximum).
+            size_t largestClearRects = 0;
             // Valid until the next call.
             const std::vector<pending_clear::Rect>& MappedDepthClear(const DepthClearMapKey& key, const HostTexture& target)
             {

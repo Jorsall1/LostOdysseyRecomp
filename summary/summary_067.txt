@@ -1,0 +1,43 @@
+================================================================================
+LostOdysseyRecomp - Nintendo Switch 2 port
+Summary - TURN 67: crash3 (push_sync) points at an NVK command-memory overrun
+from huge vkCmdClearAttachments calls; clears now split into 80-rect calls
+================================================================================
+Build: NRO md5 4abb38ac6bd10dbab750266a7df65d57 (Desktop copy matches).
+ELF build/clearsplit_turn67.elf. kaiHEN fix untouched.
+LOGS READ (Desktop\lo project\crash3, test C: LO_GUEST_AFFINITY=1,
+  NVK_DEBUG=push_sync)
+  * Same stop: PBDMA error (info32 32), error info 3 / 0x00200000 /
+    0x80000000 / class 0xc797, at 60.3 s in Tolsan's Inn (menu, ~46 draws).
+  * push_sync dumped the failing submission. Its first command block starts
+    with the words 0x00000001 0x00000001 (not a valid NVK header) and then
+    only depth clear rectangles: SET_CLEAR_RECT_HORIZONTAL/VERTICAL +
+    CALL_MME_MACRO(NVK_MME_CLEAR) with data 1 (z only), 1 (layers), 6 words
+    per rect, 40x8-pixel rects = EDRAM tiles at 4x MSAA (MapDepthClear).
+    0x1 0x1 is exactly the tail of one such rect.
+  * stderr.log is cut at word 0x2cf of that block and the runtime log stops
+    at 60.868 s: the process ended while printing (not seen why).
+CAUSE (from the OunceVK source, nvk_cmd_clear.c / nvk_cmd_buffer.h)
+  * emit_clear_rects reserves rect_count*6 words in one push and never
+    splits; nvk_cmd_buffer_push only asserts dw_count <= 512
+    (NVK_CMD_BUFFER_MAX_PUSH, compiled out). Command memory is 64 KiB blocks
+    (NVK_CMD_MEM_SIZE), so more than 2730 rects run past the block end into
+    the next block, i.e. another command buffer's commands. That block then
+    begins with stray rect words (the 0x1 0x1 seen) and the PBDMA rejects it.
+  * A cross-pitch 1280x720 4x MSAA depth clear maps to 32x90 = 2880 tile
+    rects before coalescing. Fits the "first heavy frame after the menu" stops.
+    Not proven: the dump did not show the overrunning call itself.
+CHANGE
+  * gpu/renderer.cpp ReplayClears: every queued clear is issued in calls of
+    at most 80 rects (480 words, within NVK's 512). Empty list = whole
+    target, still one call. Logs "renderer: clear of N rectangles split into
+    M calls of at most 80 (largest so far)" at each new maximum above 80.
+    Other clear callers pass at most a few rects (bars, full clears).
+TEST FILE (Desktop\lo project\env_test_turn67.txt -> env.txt)
+  LO_GUEST_AFFINITY=1 only (push_sync removed: it slows the game).
+  Same menu open/close test, several times.
+  * Look in the runtime log for the "split into" line: a count above 2730
+    confirms the overrun case was hit.
+  * If it still stops, send the folder; the turn 65 batch dump and channel
+    tap are still in.
+================================================================================
