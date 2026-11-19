@@ -242,12 +242,14 @@ namespace gpu::renderer
                 // batch always shows this: it is not evidence that the batch hung.
                 std::string("completion not read yet"));
         }
-        // gpu/op_ring.h: what the oldest unfinished batch and the refused one recorded.
-        uint64_t wanted[2] = {0, 0};
+        // gpu/op_ring.h: what the unfinished batches and the refused one recorded. The oldest unfinished one
+        // and the newest one (usually the batch after it, which may be the one that faulted) are both shown.
+        uint64_t wanted[3] = {0, 0, 0};
         for (size_t i = 0; i < g_submissionRing.Size(); ++i) {
             const auto& e = g_submissionRing.At(i);
             if (!e.completed && !e.rejected && !wanted[0]) wanted[0] = e.serial;
-            if (e.rejected) wanted[1] = e.serial;
+            if (!e.completed && !e.rejected && e.serial != wanted[0]) wanted[1] = e.serial;
+            if (e.rejected) wanted[2] = e.serial;
         }
         auto& ring = gpu::op_ring::g_ring;
         std::lock_guard opLock(ring.mutex);

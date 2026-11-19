@@ -1,0 +1,41 @@
+================================================================================
+LostOdysseyRecomp - Nintendo Switch 2 port
+Summary - TURN 65: outside diagnosis (Google) checked against the driver
+source; GPU-stop dump now also lists the newest unfinished batch
+================================================================================
+Build: NRO md5 31382c35041f55ce816a197b53426144 (Desktop copy matches).
+ELF build/channeltap_turn65.elf. Includes the turn 64 channel error tap.
+kaiHEN fix untouched.
+CLAIMS CHECKED (user pasted a Google answer about the turn 63 crash)
+  * "status 8 is brand new": no. Turn 62 crash2 also ended with status 8.
+    Status 8 = HEALTH (counter reached, marker verified, channel error
+    notification set); see summary_064.
+  * "device retirement 0x102 = GPU fault / MMU violation": no. In
+    nvkmd_nvgpu_discovery.c it is NATIVE_SHUTDOWN_DEVICE (0x100) |
+    NVKMD_NVGPU_DEVICE_CLOSE_TERMINAL (2): at exit the device was already
+    marked lost. It is a result of the stop, not its type. The type is what
+    the turn 64 tap logs (info32).
+  * "not a GPU overload / timeout": agreed, and already the working view
+    since turn 60/62. Batch sizes were changed for performance (turns 56-57),
+    not as a crash fix.
+  * "batch 5109 ops were not dumped": correct. LogSubmissionRing printed the
+    oldest unfinished batch and the refused one only. Fixed below.
+  * "[lean] / [trim] / [arena] / ZCULL could cause it": the stops started at
+    turn 35-37 (2026-11-18). [lean] and early-Z came in turn 53, [arena] in
+    turn 63, ZCULL with OunceVK 20261118 in turn 62, so none of them can be
+    the original cause. [trim] (LO_TRIM_VARYINGS, since 2026-10-13) predates
+    the stops and is still possible. Toggles already exist; no new code.
+CHANGE
+  * gpu/renderer.cpp LogSubmissionRing: also prints the operations of the
+    newest unfinished batch (the one after the oldest unfinished), e.g. both
+    5108 and 5109 in the turn 63 crash. Up to 400 operations each.
+TEST FILES (Desktop\lo project)
+  * Test A: the existing env.txt (LO_GUEST_AFFINITY=1). Run first; it gives
+    the GPU error type ("[gpu channel]" in stderr.log, "GPU channel error"
+    in the runtime log) and both batch dumps.
+  * Test B (optional, after A): env_test_norewrite.txt, renamed to env.txt:
+    LO_TRIM_VARYINGS=0 LO_LEAN_SPIRV=0 LO_EARLY_Z=0. Slower GPU. If B never
+    stops across several menu closes while A does, a shader rewrite is
+    involved; then split them one at a time.
+NEXT (user): test A, send stderr.log + runtime log; then test B if wanted.
+================================================================================
