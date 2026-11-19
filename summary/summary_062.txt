@@ -1,0 +1,76 @@
+================================================================================
+LostOdysseyRecomp - Nintendo Switch 2 port
+Summary - TURN 62: tests A and B both stopped (equip an item, close the menu);
+OunceVK source found; driver updated 114e9298 -> 2d6a8aec (OunceVK 20261118)
+================================================================================
+Build: NRO md5 c87231c6fe2312ae5b52054714d32a67 (Desktop copy matches).
+ELF build/ouncevk1118_turn62.elf. No source change in the repo this turn.
+kaiHEN fix untouched (libounce NOT changed, still d1718bb7076f).
+LOGS READ (Desktop\lo project\crash1, crash2; turn 60 NRO, handheld)
+  crash1 (env.txt only):
+    55.29 "frontbuffer scene=true" (first 3D frame after the menu), 55.29
+    "new color target base=0x2d0 fmt=12 880x864". Batch 3506 (menu closing
+    frame, 13 draws) completed, 3507 (292 draws, 31 occlusion) accepted,
+    3508 (541 draws) REFUSED. stderr: "context failed at
+    nvkmd_nvgpu_native_ctx.c:793".
+  crash2 (env.txt + config/ouncevk/debug-sync.txt = 2):
+    50.81 "GPU fence wait failed raw_vk=-4". 3337 (closing frame) and 3338
+    (first 3D frame, 293 draws) both accepted. stderr: "completion join
+    failed: status 8" (channel error).
+  * Test B did NOT run with the debug flag: the driver prints "native debug
+    sync flags: N" (mesa_log info, same level as the "native copy channel"
+    line that does print) when it reads the file; the line is missing, so
+    fopen/fscanf failed. B is a second run of A.
+DRIVER SOURCE (github.com/ouncebrew/ouncevk, public)
+  Line numbers decoded against commit 114e929 (our old driver):
+    738  native_ctx_flush_pending: prepare_sources refused the batch.
+    775  completion begin failed.
+    793  nvkmd_nvgpu_native_submit_once_endpoint failed (the channel refused
+         the submit: what follows a channel that already faulted).
+    826  point accept failed.
+  Status 7 (turn 37, 48): the batch record (guards 0xb16b00b5/0xa71ecafe in a
+  calloc'd submission) was overwritten in CPU memory. Status 8: channel error.
+  So the stops share one shape: something corrupts memory (driver records,
+  span lists, or GPU-visible data), and which check notices it first varies.
+FOUND IN THE OLD DRIVER (fixed upstream in 2d6a8ae, "Fixes from a review of
+the Switch 2 changes", released as OunceVK 20261118 on 2026-11-18)
+  native_chunk_pool_trim (nvkmd_nvgpu_native_chunked.c), run on every free of
+  GPU-only memory once the free pool is over 128 MiB: it does a finish flush
+  (GPU completes earlier work, dirty L2 lines written back) and then returns
+  pool chunks to the process heap. The flush wait releases the owner lock. A
+  chunk that another thread frees during that wait sits on top of the pool,
+  is not covered by the flush, and is the first one handed back to the heap.
+  Its dirty L2 lines can then be written back over heap memory that malloc
+  has given to someone else: driver submission records (status 7), batch
+  spans (738), our own data. The fix takes the chunks off the pool before the
+  flush. Not proven to be our stop (no driver-side trace of the chunk), but
+  it is a real corruption path that matches every signature seen since
+  turn 35, and stops cluster where memory is freed and re-allocated
+  (resizes, map loads, menu close; crash1 creates a new target right then).
+CHANGE (outside the repo)
+  * /opt/devkitpro/portlibs/switch2: OunceVK 20261118 package files
+    (ouncevk-20261118-1-any.pkg.tar.zst, sha256 fdb15b64...ba29, checked)
+    copied over the old ones. Old files backed up in
+    /opt/devkitpro/portlibs/switch2/ouncevk-114e929-backup/ (75 files).
+  * New archive needs no libounce symbols the old one did not (nm checked),
+    exports the same 249 vk entry points (plus ouncevk_profile_record_ns).
+    cmake reconfigured; PrefixOunceVK re-prefixed 249 entry points; the ELF
+    carries "Mesa 26.2.2 (git-2d6a8aec8b)".
+  * Other changes the new driver brings (upstream): ZCULL on, compression
+    for dedicated image allocations >= 2 MiB, GPU-only memory registered
+    ahead of need by a driver thread (one more thread at exit), NAK compiler
+    changes (predication, load scheduling, fence fixes). Shader binaries in
+    the driver cache will be rebuilt once (version string changed).
+ROLLBACK
+  cp -a /opt/devkitpro/portlibs/switch2/ouncevk-114e929-backup/. \
+        /opt/devkitpro/portlibs/switch2/ && cmake build && cmake --build build
+NEXT (user)
+  * Copy the NRO. Same test: field -> menu -> equip an item -> close, several
+    times; also a Settings change and a map change. First launch may be
+    slower (pipeline/driver cache rebuild).
+  * If it still stops: send the logs. Next step then is the planned driver
+    instrumentation (we can now build OunceVK from source, or patch it), and
+    a report to the OunceVK author with the decoded lines.
+  * Watch for new visual problems (ZCULL/compression are new): depth
+    flicker, black or corrupted targets. Report them with a screenshot.
+================================================================================
