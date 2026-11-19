@@ -80,6 +80,7 @@ std::atomic<uint64_t> g_cpIdleNs{0};
 std::atomic<uint64_t> g_draws{0};
 std::atomic<uint32_t> g_lastDraws{0};
 std::atomic<uint32_t> g_hitchTotal{0}; // every hitch, logged or not (HitchCount)
+std::atomic<uint64_t> g_lateGpuFrames{0}; // missed a refresh with the GPU busy most of it (LateGpuFrames)
 std::atomic<uint64_t> g_sceneSize{0}; // width << 32 | height
 std::atomic<uint32_t> g_gpuMhz{0};
 
@@ -670,6 +671,16 @@ void Present(const PresentSample& sample)
     }
     if (hitch)
         g_hitchTotal.fetch_add(1, std::memory_order_relaxed);
+    // Dynamic resolution's missed-frame signal (turn 54): a frame that took over 1.4 refreshes while the GPU was
+    // busy for over 80% of one. Average GPU time hides these (Switch 2 handheld, Main Street, 2026-11-19: 58 FPS at
+    // 14.2 ms average, under the 15.3 ms step-down line).
+    if (!sample.loading && sample.targetFps && sample.swap > 60)
+    {
+        const double targetMs = TargetMs(sample.targetFps);
+        const uint64_t frameGpuNs = current.gpuBusyNs - previous.gpuBusyNs;
+        if (intervalMs > 1.4 * targetMs && Ms(frameGpuNs) > 0.8 * targetMs)
+            g_lateGpuFrames.fetch_add(1, std::memory_order_relaxed);
+    }
     if (hitch && perf && hitchesLogged < config.hitchLimit)
     {
         ++hitchesLogged;
@@ -715,6 +726,10 @@ std::string LastPerfLine()
 uint32_t HitchCount()
 {
     return g_hitchTotal.load(std::memory_order_relaxed);
+}
+uint64_t LateGpuFrames()
+{
+    return g_lateGpuFrames.load(std::memory_order_relaxed);
 }
 uint64_t TotalDraws()
 {

@@ -204,10 +204,11 @@ namespace gpu::frame_plan
             // scene target for a loading screen, and its new uncleared targets can show for a frame.
             if (hold && controller.base == configured &&
                 controller.requestedMinimum == minimum) {
-                controller.Hold(now, gpu_busy::Total());
+                controller.Hold(now, gpu_busy::Total(), perf_stats::LateGpuFrames());
                 return controller.height;
             }
-            const uint32_t height = controller.Update(now, gpu_busy::Total(), configured, minimum, budgetMs, changed, step);
+            const uint32_t height = controller.Update(now, gpu_busy::Total(), configured, minimum, budgetMs, changed, step,
+                perf_stats::LateGpuFrames());
             if (controller.minimum != announcedMinimum || configured != announcedBase) {
                 announcedMinimum = controller.minimum;
                 announcedBase = configured;
@@ -215,8 +216,8 @@ namespace gpu::frame_plan
                     controller.minimum, configured, controller.step, budgetMs);
             }
             if (changed)
-                LOG_INFO("dynamic resolution: scene at {} rows (GPU {:.1f} ms per frame, budget {:.1f} ms)", height,
-                    controller.lastBusyMs, budgetMs);
+                LOG_INFO("dynamic resolution: scene at {} rows (GPU {:.1f} ms per frame, budget {:.1f} ms, {} missed frames)", height,
+                    controller.lastBusyMs, budgetMs, controller.lastLate);
             return height;
         }
     }

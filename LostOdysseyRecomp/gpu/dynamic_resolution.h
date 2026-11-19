@@ -87,17 +87,27 @@ namespace gpu::dynamic_resolution
             return drop && base > drop ? std::max(base - drop, minimum) : base;
         }
 
-        uint32_t base = 0, minimum = 0, height = 0, step = Rung;
-        uint64_t windowStart = 0, windowBusy = 0, lastChange = 0;
+        // Missed refreshes (perf_stats::LateGpuFrames) in a window: over LateDownShare of its frames counts as over
+        // budget even when the average GPU time is under it, and any over LateUpShare blocks a step up (turn 54).
+        static constexpr double LateDownShare = 0.02, LateUpShare = 0.005, LateMinBusyShare = 0.75;
+        // A height it stepped down from is not tried again for CeilingHoldNs (turn 54, Switch 2 handheld: 576 ->
+        // 756 -> 648 -> 576 cycles every few seconds, each a rebuild of the scene targets).
+        static constexpr uint64_t CeilingHoldNs = 20'000'000'000ull;
+        uint32_t base = 0, minimum = 0, height = 0, step = Rung, ceiling = 0;
+        uint64_t windowStart = 0, windowBusy = 0, lastChange = 0, windowLate = 0, ceilingSince = 0;
+        uint64_t lateTotal = 0;
+        uint32_t lastLate = 0;
         uint32_t windowFrames = 0, downStrikes = 0, upStrikes = 0, requestedMinimum = 0;
         double lastBusyMs = 0;
 
         // Once per CPU frame. busyTotalNs: gpu_busy's running total. Returns the height to render at, and whether it
         // changed this frame (for the log).
+        // lateFrames: perf_stats::LateGpuFrames' running total (0 when unknown).
         uint32_t Update(uint64_t nowNs, uint64_t busyTotalNs, uint32_t baseHeight, uint32_t minimumHeight, double budgetMs,
-                        bool& changed, uint32_t stepRows = Rung)
+                        bool& changed, uint32_t stepRows = Rung, uint64_t lateFrames = 0)
         {
             changed = false;
+            lateTotal = lateFrames;
             stepRows = std::clamp(stepRows / 9 * 9, 9u, 180u);
             if (baseHeight != base || stepRows != step || minimumHeight != requestedMinimum) {
                 // Docked/undocked or reconfigured: start over at the full height.
@@ -105,6 +115,7 @@ namespace gpu::dynamic_resolution
                 step = stepRows;
                 requestedMinimum = minimumHeight;
                 minimum = Floor(base, minimumHeight, step);
+                ceiling = 0;
                 const uint32_t start = StartHeight(base, minimum, step);
                 changed = height && height != start;
                 height = start;
@@ -117,12 +128,16 @@ namespace gpu::dynamic_resolution
                 return height;
             const uint64_t busy = busyTotalNs - windowBusy;
             const uint32_t frames = windowFrames;
+            const uint64_t late = lateFrames >= windowLate ? lateFrames - windowLate : 0;
             Restart(nowNs, busyTotalNs);
             if (!busy || !frames)
                 return height; // no timestamps (yet): keep the height
             const double busyMs = double(busy) / 1e6 / frames;
             lastBusyMs = busyMs;
-            if (busyMs > budgetMs * DownAt) {
+            lastLate = uint32_t(late);
+            if (ceiling && nowNs - ceilingSince >= CeilingHoldNs) ceiling = 0;
+            const bool missing = double(late) > LateDownShare * frames && busyMs > budgetMs * LateMinBusyShare;
+            if (busyMs > budgetMs * DownAt || missing) {
                 upStrikes = 0;
                 if (++downStrikes >= 2 && height > minimum && nowNs - lastChange >= DownHoldNs) {
                     // Straight to the height whose pixels fit the budget (GPU time follows the pixel count, the
@@ -135,6 +150,8 @@ namespace gpu::dynamic_resolution
                     const double fit = share > 0 ? double(height) * std::sqrt(share) : 0;
                     const uint32_t target = fit > 0 ? uint32_t(fit) / step * step : 0;
                     const uint32_t steps = std::max(1u, target < height ? (height - target + step - 1) / step : 1u);
+                    ceiling = height;
+                    ceilingSince = nowNs;
                     height = height - std::min(steps * step, height - minimum);
                     Changed(nowNs, changed);
                 }
@@ -145,14 +162,16 @@ namespace gpu::dynamic_resolution
                 upStrikes = 0;
             } else if (height < base) {
                 const double up = double(height + step) / height;
-                if (busyMs * (FixedShare + (1.0 - FixedShare) * up * up) < budgetMs * UpBelow) {
+                const uint32_t top = ceiling ? std::min(base, ceiling - step) : base;
+                if (height + step > top || double(late) > LateUpShare * frames) {
+                    upStrikes = 0;
+                } else if (busyMs * (FixedShare + (1.0 - FixedShare) * up * up) < budgetMs * UpBelow) {
                     if (++upStrikes >= 6 && nowNs - lastChange >= UpHoldNs) {
                         // More than one rung when the pixels alone (no fixed share: the cautious estimate) fit
                         // under the step-up line (turn 54: 720 -> 972 rows took seven steps and 25 s).
                         const double fit = double(height) * std::sqrt(budgetMs * UpBelow / busyMs);
-                        const uint32_t target = std::min(base, uint32_t(fit) / step * step);
-                        height = std::max(height + step, target);
-                        if (height > base) height = base;
+                        const uint32_t target = std::min(top, uint32_t(fit) / step * step);
+                        height = std::min(top, std::max(height + step, target));
                         Changed(nowNs, changed);
                     }
                 } else {
@@ -163,9 +182,10 @@ namespace gpu::dynamic_resolution
         }
 
         // While a load runs: no change, and the frames until then do not count (their GPU time is a loading screen's).
-        void Hold(uint64_t nowNs, uint64_t busyTotalNs)
+        void Hold(uint64_t nowNs, uint64_t busyTotalNs, uint64_t lateFrames = 0)
         {
             if (!base) return;
+            lateTotal = lateFrames;
             Restart(nowNs, busyTotalNs);
             downStrikes = upStrikes = 0;
         }
@@ -174,6 +194,7 @@ namespace gpu::dynamic_resolution
         {
             windowStart = nowNs;
             windowBusy = busyTotalNs;
+            windowLate = lateTotal;
             windowFrames = 0;
         }
         void Changed(uint64_t nowNs, bool& changed)

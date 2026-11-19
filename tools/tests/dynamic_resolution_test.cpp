@@ -1,6 +1,7 @@
 // gpu/dynamic_resolution.h on the Switch 2 range (turn 35): 1080 -> 576 handheld, 1440 -> 1152 docked.
 // Build with -D__SWITCH2__ for the Switch 2 Highest (1440).
 #include <gpu/dynamic_resolution.h>
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 
@@ -123,6 +124,50 @@ int main()
         // A light real scene (6 ms at this height) still steps up.
         const uint32_t up = Run(c, now, busy, 20, 1080, 576, [low](uint32_t h) { return 6.0 * double(h) * h / (double(low) * low); });
         CHECK(up > low);
+    }
+    {
+        // Turn 54: 14.2 ms average (under the 15.3 ms line) with 3% of frames missing a refresh steps down one rung,
+        // and the height it left is not tried again for 20 s.
+        dr::Controller c;
+        uint64_t now = 1'000'000'000ull, busy = 1, late = 0;
+        bool changed = false;
+        c.Update(now, busy, 1080, 576, 1000.0 / 60, changed);
+        c.height = 648;
+        uint32_t h = 648;
+        for (int f = 0; f < 96; ++f) { // 1.6 s: one step (a second needs another second of misses)
+            h = c.Update(now, busy, 1080, 576, 1000.0 / 60, changed, dr::Rung, late);
+            busy += 14'200'000ull;
+            if (f % 30 == 0) ++late; // 1 in 30 frames
+            now += 16'666'667ull;
+        }
+        CHECK(h == 612 && c.ceiling == 648);
+        // Light again (11 ms, no misses): may climb back, never to 648 within 20 s.
+        uint32_t highest = h;
+        for (int f = 0; f < 60 * 15; ++f) {
+            h = c.Update(now, busy, 1080, 576, 1000.0 / 60, changed, dr::Rung, late);
+            highest = std::max(highest, h);
+            busy += 11'000'000ull;
+            now += 16'666'667ull;
+        }
+        CHECK(highest < 648);
+        for (int f = 0; f < 60 * 15; ++f) {
+            h = c.Update(now, busy, 1080, 576, 1000.0 / 60, changed, dr::Rung, late);
+            busy += 11'000'000ull;
+            now += 16'666'667ull;
+        }
+        CHECK(h > 648 && c.ceiling == 0);
+        // Misses block a step up even at a light average.
+        dr::Controller d;
+        now = 1'000'000'000ull; busy = 1; late = 0;
+        d.Update(now, busy, 1080, 576, 1000.0 / 60, changed);
+        d.height = 612;
+        for (int f = 0; f < 60 * 10; ++f) {
+            h = d.Update(now, busy, 1080, 576, 1000.0 / 60, changed, dr::Rung, late);
+            busy += 9'000'000ull;
+            if (f % 50 == 0) ++late; // 2%, average GPU far below the 75% line: no step down either
+            now += 16'666'667ull;
+        }
+        CHECK(h == 612);
     }
     if (failures) return EXIT_FAILURE;
     std::puts("dynamic_resolution_test: ok");

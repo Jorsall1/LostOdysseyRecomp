@@ -1,0 +1,57 @@
+================================================================================
+LostOdysseyRecomp - Nintendo Switch 2 port
+Summary - TURN 55: turn 54 build checked on HW; dynamic resolution watches missed
+frames and remembers heights that failed; driver cache writes logged
+================================================================================
+Build: NRO md5 1a45942007a077455129e646eb2ae4ca (Desktop copy matches). ELF
+build/turn55_1a459420.elf. kaiHEN fix untouched. Not run on HW yet.
+
+LOGS READ (Desktop\lo project, 2026-11-19)
+  * runtime-1795095890453071: OLD build (revision 294152fd-dirty), handheld,
+    ~54 min. Not the turn 54 build.
+  * runtime-1795099349447544: turn 54 build (5bb43a1c-dirty), handheld, 194 s,
+    title -> Main Street (u36), quit with HOME -> X.
+    - Preparation bar: "video: preparation bar shown (5 of 3446 pipelines)" at
+      2.1 s. Working.
+    - Start height: 792 rows on the title (75% of 1080). Working.
+    - Driver cache still loaded at 94280926 bytes, background preparation
+      still 53 s: this session was the FIRST launch on the turn 54 build (cold
+      cache expected). It may have rewritten the cache at 55 s or 190 s, but
+      success was not logged, so this cannot be confirmed (fixed below).
+    - Field entry (prep still running): 26.4 ms -> 576 rows (floor), effect
+      budget level 2. Expected while generic pipelines are in use.
+    - Main Street steady: 1190 draws/frame, GPU 13.1-14.2 ms at 561 MHz
+      (handheld clocks), 576-648 rows. 60.0 FPS at 576 (13.1 ms); 58 FPS at
+      648 (14.2 ms average, p50 17.2 ms): frames missing vsync while the
+      average stayed under the 15.3 ms step-down line.
+    - GPU time barely follows the height in handheld Main Street (576 -> 648
+      rows: +27% pixels, +1 ms). About 9 ms is fixed cost (draw count, fixed-
+      size shadow / post targets), so handheld tops out near 700 rows there.
+    - Effect budget toggled level 0 <-> 1 every ~40 s (backoff working).
+    - CPU: Guest_Main 82%, GPU_CmdProc 74% of a core at 1101 MHz.
+
+CHANGES
+  1. debug/perf_stats: LateGpuFrames() counts frames over 1.4 refreshes with
+     the GPU busy for over 80% of one.
+  2. gpu/dynamic_resolution.h:
+     * Over 2% missed frames in a 0.5 s window (with GPU over 75% of the frame)
+       counts as over budget: one rung down after two windows.
+     * Any misses over 0.5% block a step up.
+     * Ceiling memory: a height it stepped down from is not tried again for
+       20 s (stops the 576 <-> 756 cycles of the old build's log, each one a
+       scene target rebuild).
+     * Log line now ends with ", N missed frames".
+  3. gpu/renderer.cpp: "renderer: driver pipeline cache written: N bytes (was
+     M), T ms" after every successful write.
+
+TESTS: dynamic_resolution_test ok (plain and -D__SWITCH2__; new missed-frame,
+ceiling and blocked-step-up cases); effect_budget_test ok; Switch 2 build ok.
+
+NEXT (user)
+  * Launch, reach the field, wait until texinfo "building=0", quit. Look for
+    "driver pipeline cache written".
+  * Launch again: the cache should load at the new size and "background done"
+    should take a few seconds. That is the remaining fix for the first-minute
+    drops.
+  * For the handheld fixed cost: one run with LO_GPU_PASS_TIMING=1 in Main
+    Street to see which passes make up the ~9 ms.

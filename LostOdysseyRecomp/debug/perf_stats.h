@@ -39,6 +39,8 @@ uint64_t CurrentSceneSize();
 uint64_t TotalDraws();
 // Hitches since the start (all of them, not only the logged ones). Any thread.
 uint32_t HitchCount();
+// Frames over 1.4 refresh intervals with the GPU busy for over 80% of one (dynamic resolution). Any thread.
+uint64_t LateGpuFrames();
 uint32_t GpuClockMhz();
 
 // For the debug server's info: the map's name as one word ("-" when there is none) and the last perf: line (empty

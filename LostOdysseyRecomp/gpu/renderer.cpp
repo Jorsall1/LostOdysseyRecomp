@@ -7260,8 +7260,12 @@ void main()
                     return fmt::format("{} bytes exceed the {} MB cap; keeping the file", data.size(), dpc::kMaxBytes >> 20);
                 }
                 std::string error;
+                const auto writeStart = std::chrono::steady_clock::now();
                 if (!dpc::Write(driverCachePath, data, error)) return error;
                 driverCacheBytes = data.size();
+                // Turn 54: proof on HW that the cache was saved (a silent success hid whether it ever was).
+                LOG_INFO("renderer: driver pipeline cache written: {} bytes (was {}), {:.0f} ms", data.size(), previous,
+                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - writeStart).count());
                 return {};
             }
 
