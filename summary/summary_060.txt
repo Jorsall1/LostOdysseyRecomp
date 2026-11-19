@@ -58,9 +58,10 @@ CHANGES (gpu/renderer.cpp)
   * LogSubmissionRing: "completion not read yet" instead of "not completed".
 NOT FIXED: the driver refusal itself. No proven app-side cause.
 OPTIONAL A/B (no rebuild): OunceVK reads sdmc:/config/ouncevk/debug-sync.txt
-  (one integer). Bit 1 (value 2) makes every batch carry the L2-invalidate
-  header that steady 3D batches already get; stderr then prints "native debug
-  sync flags: 2". Cost: one cache invalidate per light batch.
+  (one integer). Bit 1 (value 2) should make every batch take the header path
+  (as batches submitted behind a busy GPU do) plus an L2 invalidate; stderr
+  then prints "native debug sync flags: 2". Semantics read from disassembly,
+  not documented. Cost: one cache invalidate per batch.
 NEXT (user): put back the play env.txt (LO_GUEST_AFFINITY=1 only; the SD copy
 still has LO_CPU_PROFILE=1). Repeat field -> in-game menu -> close a few
 times; optionally with the debug-sync file. Send logs either way.
