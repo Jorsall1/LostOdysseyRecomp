@@ -1,0 +1,39 @@
+================================================================================
+LostOdysseyRecomp - Nintendo Switch 2 port
+Summary - TURN 56: test1 logs (Main Street drops) diagnosed; test env files
+================================================================================
+No code changes. NRO on the Desktop is still turn 55 (md5
+1a45942007a077455129e646eb2ae4ca, ELF build/turn55_1a459420.elf), not yet
+run by the user.
+
+LOG READ: Desktop\lo project\test1\runtime-1795099684450379.log
+  Turn 54 build (5bb43a1c-dirty), handheld (GPU 561 MHz, CPU 1101 MHz),
+  ~600 s around Uhra: Main Street, Virno's Tavern, Barkus' shop.
+  * Driver cache fix confirmed: pipeline_cache_vk.bin loaded at 169957862
+    bytes (was 94280926); background preparation done in 4558 ms, 6.6 s after
+    launch (was ~53 s). The first-minute drops are gone.
+  * Logging is not the cause: ~5 lines/s during play, written by the queued
+    writer; the only synchronous lines ([warn]) are 7 at map loads.
+  * The drops: 40-49 FPS in two Main Street stretches (62-92 s, 442-462 s).
+    Both at 2050-2140 draws per frame (rest of Main Street 1100-1500, tavern
+    800-1400). Frame time p50 21-25 ms while GPU busy was only 14.5-15.2 ms per
+    frame (gpu_pct 62-73) and cp_idle 0: the command processor thread
+    (GPU_CmdProc 77-90% of a core, Guest_Main 58-72%) is the limit, about
+    9-10 us of CPU per draw. Lower resolution cannot help (DR already at its
+    576 floor there).
+  * Possible factor: Switch 2 ends a batch every 1024 draws (turn 36, a
+    device-loss experiment, never shown to help). 2100 draws = 3 submissions;
+    the 1834-draw window (2 submissions) ran 58.9 FPS. Unproven.
+  * Both bad stretches ran with effect budget level 2 (dynamic shadows Low),
+    but level 2 at 24-38 s also had ~1170 draws; looks like a location (crowd)
+    rather than the shadow patch. Not ruled out.
+  * Rest of the session: 58-60 FPS at 576-756 rows.
+
+TEST ENV FILES (Desktop; the previous env.txt kept as env_normal.txt)
+  Test 1 env.txt: LO_GUEST_AFFINITY=1 + LO_CPU_PROFILE=1 (where the command
+    processor's time goes; stderr.log [cpu profile] blocks every 30 s; read
+    with tools/switch/switch-cpu-profile.py --elf build/turn55_1a459420.elf).
+  Test 2 env_test2.txt: LO_GUEST_AFFINITY=1 + LO_SWITCH_BATCH_DRAWS=2048.
+  Both on the turn 55 NRO, same Main Street spot, 2+ minutes there.
+NEXT: send runtime + stderr logs of each test. Then target the hottest
+command-processor functions (per-draw cost) based on test 1.
