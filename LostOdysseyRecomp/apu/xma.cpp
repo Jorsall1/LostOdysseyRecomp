@@ -129,7 +129,20 @@ namespace apu::xma
                 for (char& c : t_decoderMessage)
                     if (c == '\n' || c == '\r' || c == '"') c = ' ';
             }
-            av_log_default_callback(object, level, format, args);
+            // Only the first messages of a session reach stderr. Turn 58: entering Uhra's Residential Area, one
+            // desynchronised stream printed 501 FFmpeg lines in 30 s. The decoder thread wrote them to stderr.log
+            // (unbuffered, straight to the SD card) while holding the XMA lock, about a second of writes next to
+            // the area's streaming reads, and the game froze 1.8 s. The runtime log keeps one line per failure
+            // (with its reason, from t_decoderMessage) under its own budget.
+            if (level > av_log_get_level())
+                return;
+            constexpr uint32_t kForwarded = 24;
+            static std::atomic<uint32_t> forwarded{0};
+            const uint32_t count = forwarded.fetch_add(1, std::memory_order_relaxed);
+            if (count < kForwarded)
+                av_log_default_callback(object, level, format, args);
+            else if (count == kForwarded)
+                std::fputs("[xma] further FFmpeg decoder messages are not printed (see the runtime log)\n", stderr);
         }
 
         struct Context

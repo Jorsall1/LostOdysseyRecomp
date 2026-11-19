@@ -1,0 +1,59 @@
+================================================================================
+LostOdysseyRecomp - Nintendo Switch 2 port
+Summary - TURN 58: freeze entering Residential Area (FFmpeg log flood on the SD
+card under the XMA lock), lock-free guest timebase, turn 57 profile read
+================================================================================
+Build: NRO md5 ab704f6a98c3998a2af9a15d42381cfb (Desktop copy matches).
+ELF build/turn58_ab704f6a.elf. kaiHEN fix untouched. Not on HW yet.
+
+LOG READ: Desktop\lo project\runtime-1795103232441425.log + stderr.log
+  Turn 57 NRO (revision 21e8452a-dirty), LO_GUEST_AFFINITY=1 + LO_CPU_PROFILE=1,
+  handheld, 147 s: Tolsan's Inn -> Main Street -> Residential Area -> Main
+  Street -> Residential Area -> Main Street, HOME -> X (exit.log clean). No
+  errors, GPU stops or WAIT_REG_MEM stalls.
+  * Turn 57 occlusion fix confirmed: readback_ms 138.8 at 385024 results (turn
+    55: 884 at 434176), about 6x less.
+  * Main Street: 54.6-59.0 FPS at 1390-1600 draws (same as turn 55).
+  * THE FREEZE: 88.241 s, frame_ms=1767.6 cp_idle_ms=1755.6 (the GPU thread was
+    waiting for the game), 2.3 s after the first entry into the Residential
+    Area. At 86.39 s XMA context 6 desynchronised ("frame[3683] would have to
+    skip 4393 bits", then "Reserved bit" errors) and FFmpeg printed 501 lines
+    to stderr.log in that 30 s window. stderr.log is unbuffered (each line is
+    2+ SD writes); the XMA decoder thread spent 3.6% of its 30 s in fsFileWrite
+    (~1 s), inside Work() under the XMA g_mutex, next to the area's streaming
+    reads. The second entry (134.9 s) printed 11 lines and had no freeze
+    (79 ms). Other load hitches (90-220 ms at each map change) are the normal
+    load/prefetch and unchanged.
+  * CPU profile with helper callers (reports 2-3):
+      Guest Main: mftb clock mutex (LostOdysseyActiveGameTimeNs ->
+        fast_forward::GameTimeNs) ~4% of its time: 9.4% of its system-call
+        samples were waits for that lock plus ~50% of its helper samples.
+        The rendering thread (sub_824856A0) takes the same lock.
+      GPU CmdProc helpers 5.7%: memcmp in CapturedShader::Load 19% of them,
+        UploadUnchanged memcmp 15%, ~4.7 KB of memset per draw in DrawImpl 10%,
+        SDL gamepad reads ~14% (8 SDL pads, 7 unconnected, read each pump;
+        ~1% of the thread in all). None changed this turn.
+
+CHANGES
+  1. apu/xma.cpp CaptureDecoderLog: only the first 24 FFmpeg messages of a
+     session reach stderr, then one "[xma] further FFmpeg decoder messages are
+     not printed" line. The runtime log keeps its per-failure lines (reason
+     still captured).
+  2. debug/fast_forward.h: GameTimeNs (guest mftb / KeTimeStampBundle) reads
+     an atomic offset without the mutex while the clock runs at 1x (not paused,
+     not fast-forwarding). Every writer clears it under the mutex before
+     reading the host clock and republishes when steady. New test
+     tools/tests/fast_forward_steady_test.cpp (agreement with the locked clock,
+     paused, boosted, 4-thread monotonic): ok. fast_forward_audio_test and
+     guest_clock_origin_test: ok. Disassembly: fast path = steady_clock::now +
+     ldar, no lock.
+
+OPEN
+  * The XMA desync itself (context 6, ~830 KB into a stream, Residential Area
+    music/ambience) can still glitch the audio there; not investigated.
+  * Input: reading only connected npads would save ~1% of GPU CmdProc; not done
+    (risk of losing controls if the SDL instance <-> npad mapping is wrong).
+
+TEST ENV: Desktop env.txt unchanged (LO_GUEST_AFFINITY=1 + LO_CPU_PROFILE=1).
+NEXT (user): same route (Main Street <-> Residential Area a few times), check
+whether the entry freeze is gone and whether audio glitches there; send logs.

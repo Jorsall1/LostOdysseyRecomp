@@ -45,6 +45,14 @@ struct Clock {
         const auto room = std::numeric_limits<uint64_t>::max() - value;
         value += elapsed > room / factor ? room : elapsed * factor;
     }
+    // While the clock runs at 1x (not paused; Read only ever lowers the rate), value = now - offset for every later
+    // now: the offset GameTimeNs reads without the lock. False when the clock is not in that state.
+    bool Steady(uint64_t& offset) const {
+        if (!initialized || paused || rate != 1 || last < value) return false;
+        offset = last - value;
+        return offset != kNoOffset;
+    }
+    static constexpr uint64_t kNoOffset = ~0ull;
     uint64_t Read(uint64_t now) {
         if (!initialized) { initialized = true; last = origin = now; value = GuestClockStartNs; }
         if (now < last) return value;
@@ -108,6 +116,18 @@ struct Control {
 };
 inline std::mutex mutex;
 inline Control control;
+// Clock::Steady's offset, or Clock::kNoOffset. Turn 58: the guest reads the timebase (mftb) thousands of times a
+// frame from the main and rendering threads, and the mutex below was 4% of Guest Main's time on the Switch (waits
+// included). Writers hold `mutex`: they clear it first (before reading the host clock), change the clock, and
+// publish it again when the clock is steady. A reader takes the host clock before it loads the offset, so a value
+// it computes from an offset that a writer is about to clear is one from before that writer's change.
+inline std::atomic<uint64_t> steadyOffset{Clock::kNoOffset};
+// Caller holds mutex.
+inline void Unpublish() { steadyOffset.store(Clock::kNoOffset, std::memory_order_seq_cst); }
+inline void PublishSteady() {
+    uint64_t offset;
+    steadyOffset.store(control.clock.Steady(offset) ? offset : Clock::kNoOffset, std::memory_order_seq_cst);
+}
 // The clock's current rate for the audio driver, read without the lock.
 inline std::atomic<unsigned> audioRate{1};
 inline std::atomic<bool> audioKeepPitch{true};
@@ -119,30 +139,36 @@ inline void PublishRate() {
 inline unsigned AudioRate() { return audioRate.load(std::memory_order_relaxed); }
 inline bool KeepAudioPitch() { return audioKeepPitch.load(std::memory_order_relaxed); }
 inline uint64_t GameTimeNs() {
+    const uint64_t now = NowNs();
+    if (const uint64_t offset = steadyOffset.load(std::memory_order_seq_cst); offset != Clock::kNoOffset && now >= offset)
+        return now - offset;
     std::lock_guard lock(mutex);
     const uint64_t value = control.clock.Read(NowNs());
     PublishRate();
+    PublishSteady();
     return value;
 }
 // Host steady_clock minus guest clock, without paused or fast-forwarded time.
 inline int64_t GuestClockShiftNs() {
     std::lock_guard lock(mutex);
+    Unpublish();
     control.clock.Read(NowNs());
+    PublishSteady();
     return int64_t(control.clock.origin) - int64_t(GuestClockStartNs);
 }
-inline Status GetStatus() { std::lock_guard lock(mutex); const Status status = control.Get(NowNs()); PublishRate(); return status; }
-inline void Enable(bool enabled) { std::lock_guard lock(mutex); control.Enable(enabled, NowNs()); PublishRate(); }
-inline void SetMode(Mode mode) { std::lock_guard lock(mutex); control.SetMode(mode, NowNs()); PublishRate(); }
-inline void SetButton(Button button) { std::lock_guard lock(mutex); control.SetButton(button, NowNs()); PublishRate(); }
-inline void SetRate(unsigned rate) { std::lock_guard lock(mutex); control.SetRate(rate, NowNs()); PublishRate(); }
+inline Status GetStatus() { std::lock_guard lock(mutex); Unpublish(); const Status status = control.Get(NowNs()); PublishRate(); PublishSteady(); return status; }
+inline void Enable(bool enabled) { std::lock_guard lock(mutex); Unpublish(); control.Enable(enabled, NowNs()); PublishRate(); PublishSteady(); }
+inline void SetMode(Mode mode) { std::lock_guard lock(mutex); Unpublish(); control.SetMode(mode, NowNs()); PublishRate(); PublishSteady(); }
+inline void SetButton(Button button) { std::lock_guard lock(mutex); Unpublish(); control.SetButton(button, NowNs()); PublishRate(); PublishSteady(); }
+inline void SetRate(unsigned rate) { std::lock_guard lock(mutex); Unpublish(); control.SetRate(rate, NowNs()); PublishRate(); PublishSteady(); }
 inline void SetKeepAudioPitch(bool keep) {
     std::lock_guard lock(mutex);
     control.keepAudioPitch = keep;
     audioKeepPitch.store(keep, std::memory_order_relaxed);
 }
-inline void SetPaused(bool paused) { std::lock_guard lock(mutex); control.Pause(paused, NowNs()); PublishRate(); }
-inline void Release() { std::lock_guard lock(mutex); control.Stop(NowNs()); PublishRate(); }
+inline void SetPaused(bool paused) { std::lock_guard lock(mutex); Unpublish(); control.Pause(paused, NowNs()); PublishRate(); PublishSteady(); }
+inline void Release() { std::lock_guard lock(mutex); Unpublish(); control.Stop(NowNs()); PublishRate(); PublishSteady(); }
 inline void Sample(uint8_t button, uint8_t pair, bool allowed) {
-    std::lock_guard lock(mutex); control.Sample(button, pair, allowed, NowNs()); PublishRate();
+    std::lock_guard lock(mutex); Unpublish(); control.Sample(button, pair, allowed, NowNs()); PublishRate(); PublishSteady();
 }
 } // namespace debug_menu::fast_forward
