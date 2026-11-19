@@ -1,0 +1,24 @@
+================================================================================
+LostOdysseyRecomp - Nintendo Switch 2 port
+Summary - TURN 70: README credits/install/SD layout; release renamed v0.1.0
+================================================================================
+No code changes.
+README.md
+  * Contributors: Switch 2 port by Jorsall1 and Claude (Anthropic) (top line
+    and Credits).
+  * "Alpha" note removed.
+  * Getting started rewritten: disc extraction steps + link to
+    docs/INSTALL-SWITCH.md#step-1-extract-your-discs-on-a-pc; ZIP goes to the
+    SD root (it holds switch/LostOdysseyRecomp/); shaders portable_vk.lospv +
+    pipelines_corpus.bin from Ad0ky's Switch release (same 147970990-byte pack
+    the user's console loads), not its .nro/env.txt/cache.
+  * SD card layout chart. Paths checked in os/user_paths.h: Switch uses
+    config/settings.ini and save/ under the app folder.
+RELEASE (github.com/Jorsall1/LostOdysseyRecomp)
+  * Tag switch2-turn67-stable -> v0.1.0 (same commit 7f04f541); title
+    "LostOdysseyRecomp-Switch2-v0.1.0"; notes rewritten (no turn/alpha/beta).
+  * ZIP rebuilt: same NRO (md5 ce75f6ccf2a64d254b7cec472ba429f9, the turn 68
+    build), env.txt comment no longer mentions turn 67.
+  * Still mentions turn 67: commit message of 7f04f541 (history; changing it
+    needs a force push).
+================================================================================
