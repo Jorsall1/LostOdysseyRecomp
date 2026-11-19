@@ -414,7 +414,7 @@ index 0000000..e9914b8
 +    }
 +};
 diff --git a/plume_vulkan.cpp b/plume_vulkan.cpp
-index 3f15073..c24c9c9 100644
+index 3f15073..82759b1 100644
 --- a/plume_vulkan.cpp
 +++ b/plume_vulkan.cpp
 @@ -9,6 +9,11 @@
@@ -569,7 +569,19 @@ index 3f15073..c24c9c9 100644
              if (desc.geometryShader != nullptr) {
                  stages[stageCount++] = libraryStage(desc.geometryShader, VK_SHADER_STAGE_GEOMETRY_BIT);
              }
-@@ -3487,6 +3578,19 @@ namespace plume {
+@@ -3286,6 +3377,11 @@ namespace plume {
+             if (desc.colorAttachmentsCount == 0) {
+                 width = uint32_t(depthAttachment->desc.width);
+                 height = depthAttachment->desc.height;
++            } else {
++                // Vulkan needs every attachment at least the framebuffer's size. A depth smaller than colour 0 made
++                // render passes, clears and draws reach past the depth image (GPU faults on Switch 2 / NVK).
++                width = std::min(width, uint32_t(depthAttachment->desc.width));
++                height = std::min(height, uint32_t(depthAttachment->desc.height));
+             }
+ 
+             depthReference.attachment = uint32_t(attachments.size());
+@@ -3487,6 +3583,19 @@ namespace plume {
          }
  
  	    VkResult res = vkGetQueryPoolResults(device->vk, vk, 0, uint32_t(results.size()), sizeof(uint64_t) * results.size(), results.data(), sizeof(uint64_t), VK_QUERY_RESULT_64_BIT);
@@ -589,7 +601,7 @@ index 3f15073..c24c9c9 100644
          if (res != VK_SUCCESS) {
              PLUME_LOG_ERROR("Vulkan", "vkGetQueryPoolResults", LogErrorDomain::VkResult, res, "");
              return;
-@@ -5069,7 +5173,8 @@ namespace plume {
+@@ -5069,7 +5178,8 @@ namespace plume {
          }
  
          VkPhysicalDeviceTimelineSemaphoreFeatures timelineFeatures = {};

@@ -9228,6 +9228,16 @@ void main()
                         d ? vk_object_trace::Id(d->vk) : 0ull, d ? vk_object_trace::Id(d->imageView) : 0ull,
                         depth ? depth->width : 0u, depth ? depth->height : 0u);
                 }
+                if (color && depth && (color->width != depth->width || color->height != depth->height)) {
+                    // plume sizes the framebuffer to the smaller of the two (Vulkan's rule); this names the pair.
+                    static uint32_t mismatches = 0;
+                    if (mismatches++ < 16)
+                        LOG_WARNING("renderer: f{} framebuffer colour {}x{} (guest {}x{} scale {}x{} serial {}) with depth {}x{} "
+                            "(guest {}x{} scale {}x{} serial {})", frame, color->width, color->height, color->guestWidth,
+                            color->guestHeight, color->resolutionSize.width, color->resolutionSize.height, color->allocationSerial,
+                            depth->width, depth->height, depth->guestWidth, depth->guestHeight, depth->resolutionSize.width,
+                            depth->resolutionSize.height, depth->allocationSerial);
+                }
                 const RenderTexture* colors[1] = { key.first };
                 RenderFramebufferDesc desc(colors, color ? 1u : 0u, key.second);
                 ++recordFramebufferCreates;

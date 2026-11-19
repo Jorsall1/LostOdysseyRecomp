@@ -1,0 +1,41 @@
+================================================================================
+LostOdysseyRecomp - Nintendo Switch 2 port
+Summary - TURN 49: GPU stop after switching to fixed 1440p (no DR, no FSR);
+framebuffer extent clamped to the smallest attachment, mismatch logging
+================================================================================
+Build: NRO md5 a1a32a467e3aeb38844526ab586878b5 (Desktop copy matches).
+ELF: build/fbclamp_turn49_a1a32a46.elf. kaiHEN fix untouched. Not on HW.
+User: "a bit more stable" on turn 48 until 1440p fixed was chosen.
+CRASH LOG (lo project/crash, runtime-1795068531453947.log, docked)
+  * 347.81 Settings save: DR off, FSR off -> "dynamic resolution: off, scene
+    at 1440 rows", internal 2560x1440 at 347.96 with Settings still open;
+    scene colour targets rebuilt at 2560x1472 then, the scene DEPTH (base 0x0
+    fmt 1) not (the menu frames do not use it).
+  * Menu frames at 1440: 32 draws but 15.5-16.7 ms GPU each.
+  * 353.002 "new depth target base=0x0 fmt=1 ... physical=2560x1472" in the
+    first field frame; that batch (757 draws) not completed, the next (1024
+    draws) REFUSED; stderr "context failed at nvkmd_nvgpu_native_ctx.c:793".
+  * Same shape as turns 43 and 45: the scene depth is (re)created in the first
+    3D frame after a size change made behind a menu, and that batch faults.
+FINDING
+  thirdparty/plume VulkanFramebuffer took its extent from colour attachment 0
+  only. Vulkan requires every attachment to be at least the framebuffer's
+  size; a depth smaller than the colour (EDRAM targets grow when a taller
+  extent shows up, and colour and depth are sized/grown separately) lets the
+  render pass, vkCmdClearAttachments with no rects (ReplayClears / the zero
+  clear of a new target) and draws touch memory past the depth image: a GPU
+  fault. Whether a smaller depth was actually paired is not proven: the new
+  renderer warning will say.
+CHANGES
+  * thirdparty/plume/plume_vulkan.cpp: with a depth attachment and colour,
+    width/height = min over both. tools/patches/plume-switch-perf.patch
+    regenerated (the 5-patch chain on d890ac8 reproduces all 5 files).
+  * gpu/renderer.cpp FramebufferFor: "renderer: fN framebuffer colour WxH
+    (guest, scale, serial) with depth WxH (...)" warning when they differ
+    (16 at most).
+NOTE: fixed 1440p docked cannot hold 60 FPS (menu frames alone 15.5-16.7 ms
+GPU; the field ~3x that). Dynamic resolution 1440 -> 720 is the setting that
+can.
+TESTS: settings ctest 11/11; Switch 2 build ok.
+NEXT (user): repeat the 1440p switch; send logs either way and look for
+"framebuffer colour ... with depth" warnings.
