@@ -1,0 +1,24 @@
+================================================================================
+LostOdysseyRecomp - Nintendo Switch 2 port
+Summary - TURN 52: turn 51 reverted (very low FPS)
+================================================================================
+Build: NRO md5 a5b8b3617adfec3c5be3b9eb98c28d1d (Desktop copy matches). Same
+code as turn 50 (commit 46f06fee) + the revert commit dcff4ded.
+User: the turn 51 build ran at very low FPS.
+REVERTED (git revert 71a950a3): the plume NativeSerializeLock around pipeline
+creation / vkQueueSubmit / vkQueuePresentKHR (most likely cause of the low FPS:
+submits waited for pipeline creation on the worker threads), the scene-target
+remake at size changes, the 1500-op dump cap (back to 400). summary_051.txt
+went with the revert; its content: the 7th GPU stop (fixed 1440 picked in
+Settings) faulted in the first 3D batch that created the scene depth (serial
+97, 2560x1472) after a size change behind a menu; nothing out of bounds in the
+first 400 recorded operations.
+thirdparty/plume restored from the 5-patch chain (no NativeSerialize, the
+turn 49 framebuffer clamp still present).
+Still in: turn 49 framebuffer clamp + mismatch warning, turn 50 op ring,
+turn 48 whole-image Settings overlay copy, turn 47 restore skip / blit
+resolve opt-in, turn 43 light-screen DR hold.
+OPEN: GPU stops after menus (size change behind a menu, then the first 3D
+batch). Next candidate to try alone: the target remake without the serialize
+lock (cheap: only at size changes).
+TESTS: settings ctest 11/11; Switch 2 build ok.
