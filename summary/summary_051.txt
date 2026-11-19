@@ -1,0 +1,46 @@
+================================================================================
+LostOdysseyRecomp - Nintendo Switch 2 port
+Summary - TURN 51: seventh GPU stop (fixed 1440 chosen in Settings); first
+operation dump; scene targets remade while the GPU is drained; pipeline
+creation serialized with queue submissions
+================================================================================
+Build: NRO md5 b7bd0afcf72645f297f2c93c560601ce (Desktop copy matches).
+ELF: build/remake_turn51_b7bd0afc.elf. kaiHEN fix untouched. Not on HW.
+CRASH LOG (lo project/crash, runtime-1795071606444546.log, docked)
+  * 90.26 Settings save: DR off -> "scene at 1440 rows", internal 2560x1440
+    at 90.42 (Settings still open; scene depth not rebuilt, unused by menus).
+    97.1 closed; 32-draw menu frames ~16 ms GPU; the 20-draw closing frame
+    COMPLETED this time.
+  * Batch 5042 (frame 5034, the first 3D frame: 835 draws, 17 resolves, 53
+    rect lists, 69 occlusion) not completed, 5043 (1024 draws) REFUSED.
+  * Operation dump (first 400 of 902): #2 "clear a=97 2560x1472 whole" = the
+    zero clear of the scene depth (serial 97) created in this batch; 391 draws
+    with colour 83/84 2560x1472 + depth 97 2560x1472, scissor 2560x1440;
+    one resolve 2560x1472 -> 2560x1440; nothing out of bounds in what was
+    shown. The 5043 dump (next frame) looks the same.
+  * Again: the scene depth created inside a busy batch after a size change
+    behind a menu (turns 43, 45, 49, 51). The same targets created right after
+    a drained dynamic-resolution step during 3D never faulted. Working
+    theory: a GPU allocation made while the GPU is busy is not safe to use at
+    once in the native driver (mapping/TLB), and/or a driver race between
+    pipeline creation (shader upload on its copy channel, from the 3 pipeline
+    worker threads) and submissions ("Raced in arena grow" exists in the
+    driver's strings). Neither proven.
+CHANGES
+  * gpu/renderer.cpp: at a size change (after Flush + WaitForGpu +
+    WaitForPresentGpu) the scene targets that were released are made again at
+    once with their guest format/height (HostTexture::guestFormat), so the
+    first 3D frame after a menu uses targets made on an idle GPU. Logged
+    "renderer: size change made N of M scene targets again while the GPU is
+    idle". LO_REMAKE_TARGETS=0 off.
+  * thirdparty/plume (patch regenerated): plume::NativeSerializeLock, a global
+    mutex taken by vkCreateGraphicsPipelines (3 sites), vkCreateComputePipelines,
+    vkQueueSubmit (plume + video.cpp native submit) and vkQueuePresentKHR on
+    Switch 2. Lock order: queue mutex, then this. LO_SERIALIZE_GPU=0 off.
+    Cost: a submit can wait for a pipeline being created (cache hits ~ms;
+    background preparation in the first minutes can add hitches).
+  * Operation dump prints up to 1500 ops per batch.
+TESTS: settings ctest 11/11; Switch 2 build ok; plume chain reproduces tree.
+NEXT (user): play with Settings changes as before. If it stops, send logs
+(the dump will be complete). If hitches appear in the first minutes, that
+is the serialize lock: say so.
