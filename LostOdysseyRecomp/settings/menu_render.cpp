@@ -1173,24 +1173,9 @@ bool settings::RasterizeMenu(const MenuSnapshot &current, uint32_t width, uint32
         // the menu font. Drawn over black and over white: the difference is
         // the coverage, so the legend keeps the font's outline in straight alpha.
         const uint32_t face = MakeColor(255, 196, 197, 194);
-        const int creditY = CreditTop(output);
         const int hintY = kHintY + FooterOffset(output), quitY = kQuitHintY + FooterOffset(output);
-        const std::wstring refund = Translate(current.language, L"If you paid for this, ask for a refund.",
-                                              L"本移植免費開源。如果你是花錢買到的，請申請退款。");
-        const std::wstring authors = Translate(current.language, L"By Ad0ky and depende3000. Based on freefrank's recomp.",
-                                               L"由 Ad0ky 與 depende3000 製作。基於 freefrank 的移植。");
-        const auto legend = [&](bool credit) {
-            if (credit)
-            {
-                text(kCreditX, creditY, kCreditWidth, kCreditLineHeight,
-                     L"Lost Odyssey Recomp · Free & open source · github.com/Ad0ky/LostOdysseyRecomp",
-                     14, face, false, 0, outline, 12, false, true);
-                text(kCreditX, creditY + kCreditLineHeight, kCreditWidth, kCreditLineHeight, authors,
-                     14, face, false, 0, outline, 12, false);
-                text(kCreditX, creditY + 2 * kCreditLineHeight, kCreditWidth, kCreditLineHeight, refund,
-                     14, face, false, 0, outline, 12, false);
-                return;
-            }
+        // No project credit on the title (removed at the user's request); only the two shortcuts.
+        const auto legend = [&]() {
             text(kHintX, hintY, kHintKey, kHintHeight, current.help.substr(0, 1), 18, face, false, 1, outline, 12);
             text(kHintX + kHintKey, hintY, kHintWidth - kHintKey, kHintHeight, current.help.substr(1), 18, face,
                  false, 0, outline, 12);
@@ -1223,14 +1208,12 @@ bool settings::RasterizeMenu(const MenuSnapshot &current, uint32_t width, uint32
                      L": " + current.titleQuitLabel, 18, face, false, 0, outline, 12, false);
             }
         };
-        // Keep the credit's lower opacity independent of the two shortcuts:
-        // the wider Backspace key can extend left of the credit box's edge.
-        const auto alphaLayer = [&](bool credit, int opacity) {
+        const auto alphaLayer = [&](int opacity) {
             std::fill(pixels.begin(), pixels.end(), 0xFF000000u);
-            legend(credit);
+            legend();
             const std::vector<uint32_t> overBlack = pixels;
             std::fill(pixels.begin(), pixels.end(), 0xFFFFFFFFu);
-            legend(credit);
+            legend();
             for (size_t i = 0; i < pixels.size(); ++i)
             {
                 auto &p = pixels[i];
@@ -1244,11 +1227,7 @@ bool settings::RasterizeMenu(const MenuSnapshot &current, uint32_t width, uint32
                 p = host_ui::PackRgba(channel(0), channel(1), channel(2), uint8_t(alpha * opacity / 255));
             }
         };
-        alphaLayer(true, 184);
-        const std::vector<uint32_t> credit = pixels;
-        alphaLayer(false, 255);
-        for (size_t i = 0; i < pixels.size(); ++i)
-            pixels[i] = ColorBlend(credit[i], pixels[i]);
+        alphaLayer(255);
         return true;
     }
 

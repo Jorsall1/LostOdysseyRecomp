@@ -1,0 +1,50 @@
+================================================================================
+LostOdysseyRecomp - Nintendo Switch 2 port
+Summary - TURN 38: Voice language had no effect (hook passed an id where the
+game expects a name pointer); title-screen project credit removed
+================================================================================
+Build: NRO md5 f2214beb718cafba14a6df36638e9d01 (Desktop copy matches).
+ELF: build/menu_turn38_f2214beb.elf. kaiHEN fix untouched (RawInitialize still
+fsOpenSdCardFileSystem; no SetCurrentProcess on smGetService sessions).
+NOT yet run on hardware.
+LOGS READ (lo project): runtime-1795055623434490.log, stderr.log, exit.log.
+  * Clean run, no errors; exit by HOME -> X (log closed, exit lock released).
+  * 3.592 s: "language: voices in language 2 (Settings), the save asked for
+    2200144424". 2200144424 = 0x83238A28: a guest POINTER, not a language id.
+  * 422.9 s Settings opened; voice options 0..4 -> ids 1,2,3,4,6.
+CAUSE (voice language)
+  The turn-37 hook assumed sub_82481E78(id). Disassembly:
+    82481E78(r3 = UTF-16 name pointer): r4 = 82481CD0(Registry, name, 0)
+    (name -> id via 82481C58, mapped/validated against the voice list at
+    Registry+288), fallback 82481BE8; then 8230BAC0 copies the resulting name
+    to the voice cache 0x83318000. 82481F40 reads that cache back to an id.
+  Registry 0x8336A5F0: entries {u16 id; u16 name[6]} stride 14 at +0, count
+  at +416. Callers: 82481EE8 (first use, default name 0x83238A28) and config
+  apply 82870E38 via 82482038(voice index) = 82481BE8(Registry, list[index]),
+  i.e. a registry name pointer.
+  The hook replaced the pointer with the integer 2, so the lookup read guest
+  address 2 and fell back to the default (English).
+CHANGES
+  settings/language_hooks.cpp
+    * RegistryName(id): the registry entry's name address for the id (what
+      82481BE8 returns). The hook now puts that pointer in r3 when the chosen
+      id is in the voice list and differs from the game's request.
+    * Log: "language: voices in language N (Settings), the game asked for
+      name 0x... (language M)".
+    * Changing Voice language in the menu sets changed=true, which runs the
+      config apply 82870E38 -> 82481E78 (hooked) at once, on the title too.
+  settings/menu_render.cpp
+    * Title legend no longer draws the 3-line credit ("Lost Odyssey Recomp ·
+      Free & open source · github...", authors, refund line). Only the Y and
+      quit shortcuts remain. Translation strings left in translations*.h
+      (unused).
+TESTS
+  settings ctest 11/11 (/tmp/lotests/settings, clean env). Switch 2 build ok.
+NEXT (user)
+  1. Copy the NRO. Title: no credit lines at the bottom left.
+  2. Title -> Y -> Audio -> Voice language -> Japanese, load a save, play a
+     cutscene/battle with dialogue: voices should be Japanese, text English.
+     Log should show "voices in language 2 (Settings), the game asked for
+     name 0x... (language 1)". If voices stay English, send that log; next
+     suspect is voice banks already loaded before the apply (needs a scene
+     change) or 82481CD0's mapping table at Registry+320.
