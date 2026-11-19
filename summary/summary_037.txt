@@ -1,0 +1,128 @@
+================================================================================
+LostOdysseyRecomp - Nintendo Switch 2 port
+Summary - TURN 37: Settings at 6 FPS (uncached read-modify-write), header flicker
+and "two menus" (host presents between game frames), GPU busy time lost out of
+order (dynamic resolution saw an idle GPU), voice language from the title,
+gentler dynamic-resolution jumps; the post-Settings GPU stop decoded
+================================================================================
+(summary_036.txt already held turn 36, so this turn is 037.)
+Build: NRO md5 fdaa7cea95fd12a4e8d2f1cdfa157167 (Desktop copy matches).
+ELF: build/menu_turn37_fdaa7cea.elf. kaiHEN fix untouched (RawInitialize still
+fsOpenSdCardFileSystem; no SetCurrentProcess on smGetService sessions).
+NOT yet run on hardware.
+LOGS READ (last 80 lines only, as asked)
+  runtime-1795051643441847.log, stderr.log, exit.log (lo project).
+  * 73-74 s: 37 ms frames, present_ms ~30, gpu_ms 1.5, draws ~495: the GPU is
+    the limit (present waits for it), scene fixed at 1920x1080.
+  * 82 s perf: fps 28.8, gpu_ms 1.8, gpu_pct 5, gpu_batch_max_ms 38.1,
+    scene=1920x1080. A single batch takes 38 ms while the "union" says 1.8 ms
+    per frame: impossible, see cause 2.
+  * 88.9 s: "settings: replacement opened". Then every frame 160-262 ms with
+    present_ms 151-157 and the renderer at 11 ms per frame: about 6 FPS, all of
+    it on the CPU in presentation.
+  * 90.0 s "settings saved" (Graphics Save, "Display settings saved." path,
+    no display change, performance_overlay=1); 90.9 s menu closed.
+  * 93.31 s "frontbuffer scene=true" (first 3D frame back), 93.33 s "GPU fence
+    wait failed raw_vk=-4". The two batches still on the GPU are the first two
+    3D batches after the menu (387 and 478 draws, 45 and 73 occlusion
+    queries, 2.0-2.3 MiB uploads); the 14 menu batches before them completed.
+    stderr: "MESA: native: completion join failed: status 7, blocking 1,
+    producer 158, baseline 19267732, target 19267735", then "submission
+    failed; the primary arena is poisoned" and the exit to hbmenu.
+CAUSES
+  1. 6 FPS in Settings (gpu/video.cpp DrawSettingsOverlay): every frame copied
+     the 1920x1080 menu into the upload buffer, then cleared alpha IN the
+     mapped buffer for the header rows (about 150 rows x 1920): a read of
+     uncached memory per pixel. That is the 150 ms. A second 8 MiB copy of the
+     menu (menuPresentBuffer) was made every frame and never used.
+  2. GPU busy time (gpu/gpu_busy.h): results arrive out of GPU order. The
+     present list (timed while the performance overlay is on) is read at the
+     next present, but a renderer slot only when it is reused two batches
+     later. The union counted only time after the latest end seen, so every
+     renderer batch read after a later present added nothing. gpu_ms showed
+     the present list only (1.5-2.7 ms). Dynamic resolution saw an idle GPU
+     and held 1080 rows: 28 FPS in the field, with the overlay on.
+  3. Header flicker / "two menus": PresentHostOverlay (called from the command
+     processor's waits, meant for a paused guest) presented the opaque full
+     menu whenever no game frame had carried Settings for 100 ms. At 160 ms
+     frames that was every frame, so the game's frame (retail header: time
+     played, gold) and the opaque menu without it took turns.
+  4. The GPU stop after Settings (libouncevk.a vulkan.o, disassembled):
+     status 7 comes from completion_join. The batch's completion counter DID
+     reach its target, then the native_ctx_verify callback
+     (nvkmd_nvgpu_native_batch_verify) failed. That check reads the batch's
+     record in the driver arena: magic 0xb16b00b5, the sequence word, magic
+     0xa71ecafe, 2-2045 command ranges. So the GPU finished, but the batch's
+     driver-side record had been overwritten. Something wrote over driver
+     memory: it is not a timeout or a GPU fault (a channel error is status 8).
+     NOT proven what wrote there. The only unusual activity in that window was
+     cause 3: 160 ms presentation frames, and host presents submitted from
+     inside WAIT_REG_MEM while the renderer's batch was open, every frame for
+     2 s. That path is now closed while the game presents (below).
+CHANGES
+  Settings speed (gpu/video.cpp)
+    * DrawSettingsOverlay masks each row in cached memory, compares it with a
+      cached copy of what the texture holds, and writes and copies only the
+      rows that changed (one band, buffer offset 512-aligned). The upload
+      buffer is never read. An idle menu now uploads only the cursor's rows.
+    * No menuPresentBuffer copy when Settings is drawn over the game.
+  Host presents (gpu/video.cpp PresentHostOverlay)
+    * With Settings open (and no debug overlay), it presents only when the
+      game has not presented for 1 s (g_guestFrames unchanged), on the title
+      too. The game's own presents carry the menu otherwise. Removes the
+      header flicker, the double menu, and mid-batch submissions.
+  GPU busy time (gpu/gpu_busy.h)
+    * BusyUnion keeps up to 256 merged, sorted intervals from the last 2 s and
+      adds only the part of a new interval none of them covers, in any order.
+      Spans over 1 s are ignored (a torn result would cover every later batch).
+      Expect gpu_ms to match the ring's per-batch GPU times, and gpu_pct
+      roughly 60-100 when GPU-bound.
+  Dynamic resolution (gpu/dynamic_resolution.h)
+    * Jump down and step up assume 35% of the GPU time does not follow the
+      pixel count (FixedShare). The old pixel-only model jumped far below the
+      height that fits (the "drops low" report). Example from the test: 8 ms
+      fixed + 12 ms of pixels at 1080 now settles at 720 rows (13.3 ms).
+  Voice language (settings/config.*, language_hooks.cpp, menu.cpp)
+    * New settings.ini key voice_language (a voice language id from the game's
+      list: 1 English, 2 Japanese, 3 German, 4 French, 6 Italian on this
+      disc; 0 = the save's own choice).
+    * Audio -> Voice language is shown on the title too. Left/Right saves the
+      host choice at once (and in a game the retail row follows it); help:
+      "Spoken language, separate from the game language and kept for every
+      save. Applies from the next scene."
+    * Hook sub_82481E78 (the game's voice-data select, called by the config
+      apply 82870E38 with the save's id) passes the chosen id instead when the
+      game lists it. Logged once: "language: voices in language N (Settings),
+      the save asked for M". Text language (System -> Game language) is
+      untouched.
+NOT DONE / ANSWERS
+  * Text and UI softness: the game draws its HUD and menus into the scene
+    targets, so they are scaled with the scene. At native height (1080
+    handheld) there is no scale; below it they go through the FSR/bilinear
+    scale. The 2D art is Xbox 360 720p art, so some softness at 1080 is the
+    asset. Drawing the UI at output resolution separately would be a large
+    renderer change; not attempted.
+  * Battle slowdown / native resolution at 60: the turn-36 model (13 ms fixed
+    + 8.4 ms per million pixels in battle, handheld 561 MHz) leaves no room for
+    1080 rows at 60 FPS in battle. With busy time now correct, dynamic
+    resolution will hold the highest height that fits. Next lever is the fixed
+    13 ms, which needs LO_GPU_PASS_TIMING=1 numbers from hardware.
+  * The verify failure has no fix aimed at the overwrite itself. If it
+    happens again without Settings open, the writer is elsewhere.
+TESTS
+  gpu_busy_test (out of order, the Switch 2 present-then-batch pattern,
+  bounded list, torn spans) ok. dynamic_resolution_test (new fixed-cost case)
+  ok with and without -D__SWITCH2__. settings_menu ctest 11/11 (/tmp/lotests,
+  clean env) ok. menu_flow_test.cpp (WIN32 only) updated for the visible
+  title Voice row but not run here. Switch 2 build ok.
+NEXT (user)
+  1. Copy the NRO. Open Settings in a game: it should run at the game's frame
+     rate, with the retail header steady and one menu.
+  2. Change a Graphics setting and Save, then return to the field. If the GPU
+     stops again, send the last ~80 lines of the runtime log and stderr.log.
+     Note which settings you changed (the log does not list them).
+  3. Field with the performance overlay on: perf lines should show gpu_ms
+     close to the frame time when below 60, and "scene at N rows" lines from
+     dynamic resolution.
+  4. Title -> Y -> Audio -> Voice language -> Japanese, load a save: the
+     cutscene voices should be Japanese with English text.

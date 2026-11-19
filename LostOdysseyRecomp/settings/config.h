@@ -281,6 +281,10 @@ struct Config
     uint32_t audioOutput = AudioOutputStereo; // Applied live; saved by SaveAudioOutput.
     uint32_t audioMatrixRear = 110; // Matrix surround rear angle, 90-150 degrees in 10 degree steps. Applied live.
     uint32_t voiceVolume = 100; // Cutscene dialogue, 0-100, in place of the Sound effects volume. Applied live.
+    // Spoken language, independent of the game (text) language: a voice language id of the game's list (1 English,
+    // 2 Japanese, ...), 0 the save's own Voice language. Audio -> Voice language sets it, from the title too; the
+    // game takes it wherever it applies its voice setting (settings/language_hooks.cpp), from the next scene.
+    uint32_t voiceLanguage = 0;
     bool skipShaderPrebuild = false;
     // Achievement-unlocked toast and its chime (ui/achievement_overlay.cpp). Applied live.
     bool achievementNotifications = true;

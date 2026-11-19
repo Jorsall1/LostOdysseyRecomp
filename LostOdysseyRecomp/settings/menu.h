@@ -279,7 +279,7 @@ bool ConsumeTitleShortcut(bool titleMenuIdle);
 bool UpdateTitleQuit(uint8_t* base, bool titleMenuIdle);
 // The retail Settings task was just opened from the title menu. Until that task
 // is idle again, the per-save options are hidden (Gameplay's retail rows,
-// Restore game defaults and Quit to Main Menu; Audio's Voice language, Music and
-// Sound effects) and the brightness page cannot open the retail calibration screen.
+// Restore game defaults and Quit to Main Menu; Audio's Music and Sound effects;
+// Voice language stays, as the host's own voice_language) and the brightness page cannot open the retail calibration screen.
 void MarkTitleEntry();
 } // namespace settings

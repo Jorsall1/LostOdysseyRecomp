@@ -3,6 +3,8 @@
 #include <atomic>
 #include <cstdint>
 #include <mutex>
+#include <utility>
+#include <vector>
 
 // GPU busy time for the Detailed performance overlay (ui/performance_overlay.cpp).
 // While the overlay asks for it, timestamp queries bracket each renderer queue
@@ -16,19 +18,54 @@ namespace gpu::gpu_busy
 // summing end - begin counted the overlap twice (Switch 2, 2026-11-18:
 // gpu_pct 158 in a GPU-bound battle, and dynamic resolution saw 1.5x the
 // real cost). Only the part of a batch after the latest end seen so far adds.
+//
+// Results do not arrive in GPU order: the presentation list is read right after
+// its own fence, a renderer slot only when that slot is reused, frames later.
+// Counting only past the latest end seen dropped every renderer batch that was
+// read after a later present (Switch 2, 2026-11-18: gpu_ms 1.5-2.7 while single
+// batches took 11-41 ms, so dynamic resolution saw an idle GPU and held 1080
+// rows at 28 FPS). The union keeps the recent intervals instead, merged and
+// sorted, and adds only the part of a new one no recorded interval covers.
 struct BusyUnion
 {
-    uint64_t lastEnd = 0;
+    // Intervals ending more than this before the newest end are forgotten; a
+    // result read later than that counts in full.
+    static constexpr uint64_t kWindowNs = 2'000'000'000;
+    static constexpr size_t kMaxIntervals = 256;
+    static constexpr uint64_t kMaxSpanNs = 1'000'000'000;
+    std::vector<std::pair<uint64_t, uint64_t>> intervals; // disjoint, sorted by begin
+    uint64_t newestEnd = 0;
     uint64_t total = 0;
     // Returns the time added. Unwritten (0) or reversed results add nothing.
     uint64_t Add(uint64_t begin, uint64_t end)
     {
         if (!begin || end <= begin) return 0;
-        const uint64_t from = std::max(begin, lastEnd);
-        lastEnd = std::max(lastEnd, end);
-        if (end <= from) return 0;
-        total += end - from;
-        return end - from;
+        // No batch runs for a second (the GPU would be reset first): a span that
+        // long is a stale or torn result, and kept it would cover every later batch.
+        if (end - begin > kMaxSpanNs) return 0;
+        uint64_t covered = 0, mergedBegin = begin, mergedEnd = end;
+        auto first = std::lower_bound(intervals.begin(), intervals.end(), begin,
+            [](const auto& interval, uint64_t value) { return interval.second < value; });
+        auto last = first;
+        for (; last != intervals.end() && last->first <= end; ++last) {
+            covered += std::min(end, last->second) - std::max(begin, last->first);
+            mergedBegin = std::min(mergedBegin, last->first);
+            mergedEnd = std::max(mergedEnd, last->second);
+        }
+        first = intervals.erase(first, last);
+        intervals.insert(first, {mergedBegin, mergedEnd});
+        newestEnd = std::max(newestEnd, end);
+        if (newestEnd > kWindowNs) {
+            const uint64_t horizon = newestEnd - kWindowNs;
+            auto keep = intervals.begin();
+            while (keep != intervals.end() && keep->second < horizon) ++keep;
+            intervals.erase(intervals.begin(), keep);
+        }
+        if (intervals.size() > kMaxIntervals)
+            intervals.erase(intervals.begin(), intervals.begin() + (intervals.size() - kMaxIntervals));
+        const uint64_t added = (end - begin) - std::min(covered, end - begin);
+        total += added;
+        return added;
     }
 };
 

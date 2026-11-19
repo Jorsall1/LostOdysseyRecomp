@@ -123,6 +123,7 @@ Config Validate(Config value)
     value.vibrationPercent = std::min(value.vibrationPercent, 100u);
     value.audioMatrixRear = std::clamp((value.audioMatrixRear + 5) / 10 * 10, 90u, 150u);
     value.voiceVolume = std::min(value.voiceVolume, 100u);
+    if (value.voiceLanguage > 9) value.voiceLanguage = 0;
     if (value.buttonPrompts > 5) value.buttonPrompts = 0;
     if (value.performanceOverlay > 2) value.performanceOverlay = 0;
     value.controllerMap = hid::input_map::ValidController(value.controllerMap);
@@ -520,6 +521,8 @@ Config Read()
             value.audioMatrixRear = number;
         else if (key == "voice_volume")
             value.voiceVolume = number;
+        else if (key == "voice_language")
+            value.voiceLanguage = number;
         else if (key == "automatic_updates")
         {
             // Unknown values keep the safe package default (enabled).
@@ -724,6 +727,7 @@ static bool WriteConfig(const Config &value)
            << "\naudio_output=" << value.audioOutput
            << "\naudio_matrix_rear=" << value.audioMatrixRear
            << "\nvoice_volume=" << value.voiceVolume
+           << "\nvoice_language=" << value.voiceLanguage
            << "\nskip_shader_prebuild=" << (value.skipShaderPrebuild ? 1 : 0)
            << "\nachievement_notifications=" << (value.achievementNotifications ? 1 : 0)
            << "\nachievement_sound=" << (value.achievementSound ? 1 : 0)

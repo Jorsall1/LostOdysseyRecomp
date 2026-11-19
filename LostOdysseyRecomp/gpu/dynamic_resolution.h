@@ -67,6 +67,8 @@ namespace gpu::dynamic_resolution
         // 2026-11-18: 576 -> 612 rows on the loading screen at 0.3 ms before mv_01v, a rebuild of every scene target
         // there and again when the battle started). It never steps up.
         static constexpr double MeaningfulMs = 3.0;
+        // The share of a frame's GPU time taken as independent of the scene height when sizing a jump or a step up.
+        static constexpr double FixedShare = 0.35;
 
         uint32_t base = 0, minimum = 0, height = 0, step = Rung;
         uint64_t windowStart = 0, windowBusy = 0, lastChange = 0;
@@ -109,7 +111,10 @@ namespace gpu::dynamic_resolution
                     // square of the height), at least one rung. Each change rebuilds the scene targets, so one
                     // jump costs one rebuild where rung by rung cost one a second (Switch 2's first battle,
                     // 2026-11-18: nine rebuilds from 1080 to 432 rows, each a hitch).
-                    const double fit = double(height) * std::sqrt(budgetMs * UpBelow / busyMs);
+                    // Part of the cost does not follow the pixels (shadow maps, fixed-size targets, per-draw work:
+                    // ~13 of 31 ms in a 1080-row battle, turn 36), so the pixels are scaled by what is left.
+                    const double share = (budgetMs * UpBelow / busyMs - FixedShare) / (1.0 - FixedShare);
+                    const double fit = share > 0 ? double(height) * std::sqrt(share) : 0;
                     const uint32_t target = fit > 0 ? uint32_t(fit) / step * step : 0;
                     const uint32_t steps = std::max(1u, target < height ? (height - target + step - 1) / step : 1u);
                     height = height - std::min(steps * step, height - minimum);
@@ -122,7 +127,7 @@ namespace gpu::dynamic_resolution
                 upStrikes = 0;
             } else if (height < base) {
                 const double up = double(height + step) / height;
-                if (busyMs * up * up < budgetMs * UpBelow) {
+                if (busyMs * (FixedShare + (1.0 - FixedShare) * up * up) < budgetMs * UpBelow) {
                     if (++upStrikes >= 6 && nowNs - lastChange >= UpHoldNs) {
                         height += step;
                         Changed(nowNs, changed);

@@ -28,17 +28,45 @@ int main()
         CHECK(u.total == 300);
     }
     {
-        BusyUnion u; // out of order: an earlier batch after a later one never goes negative
+        BusyUnion u; // out of order: a renderer batch read after a later present still counts
         u.Add(500, 600);
-        CHECK(u.Add(100, 200) == 0);
-        CHECK(u.total == 100);
+        CHECK(u.Add(100, 200) == 100);
+        CHECK(u.total == 200);
+        CHECK(u.Add(150, 550) == 300); // fills the gap [200,500) only
+        CHECK(u.total == 500);
+        CHECK(u.Add(120, 580) == 0);
+        CHECK(u.intervals.size() == 1);
+    }
+    {
+        BusyUnion u; // the Switch 2 pattern: present lists first, the 11 ms batches two frames later
+        uint64_t t = 1'000'000'000;
+        for (int frame = 0; frame < 10; ++frame) {
+            const uint64_t start = t + uint64_t(frame) * 16'000'000;
+            u.Add(start + 12'000'000, start + 13'000'000);          // present list
+            if (frame >= 2) {
+                const uint64_t earlier = t + uint64_t(frame - 2) * 16'000'000;
+                u.Add(earlier, earlier + 11'000'000);               // renderer batch
+            }
+        }
+        CHECK(u.total == 10ull * 1'000'000 + 8ull * 11'000'000);
+    }
+    {
+        BusyUnion u; // old intervals are forgotten, the list stays bounded
+        for (uint64_t i = 1; i <= 2000; ++i) u.Add(i * 10'000'000, i * 10'000'000 + 1'000'000);
+        CHECK(u.total == 2000ull * 1'000'000);
+        CHECK(u.intervals.size() <= BusyUnion::kMaxIntervals);
     }
     {
         BusyUnion u; // invalid results
         CHECK(u.Add(0, 100) == 0);
         CHECK(u.Add(200, 200) == 0);
         CHECK(u.Add(300, 250) == 0);
-        CHECK(u.total == 0 && u.lastEnd == 0);
+        CHECK(u.total == 0 && u.intervals.empty());
+    }
+    {
+        BusyUnion u; // a torn result spanning seconds is ignored and does not swallow later batches
+        CHECK(u.Add(1'000, 5'000'000'000) == 0);
+        CHECK(u.Add(2'000'000, 3'000'000) == 1'000'000);
     }
     {
         // The global path: total and longest batch.

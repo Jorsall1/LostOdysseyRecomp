@@ -3629,13 +3629,15 @@ int main(int argc, char** argv)
                            contrast = PPC_LOAD_U32(ConfigData + 20);
             const uint32_t voiceVolume = settings::edit.voiceVolume;
             settings::pending = 0x200; Tick(base);
-            Require(settings::tab == 1 && settings::row == settings::AudioVoiceVolumeRow, "Audio opens on Voice volume");
+            Require(settings::tab == 1 && settings::row == settings::AudioVoiceRow, "Audio opens on Voice language");
             for (int r = 0; r < settings::AudioRowCount; ++r)
-                Require(settings::snapshot.rows[size_t(r)].hidden == (r < settings::AudioVoiceVolumeRow),
-                        "title mode hides Voice language, Music and Sound effects");
+                Require(settings::snapshot.rows[size_t(r)].hidden ==
+                            (r == settings::AudioMusicRow || r == settings::AudioEffectsRow),
+                        "title mode hides Music and Sound effects; Voice language is settings.ini's");
+            settings::row = settings::AudioVoiceVolumeRow;
             settings::pending = 1; Tick(base);
-            Require(settings::row == settings::AudioRearAngleRow, "Up from Voice volume wraps past the hidden rows");
-            for (int r : {settings::AudioVoiceRow, settings::AudioMusicRow, settings::AudioEffectsRow})
+            Require(settings::row == settings::AudioVoiceRow, "Up from Voice volume skips the hidden rows");
+            for (int r : {settings::AudioMusicRow, settings::AudioEffectsRow})
                 for (uint16_t press : {uint16_t(4), uint16_t(8)})
                 {
                     settings::row = r;

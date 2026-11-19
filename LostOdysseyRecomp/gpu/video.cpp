@@ -800,6 +800,10 @@ namespace gpu::video
             std::unique_ptr<plume::RenderTexture> texture;
             std::unique_ptr<plume::RenderBuffer> upload;
             uint32_t width = 0, height = 0;
+            // What the texture holds (masked), in cached memory: rows equal to
+            // it are not written or copied again.
+            std::vector<uint32_t> shown;
+            std::vector<uint32_t> row;
         } g_settingsOverlay;
         std::atomic<int64_t> g_settingsOverGameNs{0};
         // The achievement-unlocked toast (DrawAchievementToast).
@@ -4894,28 +4898,37 @@ namespace gpu::video
 #ifdef LO_GPU_PLUME
         if (!g_presentation || !width || !height || pixels.size() != size_t(width) * height) return;
         // The menu's motion (open cascade, tab fades, the swaying cursor)
-        // changes the pixels between revisions, so every frame is uploaded,
-        // as the replacing path does; texture and buffer are kept per size.
+        // changes some rows between revisions. Only rows that differ from what
+        // the texture holds are written and copied. The mask is applied in
+        // cached memory: the upload buffer is never read (on Switch 2 it is
+        // uncached, and the old in-place mask read 150 rows of it per frame:
+        // 155 ms presents, ~6 FPS in Settings, 2026-11-18).
         (void)revision;
         {
+            auto& r = g_settingsOverlay;
             const uint32_t rowPitch = (width * 4 + 255) & ~255u;
-            if (!g_settingsOverlay.texture || g_settingsOverlay.width != width || g_settingsOverlay.height != height) {
-                g_settingsOverlay.texture = g_device->createTexture(plume::RenderTextureDesc::Texture2D(width, height, 1,
+            if (!r.texture || r.width != width || r.height != height) {
+                r.texture = g_device->createTexture(plume::RenderTextureDesc::Texture2D(width, height, 1,
                     plume::RenderFormat::R8G8B8A8_UNORM));
-                g_settingsOverlay.upload = g_device->createBuffer(plume::RenderBufferDesc::UploadBuffer(uint64_t(rowPitch) * height));
-                g_settingsOverlay.width = width;
-                g_settingsOverlay.height = height;
+                r.upload = g_device->createBuffer(plume::RenderBufferDesc::UploadBuffer(uint64_t(rowPitch) * height));
+                r.width = width;
+                r.height = height;
+                r.shown.clear();
             }
-            auto* mapped = g_settingsOverlay.upload ? static_cast<uint8_t*>(g_settingsOverlay.upload->map()) : nullptr;
-            if (!g_settingsOverlay.texture || !mapped) { g_settingsOverlay = {}; return; }
+            if (!r.texture || !r.upload) { r = {}; return; }
+            const bool fresh = r.shown.size() != size_t(width) * height;
+            if (fresh) r.shown.assign(size_t(width) * height, 0);
+            r.row.resize(width);
             const double scale = std::min(width / 1280.0, height / 720.0);
             const double offsetX = (width - 1280 * scale) * 0.5, offsetY = (height - 720 * scale) * 0.5;
             const uint32_t header = uint32_t(std::clamp(std::lround(offsetY + settings::MenuGameHeaderBottom * scale), 0l, long(height)));
             const uint32_t left = uint32_t(std::clamp(std::lround(offsetX), 0l, long(width)));
             const uint32_t right = uint32_t(std::clamp(std::lround(offsetX + 1280 * scale), 0l, long(width)));
             const uint32_t bottom = uint32_t(std::clamp(std::lround(offsetY + 720 * scale), 0l, long(height)));
+            uint8_t* mapped = nullptr;
+            uint32_t first = height, last = 0;
             for (uint32_t y = 0; y < height; ++y) {
-                auto* row = reinterpret_cast<uint32_t*>(mapped + size_t(y) * rowPitch);
+                uint32_t* row = r.row.data();
                 memcpy(row, &pixels[size_t(y) * width], size_t(width) * 4);
                 if (y < header || y >= bottom)
                     for (uint32_t x = 0; x < width; ++x) row[x] &= 0x00FFFFFFu;
@@ -4923,13 +4936,25 @@ namespace gpu::video
                     for (uint32_t x = 0; x < left; ++x) row[x] &= 0x00FFFFFFu;
                     for (uint32_t x = right; x < width; ++x) row[x] &= 0x00FFFFFFu;
                 }
+                uint32_t* shown = &r.shown[size_t(y) * width];
+                if (!fresh && memcmp(shown, row, size_t(width) * 4) == 0) continue;
+                if (!mapped && !(mapped = static_cast<uint8_t*>(r.upload->map()))) { r = {}; return; }
+                memcpy(shown, row, size_t(width) * 4);
+                memcpy(mapped + size_t(y) * rowPitch, row, size_t(width) * 4);
+                first = std::min(first, y);
+                last = y;
             }
-            g_settingsOverlay.upload->unmap();
-            g_commandList->barriers(plume::RenderBarrierStage::COPY,
-                plume::RenderTextureBarrier(g_settingsOverlay.texture.get(), plume::RenderTextureLayout::COPY_DEST));
-            g_commandList->copyTextureRegion(plume::RenderTextureCopyLocation::Subresource(g_settingsOverlay.texture.get()),
-                plume::RenderTextureCopyLocation::PlacedFootprint(g_settingsOverlay.upload.get(), plume::RenderFormat::R8G8B8A8_UNORM,
-                    width, height, 1, rowPitch / 4), 0, 0, 0, nullptr);
+            if (mapped) {
+                r.upload->unmap();
+                // An even first row keeps the buffer offset 512-byte aligned (D3D12).
+                first &= ~1u;
+                const uint32_t rows = last + 1 - first;
+                g_commandList->barriers(plume::RenderBarrierStage::COPY,
+                    plume::RenderTextureBarrier(r.texture.get(), plume::RenderTextureLayout::COPY_DEST));
+                g_commandList->copyTextureRegion(plume::RenderTextureCopyLocation::Subresource(r.texture.get()),
+                    plume::RenderTextureCopyLocation::PlacedFootprint(r.upload.get(), plume::RenderFormat::R8G8B8A8_UNORM,
+                        width, rows, 1, rowPitch / 4, uint64_t(first) * rowPitch), 0, first, 0, nullptr);
+            }
         }
         g_presentation->DrawOverlay(g_commandList.get(), g_settingsOverlay.texture.get(), backBuffer, 0, 0,
             width, height, g_swapChain->getWidth(), g_swapChain->getHeight(), 1.0f);
@@ -5580,7 +5605,9 @@ namespace gpu::video
             }
             host_ui::CompositeScaled(s_debugOverlayBuf, menuWidth, menuHeight, menuPresentBuffer);
         }
-        else if (hasSettings) {
+        else if (hasSettings && !settingsOverGame) {
+            // Over the game DrawSettingsOverlay reads g_menuPixels itself; the
+            // CPU fallback below copies it when it needs to.
             menuPresentBuffer = g_menuPixels;
         }
         // Fast path: the frontbuffer was resolved on the GPU, copy it straight
@@ -5986,10 +6013,25 @@ namespace gpu::video
             return;
         // While game frames carry Settings over the live picture, an opaque
         // menu presented between them would flicker over the retail header.
-        if (settings::MenuOverGame() && !debug_menu::IsOverlayVisible()) {
-            const int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now().time_since_epoch()).count();
-            if (now - g_settingsOverGameNs.load(std::memory_order_relaxed) < 100'000'000)
+        // The game's own presents carry Settings too (over the game, or in place
+        // of the title frame), so this path is for a paused guest only. Called
+        // from the command processor's waits, it also submitted in the middle
+        // of the renderer's batches.
+        if (settings::IsOpen() && !debug_menu::IsOverlayVisible()) {
+            // Only when the game has stopped presenting for a second. A 100 ms
+            // gap after the last Settings frame was too short: slow game frames
+            // alternated with this opaque menu, so the retail header (time
+            // played, gold) flickered and the menu seemed to open twice
+            // (Switch 2, 2026-11-18).
+            static uint64_t s_guestFrames = ~uint64_t{};
+            static auto s_guestFrameSeen = std::chrono::steady_clock::time_point{};
+            const auto now = std::chrono::steady_clock::now();
+            const uint64_t guestFrames = g_guestFrames.load(std::memory_order_relaxed);
+            if (guestFrames != s_guestFrames) {
+                s_guestFrames = guestFrames;
+                s_guestFrameSeen = now;
+            }
+            if (now - s_guestFrameSeen < std::chrono::seconds(1))
                 return;
         }
         uint64_t displayTicket = 0;

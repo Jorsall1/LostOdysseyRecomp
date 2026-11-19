@@ -66,7 +66,8 @@ bool TitleModeHidden(int tab, int r)
 {
     if (!titleEntry.load()) return false;
     if (tab == 0) return r < GameRetailRowCount || r == GameRestoreRow || r == GameMainMenuRow;
-    return tab == 1 && (r == AudioVoiceRow || r == AudioMusicRow || r == AudioEffectsRow);
+    // Voice language stays: it is the host's own setting (settings.ini voice_language), which no save replaces.
+    return tab == 1 && (r == AudioMusicRow || r == AudioEffectsRow);
 }
 #if defined(__SWITCH2__)
 // The last action of the Gameplay tab on Switch 2: leaves through the cooperative
@@ -1005,6 +1006,20 @@ uint32_t VoiceLanguage(uint8_t *base, uint32_t index)
 {
     return index < VoiceCount(base) ? PPC_LOAD_U16(language::Registry + 288 + index * 2) : 0;
 }
+// The list index of a voice language id, or VoiceCount when it is not listed.
+uint32_t VoiceIndexOf(uint8_t *base, uint32_t id)
+{
+    const uint32_t count = VoiceCount(base);
+    for (uint32_t i = 0; i < count; ++i)
+        if (VoiceLanguage(base, i) == id) return i;
+    return count;
+}
+// The Voice language row's index: the Settings choice when it is listed, else the save's.
+uint32_t VoiceRowIndex(uint8_t *base, uint32_t config)
+{
+    const uint32_t chosen = VoiceIndexOf(base, GetConfig().voiceLanguage);
+    return chosen < VoiceCount(base) ? chosen : PPC_LOAD_U32(config + 24);
+}
 const wchar_t *VoiceName(uint8_t *base, uint32_t index)
 {
     constexpr const wchar_t *names[] = {L"English", L"English", L"日本語", L"Deutsch", L"Français",
@@ -1663,7 +1678,7 @@ void Publish(uint8_t *base, uint32_t config)
         std::vector<std::wstring> voices;
         for (uint32_t i = 0; i < VoiceCount(base); ++i)
             voices.emplace_back(VoiceName(base, i));
-        const auto index = PPC_LOAD_U32(config + 24);
+        const auto index = VoiceRowIndex(base, config);
         const bool valid = index < voices.size();
         addChoices(L"Voice language", L"語音語言", std::move(voices), index, valid);
         if (!valid)
@@ -2053,6 +2068,9 @@ void Publish(uint8_t *base, uint32_t config)
     if (tab == 3 && row == SystemShaderPreparationRow)
         next.help = Tr(L"Prepares shaders before play at the next start. Reuses the bundle and cache.",
                        L"下次啟動時在遊玩前準備著色器，並重用著色器包與快取。");
+    if (tab == 1 && row == AudioVoiceRow && status.empty())
+        next.help = Tr(L"Spoken language, separate from the game language and kept for every save. Applies from the next scene.",
+                       L"語音語言，與遊戲語言分開，所有存檔通用。從下一個場景起套用。");
     if (tab == 1 && row == AudioVoiceVolumeRow && status.empty())
         next.help = Tr(L"Cutscene dialogue volume. Voices in battle follow Sound effects. Applies from the next scene.",
                        L"過場動畫中的對白音量。戰鬥中的語音跟隨音效音量。從下一個場景起套用。");
@@ -4063,12 +4081,21 @@ PPC_FUNC(sub_822F19B0)
         {
             if (row == AudioVoiceRow)
             {
-                if (PPC_LOAD_U32(config + 24) >= VoiceCount(base))
+                const uint32_t current = VoiceRowIndex(base, config);
+                if (current >= VoiceCount(base))
                 {
                     Publish(base, config);
                     return;
                 }
-                PPC_STORE_U32(config + 24, cycle(PPC_LOAD_U32(config + 24), VoiceCount(base)));
+                // Saved as the host's voice language at once (independent of the
+                // game language and of the save); in a game the retail row
+                // follows, and the close applies it like a retail change.
+                const uint32_t next = cycle(current, VoiceCount(base));
+                Config saved = GetConfig();
+                saved.voiceLanguage = VoiceLanguage(base, next);
+                edit.voiceLanguage = saved.voiceLanguage;
+                if (!SaveConfig(saved)) status = Tr(L"Could not save settings.", L"無法儲存設定。");
+                if (!titleEntry.load()) PPC_STORE_U32(config + 24, next);
             }
             else
             {

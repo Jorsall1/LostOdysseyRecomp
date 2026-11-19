@@ -53,6 +53,16 @@ int main()
         CHECK(h < 1080 && h > 576 && h % 36 == 0);
         CHECK(mid(h) < 1000.0 / 60);
     }
+    {
+        // Turn 36's measured model: 8 ms fixed + the rest by pixels, 20 ms at 1080 rows. The jump lands
+        // where the frame fits, not far below it (pixel-only scaling went much lower).
+        const auto field = [](uint32_t h) { return 8.0 + 12.0 * double(h) * h / (1080.0 * 1080.0); };
+        dr::Controller c;
+        uint64_t now = 1'000'000'000ull, busy = 1;
+        const uint32_t h = Run(c, now, busy, 12, 1080, 576, field);
+        CHECK(h >= 720 && h < 1080 && h % 36 == 0);
+        CHECK(field(h) < 1000.0 / 60);
+    }
 #ifdef __SWITCH2__
     {
         // Docked: 1440 base, floor 1152 even when the GPU cannot make it.
