@@ -414,7 +414,7 @@ index 0000000..e9914b8
 +    }
 +};
 diff --git a/plume_vulkan.cpp b/plume_vulkan.cpp
-index 3f15073..ad144a7 100644
+index 3f15073..82759b1 100644
 --- a/plume_vulkan.cpp
 +++ b/plume_vulkan.cpp
 @@ -9,6 +9,11 @@
@@ -429,30 +429,7 @@ index 3f15073..ad144a7 100644
  #include <cstdlib>
  #include <cstring>
  #include "plume_log.h"
-@@ -55,6 +60,22 @@ extern "C" {
- // - Fix resource pools.
- 
- namespace plume {
-+    std::mutex &NativeSerializeMutex() {
-+        static std::mutex mutex;
-+        return mutex;
-+    }
-+    bool NativeSerializeEnabled() {
-+#if defined(__SWITCH2__)
-+        static const bool enabled = [] {
-+            const char *value = std::getenv("LO_SERIALIZE_GPU");
-+            return !(value && value[0] == '0');
-+        }();
-+        return enabled;
-+#else
-+        return false;
-+#endif
-+    }
-+
-     // Backend constants.
- 
-     // Required buffer alignment for acceleration structures.
-@@ -194,6 +215,8 @@ namespace plume {
+@@ -194,6 +199,8 @@ namespace plume {
              return VK_FORMAT_A2B10G10R10_UNORM_PACK32;
          case RenderFormat::B10G10R10A2_UNORM:
              return VK_FORMAT_A2R10G10B10_UNORM_PACK32;
@@ -461,7 +438,7 @@ index 3f15073..ad144a7 100644
          case RenderFormat::R16G16B16A16_FLOAT:
              return VK_FORMAT_R16G16B16A16_SFLOAT;
          case RenderFormat::R16G16B16A16_UNORM:
-@@ -1401,6 +1424,78 @@ namespace plume {
+@@ -1401,6 +1408,78 @@ namespace plume {
  
      // VulkanShader
  
@@ -540,7 +517,7 @@ index 3f15073..ad144a7 100644
      VulkanShader::VulkanShader(VulkanDevice *device, const void *data, uint64_t size, const char *entryPointName, RenderShaderFormat format) {
          assert(device != nullptr);
          assert(data != nullptr);
-@@ -1421,14 +1516,25 @@ namespace plume {
+@@ -1421,14 +1500,25 @@ namespace plume {
              PLUME_LOG_ERROR("Vulkan", "vkCreateShaderModule", LogErrorDomain::VkResult, res, "");
              return;
          }
@@ -566,20 +543,7 @@ index 3f15073..ad144a7 100644
      void VulkanShader::setName(const std::string &name) {
          setObjectName(device->vk, VK_OBJECT_TYPE_SHADER_MODULE, uint64_t(vk), name);
      }
-@@ -1509,7 +1615,11 @@ namespace plume {
-         pipelineInfo.layout = pipelineLayout->vk;
-         pipelineInfo.stage = stageInfo;
- 
--        VkResult res = vkCreateComputePipelines(device->vk, device->pipelineCache, 1, &pipelineInfo, nullptr, &vk);
-+        VkResult res;
-+        {
-+            const NativeSerializeLock serialize;
-+            res = vkCreateComputePipelines(device->vk, device->pipelineCache, 1, &pipelineInfo, nullptr, &vk);
-+        }
-         if (res != VK_SUCCESS) {
-             PLUME_LOG_ERROR("Vulkan", "vkCreateComputePipelines", LogErrorDomain::VkResult, res,
-                 "entry=%s groups=%u,%u,%u flags=0x%X", stageInfo.pName, unsigned(desc.threadGroupSizeX),
-@@ -1554,7 +1664,7 @@ namespace plume {
+@@ -1554,7 +1644,7 @@ namespace plume {
              VkPipelineShaderStageCreateInfo stageInfo = {};
              stageInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
              stageInfo.stage = VK_SHADER_STAGE_VERTEX_BIT;
@@ -588,33 +552,7 @@ index 3f15073..ad144a7 100644
              stageInfo.pName = vertexShader->entryPointName.c_str();
              stageInfo.pSpecializationInfo = pSpecInfo;
              stages.emplace_back(stageInfo);
-@@ -1778,7 +1888,11 @@ namespace plume {
-         pipelineInfo.layout = pipelineLayout->vk;
-         pipelineInfo.renderPass = renderPass;
- 
--        VkResult res = vkCreateGraphicsPipelines(device->vk, device->pipelineCache, 1, &pipelineInfo, nullptr, &vk);
-+        VkResult res;
-+        {
-+            const NativeSerializeLock serialize;
-+            res = vkCreateGraphicsPipelines(device->vk, device->pipelineCache, 1, &pipelineInfo, nullptr, &vk);
-+        }
-         if (res != VK_SUCCESS) {
-             PLUME_LOG_ERROR("Vulkan", "vkCreateGraphicsPipelines", LogErrorDomain::VkResult, res,
-                 "stages=%u render_targets=%u samples=%u flags=0x%X", unsigned(pipelineInfo.stageCount),
-@@ -1995,7 +2109,11 @@ namespace plume {
-         info.flags |= VK_PIPELINE_CREATE_LIBRARY_BIT_KHR;
- 
-         VkPipeline part = VK_NULL_HANDLE;
--        VkResult res = vkCreateGraphicsPipelines(device->vk, device->pipelineCache, 1, &info, nullptr, &part);
-+        VkResult res;
-+        {
-+            const NativeSerializeLock serialize;
-+            res = vkCreateGraphicsPipelines(device->vk, device->pipelineCache, 1, &info, nullptr, &part);
-+        }
-         if (res != VK_SUCCESS) {
-             PLUME_LOG_ERROR("Vulkan", "vkCreateGraphicsPipelines", LogErrorDomain::VkResult, res, "library=0x%X", unsigned(flags));
-             return VK_NULL_HANDLE;
-@@ -2080,7 +2198,7 @@ namespace plume {
+@@ -2080,7 +2170,7 @@ namespace plume {
          });
  
          // Pre-rasterization: depth bias enable is static (it needs extended dynamic state 2).
@@ -623,7 +561,7 @@ index 3f15073..ad144a7 100644
          const VkShaderModule geometryModule = (desc.geometryShader != nullptr) ? static_cast<const VulkanShader *>(desc.geometryShader)->vk : VK_NULL_HANDLE;
          const VkBool32 depthClamp = !desc.depthClipEnabled;
          const VkBool32 depthBias = (desc.depthBias != 0) || (desc.depthBiasClamp != 0.0f) || (desc.slopeScaledDepthBias != 0.0f);
-@@ -2097,6 +2215,7 @@ namespace plume {
+@@ -2097,6 +2187,7 @@ namespace plume {
              VkPipelineShaderStageCreateInfo stages[2];
              uint32_t stageCount = 0;
              stages[stageCount++] = libraryStage(desc.vertexShader, VK_SHADER_STAGE_VERTEX_BIT);
@@ -631,33 +569,7 @@ index 3f15073..ad144a7 100644
              if (desc.geometryShader != nullptr) {
                  stages[stageCount++] = libraryStage(desc.geometryShader, VK_SHADER_STAGE_GEOMETRY_BIT);
              }
-@@ -2245,7 +2364,11 @@ namespace plume {
-         // A fast link without link-time optimization. It skips the pipeline cache:
-         // the next start builds the full pipeline from the recipe instead.
-         auto pipeline = std::make_unique<VulkanGraphicsPipeline>(device);
--        VkResult res = vkCreateGraphicsPipelines(device->vk, VK_NULL_HANDLE, 1, &info, nullptr, &pipeline->vk);
-+        VkResult res;
-+        {
-+            const NativeSerializeLock serialize;
-+            res = vkCreateGraphicsPipelines(device->vk, VK_NULL_HANDLE, 1, &info, nullptr, &pipeline->vk);
-+        }
-         if (res != VK_SUCCESS) {
-             PLUME_LOG_ERROR("Vulkan", "vkCreateGraphicsPipelines", LogErrorDomain::VkResult, res, "linked from libraries");
-             pipeline->vk = VK_NULL_HANDLE;
-@@ -2858,10 +2981,12 @@ namespace plume {
-         
-         VkResult res;
-         if (commandQueue->device->externalSwapchainSynchronization) {
-+            const NativeSerializeLock serialize;
-             res = vkQueuePresentKHR(commandQueue->queue->vk, &presentInfo);
-         }
-         else {
-             const std::scoped_lock queueLock(*commandQueue->queue->mutex);
-+            const NativeSerializeLock serialize;
-             res = vkQueuePresentKHR(commandQueue->queue->vk, &presentInfo);
-         }
- 
-@@ -3286,6 +3411,11 @@ namespace plume {
+@@ -3286,6 +3377,11 @@ namespace plume {
              if (desc.colorAttachmentsCount == 0) {
                  width = uint32_t(depthAttachment->desc.width);
                  height = depthAttachment->desc.height;
@@ -669,7 +581,7 @@ index 3f15073..ad144a7 100644
              }
  
              depthReference.attachment = uint32_t(attachments.size());
-@@ -3487,6 +3617,19 @@ namespace plume {
+@@ -3487,6 +3583,19 @@ namespace plume {
          }
  
  	    VkResult res = vkGetQueryPoolResults(device->vk, vk, 0, uint32_t(results.size()), sizeof(uint64_t) * results.size(), results.data(), sizeof(uint64_t), VK_QUERY_RESULT_64_BIT);
@@ -689,15 +601,7 @@ index 3f15073..ad144a7 100644
          if (res != VK_SUCCESS) {
              PLUME_LOG_ERROR("Vulkan", "vkGetQueryPoolResults", LogErrorDomain::VkResult, res, "");
              return;
-@@ -4730,6 +4873,7 @@ namespace plume {
-         VkResult res;
-         {
-             const std::scoped_lock queueLock(*queue->mutex);
-+            const NativeSerializeLock serialize;
-             res = vkQueueSubmit(queue->vk, 1, &submitInfo, submitFence);
-         }
- 
-@@ -5069,7 +5213,8 @@ namespace plume {
+@@ -5069,7 +5178,8 @@ namespace plume {
          }
  
          VkPhysicalDeviceTimelineSemaphoreFeatures timelineFeatures = {};
@@ -708,28 +612,10 @@ index 3f15073..ad144a7 100644
          if (timelineFound) {
              timelineFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES;
 diff --git a/plume_vulkan.h b/plume_vulkan.h
-index 843ef81..95708e1 100644
+index 843ef81..b047a03 100644
 --- a/plume_vulkan.h
 +++ b/plume_vulkan.h
-@@ -46,6 +46,17 @@
- #endif
- 
- namespace plume {
-+    // Switch 2 (LO_SERIALIZE_GPU=0 turns it off): pipeline creation (which uploads shader code through the
-+    // driver's copy channel) never runs at the same time as a queue submission or present. Turn 51: every GPU stop
-+    // so far came while new GPU work started after a menu; the native driver's own message "Raced in arena grow"
-+    // shows races inside it are possible. Lock order: a queue's mutex first, then this one.
-+    std::mutex &NativeSerializeMutex();
-+    bool NativeSerializeEnabled();
-+    struct NativeSerializeLock {
-+        std::unique_lock<std::mutex> lock;
-+        NativeSerializeLock() { if (NativeSerializeEnabled()) lock = std::unique_lock<std::mutex>(NativeSerializeMutex()); }
-+    };
-+
-     struct VulkanCommandQueue;
-     struct VulkanDevice;
-     struct VulkanInterface;
-@@ -183,6 +194,14 @@ namespace plume {
+@@ -183,6 +183,14 @@ namespace plume {
          VulkanDevice *device = nullptr;
          RenderShaderFormat format = RenderShaderFormat::UNKNOWN;
  
@@ -744,7 +630,7 @@ index 843ef81..95708e1 100644
          VulkanShader(VulkanDevice *device, const void *data, uint64_t size, const char *entryPointName, RenderShaderFormat format);
          ~VulkanShader() override;
          virtual void setName(const std::string &name) override;
-@@ -591,6 +610,9 @@ namespace plume {
+@@ -591,6 +599,9 @@ namespace plume {
          // interpolation extensions and features. Other SDKs can supply aggregate
          // Vulkan feature structs that must not coexist with these individual structs.
          bool enableFrameInterpolationFeatures = false;

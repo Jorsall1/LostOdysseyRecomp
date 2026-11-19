@@ -244,8 +244,8 @@ namespace gpu::renderer
             if (!serial) continue;
             uint32_t printed = 0, total = 0;
             for (uint64_t i = first; i < ring.next; ++i) total += ring.ops[i % gpu::op_ring::kOps].batch == serial;
-            LOG_ERROR("renderer: batch {} operations ({} recorded, first 1500 shown):", serial, total);
-            for (uint64_t i = first; i < ring.next && printed < 1500; ++i) {
+            LOG_ERROR("renderer: batch {} operations ({} recorded, first 400 shown):", serial, total);
+            for (uint64_t i = first; i < ring.next && printed < 400; ++i) {
                 const auto& op = ring.ops[i % gpu::op_ring::kOps];
                 if (op.batch != serial) continue;
                 ++printed;
@@ -615,8 +615,6 @@ namespace gpu::renderer
             bool shadowMap = false;
             // Released by a render size change and kept alive until the next one (renderer stepGraveyard).
             bool graveyard = false;
-            // The guest format the render target was made for (GetRenderTarget), to make it again at a size change.
-            uint32_t guestFormat = 0;
             uint32_t ScaleX(uint32_t value) const { return resolution::ScaleX(value, resolutionSize.width); }
             uint32_t ScaleY(uint32_t value) const { return resolution::Scale(value, resolutionSize.height); }
             uint32_t depthMsaa = 0;
@@ -1234,8 +1232,6 @@ namespace gpu::renderer
             // change, so a pointer kept from before the change is the suspect: the old images stay alive (and valid
             // for the GPU) until the next change, which drains the GPU first, and Transition() reports any use.
             std::vector<std::unique_ptr<HostTexture>> stepGraveyard;
-            struct Remake { RenderTargetKey key; uint32_t guestHeight = 0, format = 0; };
-            std::vector<Remake> remake;
             void BuryTarget(std::unique_ptr<HostTexture> tex)
             {
                 if (!tex) return;
@@ -8979,7 +8975,6 @@ void main()
                         activePlan.requestedUpscaler == upscaling::Upscaler::Off &&
                         activePlan.frameGeneration == upscaling::FrameGeneration::Off;
                     size_t keptTargets = 0;
-                    remake.clear();
                     // The GPU is drained here: the previous change's released targets can go now.
                     stepGraveyard.clear();
                     if (sceneStepOnly) {
@@ -8989,8 +8984,6 @@ void main()
                         for (auto it = renderTargets.begin(); it != renderTargets.end();) {
                             const auto& size = it->second ? it->second->resolutionSize : internalSize;
                             if (!it->second || size == internalSize || size == oldAreaSize || size == oldLegacy) {
-                                if (it->second && it->second->texture)
-                                    remake.push_back({it->first, it->second->guestHeight, it->second->guestFormat});
                                 BuryTarget(std::move(it->second));
                                 it = renderTargets.erase(it);
                             } else {
@@ -9002,11 +8995,7 @@ void main()
                         if (loggedKeeps++ < 8)
                             LOG_INFO("renderer: scene size step keeps {} fixed-size targets", keptTargets);
                     } else {
-                        for (auto& [key, tex] : renderTargets) {
-                            if (tex && tex->texture && !shadowChanged && !tex->shadowMap)
-                                remake.push_back({key, tex->guestHeight, tex->guestFormat});
-                            BuryTarget(std::move(tex));
-                        }
+                        for (auto& [key, tex] : renderTargets) BuryTarget(std::move(tex));
                         renderTargets.clear();
                     }
                     ++targetEpoch;
@@ -9033,23 +9022,6 @@ void main()
                 shadowResolution = desiredShadow;
                 internalSize = effective;
                 appliedPlanEpoch = selected.geometryEpoch;
-                // Make the released targets again now, while the GPU is drained, instead of on their first draw. Every
-                // GPU stop that rebuilt the scene depth (turns 43, 45, 49, 51) made it in the middle of a busy batch,
-                // after a size change behind a menu, and faulted in that batch; the same targets made right after a
-                // drained step (dynamic resolution during 3D, dozens of times) never did. LO_REMAKE_TARGETS=0 skips.
-                static const bool remakeTargets = [] {
-                    const char* value = getenv("LO_REMAKE_TARGETS");
-                    return !(value && value[0] == '0');
-                }();
-                if (remakeTargets && !remake.empty()) {
-                    size_t made = 0;
-                    for (const auto& r : remake)
-                        made += GetRenderTarget(r.key.base, r.format, r.key.pitch, r.guestHeight, r.key.depth) != nullptr;
-                    static uint32_t loggedRemakes = 0;
-                    if (loggedRemakes++ < 8)
-                        LOG_INFO("renderer: size change made {} of {} scene targets again while the GPU is idle", made, remake.size());
-                }
-                remake.clear();
                 LOG_INFO("renderer: internal resolution f{} plan={} epoch={} requested={}x{} effective={}x{} cpu_readback={} allocation_fallback={}",
                     frame, selected.cpuSerial, selected.geometryEpoch, requested.width, requested.height, effective.width, effective.height,
                     resolveReadback, false);
@@ -9173,7 +9145,6 @@ void main()
                 consecutiveResolveCopies.Invalidate();
                 auto tex = std::make_unique<HostTexture>();
                 tex->allocationSerial = ++nextTargetAllocation;
-                tex->guestFormat = format;
                 tex->format = depth ? RenderFormat::D32_FLOAT_S8_UINT : ClassHostFormat(colorClass);
                 tex->guestWidth = pitch;
                 tex->guestHeight = effectiveHeight;

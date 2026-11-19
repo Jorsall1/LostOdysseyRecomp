@@ -964,10 +964,7 @@ namespace gpu::video
                         }
                         return int32_t(vkResetFences(queue->device->vk, 1, &nativeFence->vk));
                     },
-                    [&] {
-                        const plume::NativeSerializeLock serialize;
-                        return int32_t(vkQueueSubmit(queue->queue->vk, 1, &submit, nativeFence->vk));
-                    },
+                    [&] { return int32_t(vkQueueSubmit(queue->queue->vk, 1, &submit, nativeFence->vk)); },
                     acceptedSerial, result);
             }
             if (rawResult) *rawResult = result;
