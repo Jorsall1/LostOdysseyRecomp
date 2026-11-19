@@ -1,0 +1,36 @@
+================================================================================
+LostOdysseyRecomp - Nintendo Switch 2 port
+Summary - TURN 47: fourth GPU stop at a menu close (performance overlay on);
+restore skip and blit resolve back to opt-in on Switch 2
+================================================================================
+Build: NRO md5 b38b77dd7187c18229b29fe115b2ad9f (Desktop copy matches).
+ELF: build/norestoreskip_turn47_b38b77dd.elf. kaiHEN fix untouched. Not on HW.
+CRASH LOG (lo project/crash, runtime-1795065718449492.log, turn 45 build,
+docked 2560x1440)
+  * 220.34 s step to 792 rows during 3D: scene depth/colour rebuilt AT ONCE.
+    221.9 light-screen hold (game menu, 21 draws), 225.7 Settings opened,
+    234.7 saved (performance_overlay=1), 237.9 closed, game-menu frames.
+  * 240.06: batch 13412 (frame 13410, 13 draws, 7 resolves, 6 rect lists) NOT
+    completed 24 ms after submit (the menu frames before it took 3.4 ms),
+    batch 13413 (410 draws) REFUSED, raw_vk -4, "context failed at
+    nvkmd_nvgpu_native_ctx.c:738".
+  * No size change behind the menu, no target created, no "released by the
+    last render size change" line: the turn-45 stale-pointer theory is WRONG
+    for this stop (graveyard kept; harmless).
+  * What all four stops share (turns 37, 43, 45, 47): the game's menu closes
+    and the first frame after it faults. That frame is where the game draws
+    its saved scene back (the EDRAM restore after the menu's resolves). On
+    Switch 2 two paths there were enabled in turn 36 without a hardware check:
+    the restore skip and the blit resolve (both measured on Switch 1 deko3d
+    only). No such stop was seen before turn 36. The overlay and FSR toggles
+    are incidental: they were simply the Settings change made each time.
+CHANGE (gpu/renderer.cpp)
+  * skipRestores and resolveBlit: on Switch 2 only with LO_SKIP_RESTORE=1 /
+    LO_RESOLVE_BLIT=1. deko3d (Switch 1) keeps them on (=0 off), as before.
+    Cost: turn 36 estimated a small GPU gain; unmeasured on NVK.
+TESTS: settings ctest 11/11; Switch 2 build ok.
+NEXT (user)
+  * Same steps: in-game menu -> Settings -> change something (overlay, FSR)
+    -> save -> close -> back to the field, a few times; also save screen.
+  * If it still stops, the next suspects from turn 36 are the batch upload
+    split and the new-target zero clear; send the logs.

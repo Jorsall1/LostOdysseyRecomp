@@ -10963,9 +10963,14 @@ void main()
                 // copy shader, often right after the resolve cleared the target. Here the target still holds it, unless
                 // the queued clear runs. A target stays in COPY_SOURCE after a resolve until something writes it, and
                 // that layout proves the two images are the same, so the clear and the draw can both go.
-                // Switch 2 (Vulkan) too since turn 36: the check is the renderer's own layout bookkeeping, not deko3d's.
-                static const bool skipRestores = (video::IsDeko3d() || LO_PLATFORM_SWITCH2) &&
-                    !(getenv("LO_SKIP_RESTORE") && getenv("LO_SKIP_RESTORE")[0] == '0');
+                // Switch 2: opt-in only (LO_SKIP_RESTORE=1) since turn 47. Turned on there in turn 36 without a hardware
+                // check; every GPU stop since (turns 37, 43, 45, 47) faulted on the frame where a menu closes and the
+                // game draws its saved scene back, which is this path and the blit resolve below.
+                static const bool skipRestores = [] {
+                    const char* value = getenv("LO_SKIP_RESTORE");
+                    if (LO_PLATFORM_SWITCH2) return value && value[0] == '1';
+                    return video::IsDeko3d() && !(value && value[0] == '0');
+                }();
                 constexpr uint64_t kPlainCopyShader = 0x38b953b91dcfd9ceull;
                 if (skipRestores && psHash == kPlainCopyShader && info.indexCount <= 6 && !(depthControl & 7) &&
                     Reg(REG_RB_BLENDCONTROL0) == 0x10001 && (Reg(REG_RB_COLOR_MASK) & 0xF) == 0xF && !(Reg(REG_RB_COLORCONTROL) & 8))
@@ -15784,10 +15789,12 @@ void main()
                     // The same pixels through the blit shader on the 3D engine, not a copy-engine copy between two barriers
                     // (exact for these formats: each value round-trips through float32). First battle, 3 runs: 26.62 to
                     // 27.72 FPS, GPU 37.01 to 35.34 ms. LO_RESOLVE_BLIT=0 goes back to the copy.
-                    // Switch 2 too since turn 36: NVK's copy runs on the copy engine's subchannel of the same channel, and
-                    // each switch between it and the 3D engine waits for the GPU to go idle.
-                    static const bool resolveBlit = (video::IsDeko3d() || LO_PLATFORM_SWITCH2) &&
-                        !(getenv("LO_RESOLVE_BLIT") && getenv("LO_RESOLVE_BLIT")[0] == '0');
+                    // Switch 2: opt-in only (LO_RESOLVE_BLIT=1) since turn 47, with the restore skip above (same reason).
+                    static const bool resolveBlit = [] {
+                        const char* value = getenv("LO_RESOLVE_BLIT");
+                        if (LO_PLATFORM_SWITCH2) return value && value[0] == '1';
+                        return video::IsDeko3d() && !(value && value[0] == '0');
+                    }();
                     const resolve_copy::Copy copy{color.allocationSerial, rs.tex->allocationSerial,
                         color.width, color.height, texW, texH, uint32_t(color.format), x0, y0, w, h};
                     const bool reuse = resolveCopyReuse && consecutiveResolveCopies.CanReuse(copy);
