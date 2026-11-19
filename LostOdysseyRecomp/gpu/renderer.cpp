@@ -1034,6 +1034,8 @@ namespace gpu::renderer
                 // (recorded words); a draw that needs it moves it forward.
                 std::shared_ptr<PrefetchJob> job;
                 bool seeded = false;
+                // Switch 2 (LO_EARLY_Z): built with the pixel shader's EarlyFragmentTests twin.
+                bool early = false;
             };
             static constexpr size_t kMaxSpecVariants = gpu::pipeline_cache::kMaxTexInfo;
             struct PipelineSlot {
@@ -8488,6 +8490,21 @@ void main()
 
             std::unique_ptr<position_evidence::Collection> positionEvidence;
 
+            // Switch 2 (turn 53): early depth tests on Vulkan through specialised variants built with the pixel shader's
+            // EarlyFragmentTests twin (plume LO_EARLY_Z). Every translated pixel shader holds the alpha test's discard,
+            // so without it NVK tests depth after shading on every draw. Switch 1's deko3d early-Z: GPU 53 -> 41.5 ms.
+            static bool EarlyZVulkan()
+            {
+#if LO_PLATFORM_SWITCH2
+                static const bool enabled = [] {
+                    const char* value = getenv("LO_EARLY_Z");
+                    return !(value && value[0] == '0');
+                }();
+                return enabled;
+#else
+                return false;
+#endif
+            }
             // The translator writes guest kill instructions as clip(), and its only other discard is the alpha test.
             // The shader pack keeps no source, so a pixel shader is translated once to look.
             void CheckShaderDiscard(Shader& entry, const uint32_t* words, uint32_t count)
@@ -8542,7 +8559,7 @@ void main()
                 }
                 if (it != cache.end() && !it->second.valid && !it->second.retry.Ready()) return nullptr;
                 if (it != cache.end() && it->second.valid) {
-                    if (pixel && !it->second.discardChecked && video::IsDeko3d()) CheckShaderDiscard(it->second, words, count);
+                    if (pixel && !it->second.discardChecked && (video::IsDeko3d() || EarlyZVulkan())) CheckShaderDiscard(it->second, words, count);
                     if (!it->second.slotsResolved) ResolveConstantSlots(it->second, pixel, words, count);
                     // LO_SHADER_HLSL_DIR also covers shaders that came from the portable
                     // pack (no HLSL was generated for them): translate once to write it.
@@ -10424,17 +10441,17 @@ void main()
             // Render thread: builds the variant of slot (key) for info on a worker. Seeds
             // (recorded words) wait until no draw-time variant is queued.
             void QueueSpecialisation(PipelineSlot& slot, const PipelineKey& key, Shader* vs, Shader* ps,
-                const gpu::pipeline_cache::TexInfo& info, bool seed)
+                const gpu::pipeline_cache::TexInfo& info, bool seed, bool early = false)
             {
                 if (!info.Valid() || info.mask != TextureSlotMask(vs, ps)) return;
                 for (auto& variant : slot.variants)
-                    if (variant.info == info) {
+                    if (variant.info == info && variant.early == early) {
                         if (!seed) PromoteSpecialisation(variant);
                         return;
                     }
                 if (slot.variants.size() >= kMaxSpecVariants) return;
                 auto job = std::make_shared<PrefetchJob>();
-                slot.variants.push_back({ info, nullptr, job, seed });
+                slot.variants.push_back({ info, nullptr, job, seed, early });
                 job->key = key;
                 job->kind = PrefetchJob::Specialise;
                 job->seed = seed;
@@ -10446,6 +10463,7 @@ void main()
                 job->desc.cacheKey = 0; // the D3D12 library and Metal archive name the generic pipeline
                 job->desc.specConstants = job->specConstants.data();
                 job->desc.specConstantsCount = uint32_t(job->specConstants.size());
+                job->desc.earlyFragmentTests = early;
                 ++specStats.queued;
                 if (seed) ++specStats.seeded;
                 QueuePrefetchJobs({ job });
@@ -10459,7 +10477,9 @@ void main()
                 const auto recipe = knownRecipes.find(key);
                 if (recipe == knownRecipes.end() || recipe->second.texinfo.empty()) return;
                 if ((!vs || (key.ps && !ps)) && FindRecipeShaders(key, vs, ps, nullptr) != RecipeShaderState::Ready) return;
-                for (const auto& info : recipe->second.texinfo) QueueSpecialisation(slot, key, vs, ps, info, true);
+                // Seeds take the early twin when the pixel shader cannot discard (alpha test aside, rare for those).
+                const bool early = EarlyZVulkan() && ps && !ps->mayDiscard;
+                for (const auto& info : recipe->second.texinfo) QueueSpecialisation(slot, key, vs, ps, info, true, early);
             }
 
             // Render thread: a finished variant job into its slot.
@@ -10468,7 +10488,7 @@ void main()
                 const auto slot = pipelines.find(job.key);
                 if (slot == pipelines.end()) return;
                 for (auto& variant : slot->second.variants)
-                    if (variant.info == job.texInfo && !variant.pipeline) {
+                    if (variant.job.get() == &job && !variant.pipeline) {
                         variant.pipeline = std::move(job.pipeline);
                         variant.job.reset();
                         variant.seeded = false;
@@ -10493,7 +10513,7 @@ void main()
             // Render thread, at the draw's bind: the specialised variant of the generic
             // pipeline GetPipeline just returned, when one is built for the words the
             // draw binds; otherwise the generic one, and an unseen tuple is queued.
-            RenderPipeline* SpecialisedPipeline(Shader* vs, Shader* ps, RenderPipeline* generic, const uint32_t* words)
+            RenderPipeline* SpecialisedPipeline(Shader* vs, Shader* ps, RenderPipeline* generic, const uint32_t* words, bool early = false)
             {
                 const uint32_t mask = TextureSlotMask(vs, ps);
                 PipelineSlot* slot = lastPipelineSlot;
@@ -10503,7 +10523,7 @@ void main()
                     size_t(std::popcount(mask)) > gpu::pipeline_cache::kTexInfoWords) return generic;
                 ++specStats.textured;
                 for (auto& variant : slot->variants) {
-                    if (variant.info.mask != mask) continue;
+                    if (variant.info.mask != mask || variant.early != early) continue;
                     bool same = true;
                     size_t word = 0;
                     for (uint32_t m = mask; m && same; m &= m - 1)
@@ -10523,7 +10543,7 @@ void main()
                 size_t word = 0;
                 for (uint32_t m = mask; m; m &= m - 1)
                     info.words[word++] = words[std::countr_zero(m)];
-                QueueSpecialisation(*slot, lastPipelineKey, vs, ps, info, false);
+                QueueSpecialisation(*slot, lastPipelineKey, vs, ps, info, false, early);
                 NoteRecipeTexInfo(lastPipelineKey, info);
                 return generic;
             }
@@ -11019,14 +11039,10 @@ void main()
                 // copy shader, often right after the resolve cleared the target. Here the target still holds it, unless
                 // the queued clear runs. A target stays in COPY_SOURCE after a resolve until something writes it, and
                 // that layout proves the two images are the same, so the clear and the draw can both go.
-                // Switch 2: opt-in only (LO_SKIP_RESTORE=1) since turn 47. Turned on there in turn 36 without a hardware
-                // check; every GPU stop since (turns 37, 43, 45, 47) faulted on the frame where a menu closes and the
-                // game draws its saved scene back, which is this path and the blit resolve below.
-                static const bool skipRestores = [] {
-                    const char* value = getenv("LO_SKIP_RESTORE");
-                    if (LO_PLATFORM_SWITCH2) return value && value[0] == '1';
-                    return video::IsDeko3d() && !(value && value[0] == '0');
-                }();
+                // Switch 2 too (turn 53): turned off in turn 47 as a GPU-stop suspect, then cleared: the stops of turns
+                // 48, 50 and 51 came with it off. Switch 1 measured ~2 ms of GPU per battle frame. LO_SKIP_RESTORE=0 off.
+                static const bool skipRestores = (video::IsDeko3d() || LO_PLATFORM_SWITCH2) &&
+                    !(getenv("LO_SKIP_RESTORE") && getenv("LO_SKIP_RESTORE")[0] == '0');
                 constexpr uint64_t kPlainCopyShader = 0x38b953b91dcfd9ceull;
                 if (skipRestores && psHash == kPlainCopyShader && info.indexCount <= 6 && !(depthControl & 7) &&
                     Reg(REG_RB_BLENDCONTROL0) == 0x10001 && (Reg(REG_RB_COLOR_MASK) & 0xF) == 0xF && !(Reg(REG_RB_COLORCONTROL) & 8))
@@ -13317,7 +13333,9 @@ void main()
                 // variant here instead, so a run of query boxes keeps one binding;
                 // OcclusionQueryForDraw takes the counter at the draw.
                 RenderPipeline* const genericPipeline = pipeline;
-                if (texInfoSpecialization) pipeline = SpecialisedPipeline(vs, ps, pipeline, shared.textureInfo);
+                if (texInfoSpecialization)
+                    pipeline = SpecialisedPipeline(vs, ps, pipeline, shared.textureInfo,
+                        EarlyZVulkan() && ps && !ps->mayDiscard && !(shared.flags & 1));
                 RenderPipeline* countingPipeline = OcclusionCountingPending() ? CountingPipeline(key, vs, ps) : nullptr;
 #if defined(LO_SWITCH_DEKO3D)
                 // With no discard possible on this draw, depth tested before the shader gives the same image and
@@ -15859,12 +15877,9 @@ void main()
                     // The same pixels through the blit shader on the 3D engine, not a copy-engine copy between two barriers
                     // (exact for these formats: each value round-trips through float32). First battle, 3 runs: 26.62 to
                     // 27.72 FPS, GPU 37.01 to 35.34 ms. LO_RESOLVE_BLIT=0 goes back to the copy.
-                    // Switch 2: opt-in only (LO_RESOLVE_BLIT=1) since turn 47, with the restore skip above (same reason).
-                    static const bool resolveBlit = [] {
-                        const char* value = getenv("LO_RESOLVE_BLIT");
-                        if (LO_PLATFORM_SWITCH2) return value && value[0] == '1';
-                        return video::IsDeko3d() && !(value && value[0] == '0');
-                    }();
+                    // Switch 2 too (turn 53, cleared as a GPU-stop suspect like the restore skip). LO_RESOLVE_BLIT=0 off.
+                    static const bool resolveBlit = (video::IsDeko3d() || LO_PLATFORM_SWITCH2) &&
+                        !(getenv("LO_RESOLVE_BLIT") && getenv("LO_RESOLVE_BLIT")[0] == '0');
                     const resolve_copy::Copy copy{color.allocationSerial, rs.tex->allocationSerial,
                         color.width, color.height, texW, texH, uint32_t(color.format), x0, y0, w, h};
                     const bool reuse = resolveCopyReuse && consecutiveResolveCopies.CanReuse(copy);

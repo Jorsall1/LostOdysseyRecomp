@@ -1,0 +1,46 @@
+================================================================================
+LostOdysseyRecomp - Nintendo Switch 2 port
+Summary - TURN 53: GPU optimizations: early depth tests on Vulkan, lean SPIR-V
+(no NoContraction), restore skip + blit resolve back on, DR steps up sooner
+================================================================================
+Build: NRO md5 08355b00a1c97a7c51adeff0d6c34b86 (Desktop copy matches). ELF build/gpuopt_turn53_08355b00.elf.
+kaiHEN fix untouched. Not on HW. User: Settings changes from the title menu do
+not stop the GPU (in-game changes still can; open issue).
+CHANGES
+  1. Early depth tests (LO_EARLY_Z, default on, Switch 2). Every translated pixel
+     shader holds the alpha test's discard, so NVK tested depth after shading on
+     every draw (hidden pixels shaded). Switch 1's deko3d equivalent: GPU 53 ->
+     41.5 ms, +20% FPS.
+     * plume (patch regenerated): VulkanShader makes an EarlyFragmentTests twin
+       of each fragment module (spirv_trim::AddEarlyFragmentTests);
+       RenderGraphicsPipelineDesc::earlyFragmentTests picks it (non-library
+       path; the fast-link library path stays late-Z).
+     * renderer: CheckShaderDiscard now runs on Switch 2 (mayDiscard = clip() /
+       depth write / translation errors). Texinfo-specialised variants carry an
+       "early" flag (SpecVariant::early, desc.earlyFragmentTests); a draw asks for
+       early when ps && !mayDiscard && alpha test off; seeds from recipes are
+       early when the shader cannot discard. Generic (late-Z) pipeline is bound
+       until the variant is built in the background. FinishSpecialisation matches
+       by job pointer.
+  2. Lean SPIR-V (LO_LEAN_SPIRV, default on, Switch 2): OpDecorate NoContraction
+     removed at module creation (HLSL precise on SV_Position and its inputs),
+     letting the compiler fuse mul+add. Switch 1 lean level 2: hot vertex shaders
+     -30-34% code, GPU ~-10%. stderr "[lean] N shaders without NoContraction".
+     Risk: position rounding between passes (z-fighting in depth-equal passes);
+     Switch 1 shipped with it.
+  3. Restore skip and blit resolve on again on Switch 2 (LO_SKIP_RESTORE=0 /
+     LO_RESOLVE_BLIT=0 off): cleared as GPU-stop suspects (stops in turns 48,
+     50, 51 happened with them off). Switch 1: ~2 ms GPU per battle frame.
+  4. dynamic_resolution UpBelow 0.80 -> 0.85: steps up when the next rung is
+     predicted under 14.2 ms (was 13.3) at 60 FPS.
+FIRST LAUNCH: changed SPIR-V means NVK compiles every pipeline again (driver
+cache miss) and early variants are new: expect stutter / lower FPS during the
+background preparation (several minutes, "pipeline preparation: background
+done"). Later launches use pipeline_cache_vk.bin.
+TESTS: tools/tests/spirv_lean_test.cpp (new) ok; dynamic_resolution_test ok
+(both); settings ctest 11/11; Switch 2 build ok; plume chain reproduces tree.
+NEXT (user): let the first launch finish preparing (title or field, a few
+minutes), quit, relaunch, then compare FPS/resolution with the perf overlay.
+Visual check: z-fighting/flicker on overlapping surfaces, missing alpha-tested
+foliage/fences (early-Z wrongly chosen). A/B lines: LO_EARLY_Z=0,
+LO_LEAN_SPIRV=0, LO_SKIP_RESTORE=0, LO_RESOLVE_BLIT=0.

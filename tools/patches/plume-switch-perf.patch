@@ -12,7 +12,7 @@ index 29cddfd..3972f17 100644
              return DXGI_FORMAT_R16G16B16A16_FLOAT;
          case RenderFormat::R16G16B16A16_UNORM:
 diff --git a/plume_render_interface_types.h b/plume_render_interface_types.h
-index b2149f3..3b006ed 100644
+index b2149f3..63ab2c6 100644
 --- a/plume_render_interface_types.h
 +++ b/plume_render_interface_types.h
 @@ -192,6 +192,7 @@ namespace plume {
@@ -39,12 +39,22 @@ index b2149f3..3b006ed 100644
          case RenderFormat::R32G32B32A32_TYPELESS:
          case RenderFormat::R32G32B32A32_FLOAT:
          case RenderFormat::R32G32B32A32_UINT:
+@@ -1365,6 +1368,9 @@ namespace plume {
+         uint32_t inputElementsCount = 0;
+         const RenderSpecConstant *specConstants = nullptr;
+         uint32_t specConstantsCount = 0;
++        // LostOdysseyRecomp: test depth before the fragment shader (Vulkan: the pixel shader's EarlyFragmentTests
++        // twin). Only for draws that cannot discard or write depth. Ignored where unsupported.
++        bool earlyFragmentTests = false;
+         // Non-zero: stable identity of this state across runs. D3D12 names its
+         // pipeline library entry after it (mixed with the shader bytecode), Metal
+         // adds such pipelines to its binary archive. Vulkan caches every pipeline.
 diff --git a/plume_spirv_trim.h b/plume_spirv_trim.h
 new file mode 100644
-index 0000000..e9914b8
+index 0000000..4159125
 --- /dev/null
 +++ b/plume_spirv_trim.h
-@@ -0,0 +1,368 @@
+@@ -0,0 +1,418 @@
 +//
 +// LostOdysseyRecomp: removes vertex shader outputs that the paired fragment
 +// shader never reads.
@@ -412,9 +422,59 @@ index 0000000..e9914b8
 +        if (removedCount != nullptr) *removedCount = uint32_t(demoted.size());
 +        return true;
 +    }
++    // LostOdysseyRecomp (turn 53, Switch 2): GPU-cost transforms applied when a module is created.
++    constexpr uint32_t kDecorationNoContraction = 42, kExecutionModelFragment = 4, kModeEarlyFragmentTests = 9;
++    // Drops every "OpDecorate %id NoContraction". DXC emits them for HLSL `precise` (the translated vertex shaders'
++    // SV_Position and everything feeding it); they stop the compiler fusing multiplies and adds. The same edit on
++    // Switch 1 (deko3d lean shaders level 2+) cut the hot vertex shaders' code by 30-34%. Returns the count removed.
++    inline uint32_t StripNoContraction(std::vector<uint32_t> &words) {
++        std::vector<Instruction> instructions;
++        if (!Parse(words, instructions)) return 0;
++        std::vector<uint32_t> out(words.begin(), words.begin() + 5);
++        out.reserve(words.size());
++        uint32_t removed = 0;
++        for (const auto &ins : instructions) {
++            if (ins.opcode == op::Decorate && ins.count == 3 && words[ins.offset + 2] == kDecorationNoContraction) {
++                ++removed;
++                continue;
++            }
++            out.insert(out.end(), words.begin() + ins.offset, words.begin() + ins.offset + ins.count);
++        }
++        if (removed) words.swap(out);
++        return removed;
++    }
++    // A copy of a fragment shader with OpExecutionMode EarlyFragmentTests on its entry point: depth and stencil are
++    // tested before the shader runs. Only for draws that can neither discard nor write depth (the renderer decides);
++    // for them the image is the same. False when it is not a single-entry fragment module or already has the mode.
++    inline bool AddEarlyFragmentTests(const std::vector<uint32_t> &words, std::vector<uint32_t> &out) {
++        std::vector<Instruction> instructions;
++        if (!Parse(words, instructions)) return false;
++        size_t insertAt = 0;
++        uint32_t entry = 0, entries = 0;
++        for (const auto &ins : instructions) {
++            if (ins.opcode == op::EntryPoint && ins.count >= 3) {
++                if (words[ins.offset + 1] != kExecutionModelFragment) return false;
++                entry = words[ins.offset + 2];
++                ++entries;
++                insertAt = ins.offset + ins.count;
++            } else if ((ins.opcode == op::ExecutionMode || ins.opcode == op::ExecutionModeId) && ins.count >= 3 &&
++                       words[ins.offset + 2] == kModeEarlyFragmentTests) {
++                return false;
++            }
++        }
++        if (entries != 1 || !insertAt) return false;
++        out.clear();
++        out.reserve(words.size() + 3);
++        out.insert(out.end(), words.begin(), words.begin() + insertAt);
++        out.push_back((3u << 16) | op::ExecutionMode);
++        out.push_back(entry);
++        out.push_back(kModeEarlyFragmentTests);
++        out.insert(out.end(), words.begin() + insertAt, words.end());
++        return true;
++    }
 +};
 diff --git a/plume_vulkan.cpp b/plume_vulkan.cpp
-index 3f15073..82759b1 100644
+index 3f15073..0ef189c 100644
 --- a/plume_vulkan.cpp
 +++ b/plume_vulkan.cpp
 @@ -9,6 +9,11 @@
@@ -438,7 +498,7 @@ index 3f15073..82759b1 100644
          case RenderFormat::R16G16B16A16_FLOAT:
              return VK_FORMAT_R16G16B16A16_SFLOAT;
          case RenderFormat::R16G16B16A16_UNORM:
-@@ -1401,6 +1408,78 @@ namespace plume {
+@@ -1401,6 +1408,94 @@ namespace plume {
  
      // VulkanShader
  
@@ -454,6 +514,22 @@ index 3f15073..82759b1 100644
 +        return enabled;
 +    }
 +
++    static bool switch2Default(const char *name) {
++        const char *value = std::getenv(name);
++#if defined(__SWITCH2__)
++        return !(value && value[0] == '0');
++#else
++        return value && value[0] == '1';
++#endif
++    }
++    static bool leanSpirvEnabled() {
++        static const bool enabled = switch2Default("LO_LEAN_SPIRV");
++        return enabled;
++    }
++    static bool earlyFragmentEnabled() {
++        static const bool enabled = switch2Default("LO_EARLY_Z");
++        return enabled;
++    }
 +    static VkShaderModule vertexModuleFor(const RenderGraphicsPipelineDesc &desc) {
 +        VulkanShader *vertexShader = const_cast<VulkanShader *>(static_cast<const VulkanShader *>(desc.vertexShader));
 +        if (!trimVaryingsEnabled() || (desc.geometryShader != nullptr) || vertexShader->spirv.empty()) {
@@ -517,17 +593,56 @@ index 3f15073..82759b1 100644
      VulkanShader::VulkanShader(VulkanDevice *device, const void *data, uint64_t size, const char *entryPointName, RenderShaderFormat format) {
          assert(device != nullptr);
          assert(data != nullptr);
-@@ -1421,14 +1500,25 @@ namespace plume {
+@@ -1412,23 +1507,61 @@ namespace plume {
+         this->format = format;
+         this->entryPointName = (entryPointName != nullptr) ? std::string(entryPointName) : std::string();
+ 
++        // LostOdysseyRecomp (turn 53, Switch 2): LO_LEAN_SPIRV (default on) drops NoContraction; LO_EARLY_Z (default
++        // on) makes a fragment shader's EarlyFragmentTests twin. Both =0 to turn off.
++        std::vector<uint32_t> words;
++        if ((size % 4) == 0) {
++            words.assign(reinterpret_cast<const uint32_t *>(data), reinterpret_cast<const uint32_t *>(data) + (size / 4));
++        }
++        if (leanSpirvEnabled() && !words.empty()) {
++            static std::atomic<uint32_t> leanModules{ 0 }, leanDecorations{ 0 };
++            if (const uint32_t removed = spirv_trim::StripNoContraction(words)) {
++                const uint32_t modules = ++leanModules, total = (leanDecorations += removed);
++                if ((modules <= 2) || ((modules % 500) == 0)) {
++                    std::fprintf(stderr, "[lean] %u shaders without NoContraction (%u decorations removed)\n", modules, total);
++                }
++            }
++        }
+         VkShaderModuleCreateInfo shaderInfo = {};
+         shaderInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+-        shaderInfo.pCode = reinterpret_cast<const uint32_t *>(data);
+-        shaderInfo.codeSize = size;
++        shaderInfo.pCode = words.empty() ? reinterpret_cast<const uint32_t *>(data) : words.data();
++        shaderInfo.codeSize = words.empty() ? size : words.size() * sizeof(uint32_t);
+         VkResult res = vkCreateShaderModule(device->vk, &shaderInfo, nullptr, &vk);
+         if (res != VK_SUCCESS) {
              PLUME_LOG_ERROR("Vulkan", "vkCreateShaderModule", LogErrorDomain::VkResult, res, "");
              return;
          }
-+
-+        if (trimVaryingsEnabled() && ((size % 4) == 0)) {
-+            spirv.assign(reinterpret_cast<const uint32_t *>(data), reinterpret_cast<const uint32_t *>(data) + (size / 4));
++        if (earlyFragmentEnabled() && !words.empty()) {
++            std::vector<uint32_t> early;
++            if (spirv_trim::AddEarlyFragmentTests(words, early)) {
++                VkShaderModuleCreateInfo earlyInfo = shaderInfo;
++                earlyInfo.pCode = early.data();
++                earlyInfo.codeSize = early.size() * sizeof(uint32_t);
++                if (vkCreateShaderModule(device->vk, &earlyInfo, nullptr, &earlyFragment) != VK_SUCCESS) {
++                    earlyFragment = VK_NULL_HANDLE;
++                }
++            }
++        }
++        if (trimVaryingsEnabled() && !words.empty()) {
++            spirv = std::move(words);
 +        }
      }
- 
+-
      VulkanShader::~VulkanShader() {
++        if (earlyFragment != VK_NULL_HANDLE) {
++            vkDestroyShaderModule(device->vk, earlyFragment, nullptr);
++        }
 +        for (auto &variant : outputVariants) {
 +            if (variant.second != VK_NULL_HANDLE) {
 +                vkDestroyShaderModule(device->vk, variant.second, nullptr);
@@ -543,7 +658,7 @@ index 3f15073..82759b1 100644
      void VulkanShader::setName(const std::string &name) {
          setObjectName(device->vk, VK_OBJECT_TYPE_SHADER_MODULE, uint64_t(vk), name);
      }
-@@ -1554,7 +1644,7 @@ namespace plume {
+@@ -1554,7 +1687,7 @@ namespace plume {
              VkPipelineShaderStageCreateInfo stageInfo = {};
              stageInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
              stageInfo.stage = VK_SHADER_STAGE_VERTEX_BIT;
@@ -552,7 +667,16 @@ index 3f15073..82759b1 100644
              stageInfo.pName = vertexShader->entryPointName.c_str();
              stageInfo.pSpecializationInfo = pSpecInfo;
              stages.emplace_back(stageInfo);
-@@ -2080,7 +2170,7 @@ namespace plume {
+@@ -1576,7 +1709,7 @@ namespace plume {
+             VkPipelineShaderStageCreateInfo stageInfo = {};
+             stageInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+             stageInfo.stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+-            stageInfo.module = pixelShader->vk;
++            stageInfo.module = (desc.earlyFragmentTests && pixelShader->earlyFragment != VK_NULL_HANDLE) ? pixelShader->earlyFragment : pixelShader->vk;
+             stageInfo.pName = pixelShader->entryPointName.c_str();
+             stageInfo.pSpecializationInfo = pSpecInfo;
+             stages.emplace_back(stageInfo);
+@@ -2080,7 +2213,7 @@ namespace plume {
          });
  
          // Pre-rasterization: depth bias enable is static (it needs extended dynamic state 2).
@@ -561,7 +685,7 @@ index 3f15073..82759b1 100644
          const VkShaderModule geometryModule = (desc.geometryShader != nullptr) ? static_cast<const VulkanShader *>(desc.geometryShader)->vk : VK_NULL_HANDLE;
          const VkBool32 depthClamp = !desc.depthClipEnabled;
          const VkBool32 depthBias = (desc.depthBias != 0) || (desc.depthBiasClamp != 0.0f) || (desc.slopeScaledDepthBias != 0.0f);
-@@ -2097,6 +2187,7 @@ namespace plume {
+@@ -2097,6 +2230,7 @@ namespace plume {
              VkPipelineShaderStageCreateInfo stages[2];
              uint32_t stageCount = 0;
              stages[stageCount++] = libraryStage(desc.vertexShader, VK_SHADER_STAGE_VERTEX_BIT);
@@ -569,7 +693,7 @@ index 3f15073..82759b1 100644
              if (desc.geometryShader != nullptr) {
                  stages[stageCount++] = libraryStage(desc.geometryShader, VK_SHADER_STAGE_GEOMETRY_BIT);
              }
-@@ -3286,6 +3377,11 @@ namespace plume {
+@@ -3286,6 +3420,11 @@ namespace plume {
              if (desc.colorAttachmentsCount == 0) {
                  width = uint32_t(depthAttachment->desc.width);
                  height = depthAttachment->desc.height;
@@ -581,7 +705,7 @@ index 3f15073..82759b1 100644
              }
  
              depthReference.attachment = uint32_t(attachments.size());
-@@ -3487,6 +3583,19 @@ namespace plume {
+@@ -3487,6 +3626,19 @@ namespace plume {
          }
  
  	    VkResult res = vkGetQueryPoolResults(device->vk, vk, 0, uint32_t(results.size()), sizeof(uint64_t) * results.size(), results.data(), sizeof(uint64_t), VK_QUERY_RESULT_64_BIT);
@@ -601,7 +725,7 @@ index 3f15073..82759b1 100644
          if (res != VK_SUCCESS) {
              PLUME_LOG_ERROR("Vulkan", "vkGetQueryPoolResults", LogErrorDomain::VkResult, res, "");
              return;
-@@ -5069,7 +5178,8 @@ namespace plume {
+@@ -5069,7 +5221,8 @@ namespace plume {
          }
  
          VkPhysicalDeviceTimelineSemaphoreFeatures timelineFeatures = {};
@@ -612,10 +736,10 @@ index 3f15073..82759b1 100644
          if (timelineFound) {
              timelineFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES;
 diff --git a/plume_vulkan.h b/plume_vulkan.h
-index 843ef81..b047a03 100644
+index 843ef81..da8585d 100644
 --- a/plume_vulkan.h
 +++ b/plume_vulkan.h
-@@ -183,6 +183,14 @@ namespace plume {
+@@ -183,6 +183,17 @@ namespace plume {
          VulkanDevice *device = nullptr;
          RenderShaderFormat format = RenderShaderFormat::UNKNOWN;
  
@@ -626,11 +750,14 @@ index 843ef81..b047a03 100644
 +        std::mutex variantMutex;
 +        std::unordered_map<uint32_t, VkShaderModule> outputVariants;
 +        int64_t fragmentInputMask = -2; // -2: not computed, -1: not understood
++        // LostOdysseyRecomp (LO_EARLY_Z): the same fragment shader with EarlyFragmentTests, for pipelines whose
++        // desc asks for it (RenderGraphicsPipelineDesc::earlyFragmentTests). Null when not made.
++        VkShaderModule earlyFragment = VK_NULL_HANDLE;
 +
          VulkanShader(VulkanDevice *device, const void *data, uint64_t size, const char *entryPointName, RenderShaderFormat format);
          ~VulkanShader() override;
          virtual void setName(const std::string &name) override;
-@@ -591,6 +599,9 @@ namespace plume {
+@@ -591,6 +602,9 @@ namespace plume {
          // interpolation extensions and features. Other SDKs can supply aggregate
          // Vulkan feature structs that must not coexist with these individual structs.
          bool enableFrameInterpolationFeatures = false;

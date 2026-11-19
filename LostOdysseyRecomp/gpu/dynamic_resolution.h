@@ -61,7 +61,7 @@ namespace gpu::dynamic_resolution
     {
         // Tuning: the share of the frame budget the GPU may use before stepping down, and the share the next rung up
         // must stay under (its cost scaled by its pixel count) before stepping up.
-        static constexpr double DownAt = 0.92, UpBelow = 0.80;
+        static constexpr double DownAt = 0.92, UpBelow = 0.85; // UpBelow 0.80 -> 0.85 (turn 53): one more rung in battle (576 -> 612 at 12.5 ms)
         static constexpr uint64_t WindowNs = 500'000'000ull, DownHoldNs = 1'000'000'000ull, UpHoldNs = 3'000'000'000ull;
         // A frame that costs less than this says nothing about the scene: a loading screen, a fade or a movie (Switch 2,
         // 2026-11-18: 576 -> 612 rows on the loading screen at 0.3 ms before mv_01v, a rebuild of every scene target
