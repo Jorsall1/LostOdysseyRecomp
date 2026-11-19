@@ -2,108 +2,96 @@
 
 <img src="assets/lost-odyssey-recomp.png" alt="Lost Odyssey Recomp logo" width="112">
 
-# Lost Odyssey Recomp for Nintendo Switch
+# Lost Odyssey Recomp for Nintendo Switch 2
 
-**Lost Odyssey (Xbox 360), recompiled to run natively on the Nintendo Switch.**
+**Lost Odyssey (Xbox 360), recompiled to run natively on the Nintendo Switch 2.**
 
-[![Release](https://img.shields.io/github/v/release/Ad0ky/LostOdysseyRecomp?include_prereleases&label=release)](https://github.com/Ad0ky/LostOdysseyRecomp/releases)
-[![Downloads](https://img.shields.io/github/downloads/Ad0ky/LostOdysseyRecomp/total?label=downloads)](https://github.com/Ad0ky/LostOdysseyRecomp/releases)
+[![Release](https://img.shields.io/github/v/release/Jorsall1/LostOdysseyRecomp?include_prereleases&label=release)](https://github.com/Jorsall1/LostOdysseyRecomp/releases)
 [![License: GPL-3.0](https://img.shields.io/badge/license-GPL--3.0-blue)](LICENSE)
-![Nintendo Switch](https://img.shields.io/badge/Nintendo%20Switch-homebrew-E60012)
-![deko3d](https://img.shields.io/badge/graphics-deko3d-5E5E5E)
-[![Discord](https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white)](https://discord.gg/z2yPct6z2w)
+![Nintendo Switch 2](https://img.shields.io/badge/Nintendo%20Switch%202-homebrew-E60012)
+![Vulkan](https://img.shields.io/badge/graphics-Vulkan%20(OunceVK)-A41E22)
 
-### [Download](https://github.com/Ad0ky/LostOdysseyRecomp/releases) · [Installation guide](docs/INSTALL-SWITCH.md) · [Report a problem](https://github.com/Ad0ky/LostOdysseyRecomp/issues) · [Discord](https://discord.gg/z2yPct6z2w)
+### [Download](https://github.com/Jorsall1/LostOdysseyRecomp/releases) · [Report a problem](https://github.com/Jorsall1/LostOdysseyRecomp/issues)
 
-By **Ad0ky** and **depende3000**, based on [freefrank's Lost Odyssey Recomp](https://github.com/freefrank/LostOdysseyRecomp).
+Switch 2 port by **[Jorsall1](https://github.com/Jorsall1)**, built on the [Switch port](https://github.com/Ad0ky/LostOdysseyRecomp) by **Ad0ky** and **depende3000**, which is based on [freefrank's Lost Odyssey Recomp](https://github.com/freefrank/LostOdysseyRecomp).
+
 Free and open source: if you paid for this, ask for a refund.
 
 </div>
 
-<img src="docs/images/switch-uhra-street.jpg" alt="Kaim in the main street of Uhra, on the Switch" width="960">
-
 ## What this is
 
-A homebrew build of Lost Odyssey Recomp for Switch consoles running custom firmware (Atmosphère). The game's Xbox 360 code is statically recompiled to native ARM64, and its graphics run on **deko3d**, the Switch's own graphics API. It plays at the Switch's stock clocks.
+A homebrew build of Lost Odyssey Recomp for the Nintendo Switch 2, running under [kaiHEN](https://github.com/ouncebrew/kaihen). The game's Xbox 360 code is statically recompiled to native ARM64. Its graphics run on Vulkan through [OunceVK](https://github.com/ouncebrew/ouncevk), the Switch 2's Mesa NVK driver, and the port is built with [libounce](https://github.com/ouncebrew/libounce) from the [ounce devkit](https://github.com/ouncebrew/ounce-devkit).
 
 You need your own Lost Odyssey discs. This project contains no game files.
 
-> **Experimental.** The whole game is playable, but expect rough edges: report crashes, missing effects or anything that looks or sounds different from the Xbox 360 ([how](#reporting-a-problem)).
+> **Alpha.** The game boots, plays through fields, towns, battles and menus, and Settings changes apply while playing. Expect rough edges: report crashes, missing effects or anything that looks or sounds different from the Xbox 360 ([how](#reporting-a-problem)).
+
+The original Switch (Switch 1) version, with its deko3d back end, lives in [Ad0ky/LostOdysseyRecomp](https://github.com/Ad0ky/LostOdysseyRecomp). Use that one on a Switch 1 with Atmosphère.
 
 ## Performance
 
-The game is fully playable at the Switch's **stock clocks** (CPU 1020 MHz, GPU 460 MHz), measured in handheld mode at 960×540:
+The Switch 2 version targets **60 FPS** (the Switch 1 version runs at 30). Dynamic resolution keeps the frame rate: it lowers the 3D scene's height when the GPU runs out of time and raises it again when there's room. FSR 1 scales the scene to the screen.
 
-| Scene | Frame rate at stock clocks |
-| :--- | ---: |
-| Merchant ship and lighter areas | **30 FPS**, the game's cap |
-| Crowded battles | **24–28 FPS** at 960×540, **30 FPS** at 640×360 |
-| Busiest streets | **27 FPS** |
+Measured in handheld mode (GPU 561 MHz, CPU 1101 MHz) with the default settings:
 
-**For a perfect, locked 30 FPS everywhere, we recommend a light overclock (for example with sys-clk).** Stay within what your console and cooling can handle. Without one the game is still fully playable.
+| Scene | Frame rate | Scene resolution |
+| :--- | ---: | ---: |
+| Fields, inns and lighter areas | **60 FPS** | up to 1920×1080 |
+| Uhra's Main Street (busiest town) | **52–59 FPS** | 576 rows (the minimum) |
+| Fixed 1080p, dynamic resolution off | 51–57 FPS | 1920×1080 |
 
-[docs/SWITCH-BENCHMARKS.md](docs/SWITCH-BENCHMARKS.md) shows how it was measured.
+Docked, dynamic resolution runs from 720p up to 1440p. Docked performance hasn't been benchmarked yet.
 
 ## Getting started
 
 You need:
 
-- a Switch with **Atmosphère** and the Homebrew Menu;
-- a **microSD card (exFAT)** with about **25 GB** free;
+- a **Nintendo Switch 2** running **[kaiHEN](https://github.com/ouncebrew/kaihen)** with the Homebrew Menu;
+- a **microSD card** with about **25 GB** free;
 - your **Lost Odyssey discs** (Asian multilingual or USA/Europe edition, as ISOs, Games on Demand data or folders);
 - a **Windows or Linux PC**, to extract the discs once with the [PC version](https://github.com/freefrank/LostOdysseyRecomp/releases/latest).
 
 Then:
 
 1. **Extract your discs** with the PC version's importer. It leaves a `game` folder with `disc1`–`disc4`.
-2. **Copy the release ZIP** to `sdmc:/switch/LostOdysseyRecomp/`, and the disc folders into its `game/`.
-3. **Start the Homebrew Menu through title takeover:** hold **R** while starting any installed game, then choose **Lost Odyssey Recomp**. Starting from the Album doesn't work, because the game needs the full application memory.
+2. **Copy the release ZIP's contents** to `sdmc:/switch/LostOdysseyRecomp/`, and the disc folders into its `game/` folder.
+3. **Copy the shader files** `portable_vk.lospv` and `pipelines_corpus.bin` into `sdmc:/switch/LostOdysseyRecomp/shaders/`.
+4. **Start the Homebrew Menu through title takeover:** hold **R** while starting any installed game, then choose **Lost Odyssey Recomp**.
 
-The [installation guide](docs/INSTALL-SWITCH.md) has every step, the SD card layout and how to update.
+On the first launch the GPU driver compiles the game's pipelines in the background. Expect some stutter for the first few minutes. Later launches load them from the driver cache.
+
+To quit, press **HOME** and close the game with **X**. kaiHEN's R hook keeps working afterwards.
 
 ## Settings
 
-On the title screen, **Y** opens **Settings**. Settings are saved in `settings.ini`.
-
-### Graphics
+On the title screen, **Y** opens **Settings**. In-game, Settings is in the game's own menu. Settings are saved in `settings.ini`.
 
 | Option | What it does |
 | :--- | :--- |
-| **Graphics preset** | Sets the options below in one step. All three presets use FSR and 30 FPS. **Balanced (recommended)** is the default: dynamic resolution 360–540p, depth of field at 50%, no bloom, dynamic shadows and motion blur on. **Quality** renders a fixed 540p with every effect. **Performance** is Balanced without dynamic shadows, motion blur or depth of field. Changing any option below shows **Custom**. |
-| **Render resolution** | The height the 3D scene is rendered at before it's scaled to the screen, from 360p to 720p, set separately for handheld and docked. Automatic is 540p. With dynamic resolution on, this row is called **Maximum resolution**. |
-| **Dynamic resolution** | Lowers the scene's resolution step by step when the GPU can't finish a frame in time, and raises it again when there's room, so the frame rate holds steadier. |
-| **Minimum resolution** | How low dynamic resolution may go. Shown when dynamic resolution is on. |
-| **FSR** | AMD FSR 1: scales the scene to the screen with sharper edges than plain scaling. Costs a little GPU time. |
-| **FSR sharpness** | How strongly FSR sharpens: 0% is no sharpening, 100% the strongest. |
-| **Dynamic shadows** | Character and object shadows. **Low** keeps only the largest ones; **Off** removes them. Both raise the frame rate. |
-| **Depth of field** | Strength of the game's background blur. 100% is the original look; **Off** keeps distant scenery sharp. |
-| **Bloom** | The game's glow around bright areas. Off removes it, and the picture gets slightly darker. |
-| **Motion blur** | The blur during fast camera and character movement. Off keeps moving scenes sharp. |
-| **Culling** | How soon objects at the screen edges stop being drawn. 100% is the original; lower costs frame rate, higher hides them sooner. |
-| **Scaling filter** | The filter used when the scene is scaled without FSR: **Standard** (bilinear) or **High** (bicubic, slower on the Switch). |
-| **Loading speed** | **Original** keeps the Xbox 360's loading pace; **Fast** loads quicker. Effects play at normal speed either way. |
-| **Performance overlay** | Off by default. **FPS** shows the frame rate; **Detailed** adds a bar with the render resolution, FSR, and the CPU and GPU load. |
-| **Brightness** | Opens a page to adjust brightness and gamma. |
+| **Render resolution** | The height the 3D scene is rendered at before it's scaled to the screen, set separately for handheld and docked. Automatic is 1080p handheld and 1440p docked. With dynamic resolution on, this row is called **Maximum resolution**. |
+| **Dynamic resolution** | On by default. Lowers the scene's resolution step by step when the GPU can't finish a frame in time, and raises it again when there's room. It holds still on light screens (menus) and during loads. |
+| **Minimum resolution** | How low dynamic resolution may go. Automatic is 576p handheld and 720p docked. |
+| **FSR** | AMD FSR 1: scales the scene to the screen with sharper edges than plain scaling. On by default. |
+| **FSR sharpness** | How strongly FSR sharpens. |
+| **Dynamic shadows, depth of field, bloom, motion blur** | The game's effects. When dynamic resolution is already at its minimum and the GPU still can't keep up, motion blur, depth-of-field blur and shadows are reduced, then brought back once there's room. |
+| **Performance overlay** | Off by default. **FPS** shows the frame rate; **Detailed** adds the render resolution, FSR, and the CPU and GPU load. |
 
-### Other settings
+**Recommended:** keep dynamic resolution and FSR on. Fixed 1080p without FSR drops below 60 FPS in heavier areas.
 
-Text, the HUD and the menus follow the console's language, Spanish included.
+### env.txt
 
-`env.txt`, next to the game, holds settings that aren't in the menu. A line there wins over the matching menu option, which then shows greyed out. The [installation guide](docs/INSTALL-SWITCH.md#settings) explains the release's `env.txt`.
+`env.txt`, next to the game, holds settings that aren't in the menu, one `NAME=value` per line. For normal play, use only:
 
-**LB+RB** opens the debug menu: Save Anywhere, teleport, fast-forward, encounter rate and cheats.
+```
+LO_GUEST_AFFINITY=1
+```
 
-## Screenshots
-
-| First battle | Merchant ship |
-| :---: | :---: |
-| ![Kaim's first battle in the Wohl Highlands](docs/images/switch-first-battle.jpg) | ![Inside the merchant ship](docs/images/switch-merchant-ship.jpg) |
-
-All screenshots were taken on a Switch in handheld mode at 960×540.
+It places the game's threads on the cores the Xbox 360 version asks for. Every speed option is already on by default, and the debug options cost speed, so leave the rest out.
 
 ## Reporting a problem
 
-[Open an issue](https://github.com/Ad0ky/LostOdysseyRecomp/issues) with:
+[Open an issue](https://github.com/Jorsall1/LostOdysseyRecomp/issues) with:
 
 - the release version;
 - your game edition;
@@ -111,29 +99,41 @@ All screenshots were taken on a Switch in handheld mode at 960×540.
 - your `env.txt`;
 - what was on screen when it happened.
 
-Also attach the files the game writes in `sdmc:/switch/LostOdysseyRecomp/`: `state/logs/runtime-*.log`, `stderr.log` and, if they exist, `crash.log`, `hang.log` and `exit.log`.
+Also attach the files the game writes in `sdmc:/switch/LostOdysseyRecomp/`: `state/logs/runtime-*.log`, `stderr.log`, `early_boot.log` and, if they exist, `exit.log`, `crash.log` and `hang.log`.
 
-For a problem while playing, also zip the `save/` folder (your saves) and say which slot it happens on. Don't attach the game's disc files (`game/`).
-
-Questions and help: the [Discord](https://discord.gg/z2yPct6z2w).
+Don't attach the game's disc files (`game/`).
 
 ## For developers
 
-- [docs/SWITCH.md](docs/SWITCH.md): building the Switch version, how the port works, the deko3d back end, logs and diagnostics.
-- **Debug server and benchmarks:** `tools/switch/lo_debug.py` deploys builds and reads logs, screenshots and input over the local network. `tools/switch/bench.py` runs scripted benchmarks hands-free.
-- [docs/SWITCH-PGO.md](docs/SWITCH-PGO.md): the profile-guided build.
-- [docs/SWITCH-BENCHMARKS.md](docs/SWITCH-BENCHMARKS.md): every optimization, with its numbers.
+Building needs devkitPro with the [ounce devkit](https://github.com/ouncebrew/ounce-devkit) (libounce, OunceVK) installed. Generate the recompiled game code first, as described in [docs/SWITCH.md](docs/SWITCH.md) (the generated `LostOdysseyRecompLib/ppc` sources are not in the repository). Then:
 
-This repository also carries the rest of upstream's source, so the PC, macOS and Android versions still build from it. For those, use [freefrank/LostOdysseyRecomp](https://github.com/freefrank/LostOdysseyRecomp).
+```sh
+export DEVKITPRO=/opt/devkitpro
+. /opt/devkitpro/switch2vars.sh
+cmake -B build -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_TOOLCHAIN_FILE=/opt/devkitpro/libounce/cmake/Switch2.cmake
+cmake --build build -j
+```
+
+The NRO is `build/LostOdysseyRecomp/LostOdysseyRecomp.nro`. Switch 2 code is under `LO_TARGET_SWITCH2` / `__SWITCH2__`; the plume changes are kept as patches in `tools/patches/`.
+
+Switch 2 specifics worth knowing:
+
+- **Memory:** kaiHEN masks the memory-mapping syscalls, so guest memory is one heap block (`Backend::Heap`), not mirrored views.
+- **kaiHEN's R hook:** never send `SetCurrentProcess` (or any identity request) on a session from `smGetService` on Switch 2. Those sessions are libounce overrides shared with kaiHEN, and doing so breaks the R → Homebrew Menu hook until a reboot. The SD card is opened with `fsOpenSdCardFileSystem` instead.
+- **Clears:** NVK writes every rectangle of one `vkCmdClearAttachments` into a single 64 KiB command block. More than 2730 rectangles overrun it and stop the GPU, so the renderer merges clear rectangles and issues at most 80 per call.
+- **Diagnostics:** on a GPU stop the runtime log lists the last GPU batches and their operations, and `stderr.log` gets the GPU channel's error type (`[gpu channel]`).
+
+This repository also carries the rest of upstream's source, so the PC, macOS and Android versions still build from it. For those, use [freefrank/LostOdysseyRecomp](https://github.com/freefrank/LostOdysseyRecomp). For the Switch 1 version, use [Ad0ky/LostOdysseyRecomp](https://github.com/Ad0ky/LostOdysseyRecomp).
 
 ## Credits
 
-- **Switch port:** [Ad0ky](https://github.com/Ad0ky) and [depende3000](https://github.com/depende3000).
-- **Lost Odyssey Recomp:** [freefrank](https://github.com/freefrank) and its contributors: [MikeRavenelle](https://github.com/MikeRavenelle), [dj5927](https://github.com/dj5927), [Xarishark](https://github.com/Xarishark), [navjack](https://github.com/navjack), [frankzzz](https://github.com/frankzzz), [cngjd](https://github.com/cngjd) and [faisalkindi](https://github.com/faisalkindi).
-- **Research and tools:**
-  - [UnleashedRecomp](https://github.com/hedge-dev/UnleashedRecomp), [XenonRecomp](https://github.com/hedge-dev/XenonRecomp), [XenosRecomp](https://github.com/hedge-dev/XenosRecomp), [re:Blue](https://github.com/zolaware/reblue), [plume](https://github.com/renderbag/plume) and [Xenia](https://github.com/xenia-project/xenia);
-  - on the Switch: [devkitPro](https://devkitpro.org), [libnx](https://github.com/switchbrew/libnx), [deko3d](https://github.com/devkitPro/deko3d) and [Atmosphère](https://github.com/Atmosphere-NX/Atmosphere).
-- **Upscaling:** thanks to AMD for [FidelityFX Super Resolution 1](https://github.com/GPUOpen-Effects/FidelityFX-FSR) (MIT), the FSR option on the Switch. Its shader port follows the deko3d one in [SwitchWakerHD](https://github.com/centollOS/SwitchWakerHD), whose debug server the Switch build's also follows.
+- **Switch 2 port:** [Jorsall1](https://github.com/Jorsall1).
+- **Switch port**, which this port is built on: [Ad0ky](https://github.com/Ad0ky) and [depende3000](https://github.com/depende3000), in [Ad0ky/LostOdysseyRecomp](https://github.com/Ad0ky/LostOdysseyRecomp).
+- **Lost Odyssey Recomp**, the original recompilation: [freefrank](https://github.com/freefrank), in [freefrank/LostOdysseyRecomp](https://github.com/freefrank/LostOdysseyRecomp), and its contributors: [MikeRavenelle](https://github.com/MikeRavenelle), [dj5927](https://github.com/dj5927), [Xarishark](https://github.com/Xarishark), [navjack](https://github.com/navjack), [frankzzz](https://github.com/frankzzz), [cngjd](https://github.com/cngjd) and [faisalkindi](https://github.com/faisalkindi).
+- **Switch 2 homebrew:** [ouncebrew](https://github.com/ouncebrew) for [kaiHEN](https://github.com/ouncebrew/kaihen), [libounce](https://github.com/ouncebrew/libounce), [OunceVK](https://github.com/ouncebrew/ouncevk) and the [ounce devkit](https://github.com/ouncebrew/ounce-devkit).
+- **Research and tools:** [UnleashedRecomp](https://github.com/hedge-dev/UnleashedRecomp), [XenonRecomp](https://github.com/hedge-dev/XenonRecomp), [XenosRecomp](https://github.com/hedge-dev/XenosRecomp), [re:Blue](https://github.com/zolaware/reblue), [plume](https://github.com/renderbag/plume), [Xenia](https://github.com/xenia-project/xenia), [devkitPro](https://devkitpro.org) and [Mesa](https://mesa3d.org) (NVK).
+- **Upscaling:** thanks to AMD for [FidelityFX Super Resolution 1](https://github.com/GPUOpen-Effects/FidelityFX-FSR) (MIT).
 - **Audio** uses the [Xenia FFmpeg fork](https://github.com/xenia-project/FFmpeg) ([license](thirdparty/ffmpeg-LICENSE.txt)).
 
 Lost Odyssey and its assets belong to their respective owners. This is an unofficial, non-commercial project under the GPL-3.0; dependencies keep their own licenses. Use data from discs you own, and don't commit game executables, archives, textures, audio, video, generated game code or captures to this repository.

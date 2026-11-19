@@ -1,0 +1,29 @@
+================================================================================
+LostOdysseyRecomp - Nintendo Switch 2 port
+Summary - TURN 69: README rewritten for the Switch 2 port and pushed
+================================================================================
+No code changes. NRO unchanged (turn 68, md5 ce75f6cc...).
+STATE FOUND
+  * origin = github.com/Jorsall1/LostOdysseyRecomp (fork of Ad0ky's), default
+    branch switch2-ouncevk, already in sync with local (7f04f541, tag
+    switch2-turn67-stable, release "Alpha / Turn 67" with
+    LostOdysseyRecomp-Switch2-v0.1.0.zip). The README there was still the
+    Switch 1 (deko3d, 30 FPS) one.
+CHANGE: README.md (switch2-ouncevk)
+  * Switch 2 title, badges and links to Jorsall1's releases/issues.
+  * Credits: Switch 2 port Jorsall1; Switch port Ad0ky + depende3000 linked to
+    github.com/Ad0ky/LostOdysseyRecomp; original recomp freefrank linked to
+    github.com/freefrank/LostOdysseyRecomp (+ its contributors); ouncebrew
+    (kaiHEN, libounce, OunceVK, ounce-devkit); upstream tools.
+  * Performance from our HW logs (handheld 561/1101 MHz): fields 60 FPS up to
+    1920x1080 (turn 67/68 log), Main Street 52-59 FPS at the 576 floor (turn
+    57), fixed 1080 no DR 51-57 FPS. Docked marked as not benchmarked.
+  * Install steps from the release notes (kaiHEN title takeover, shaders/),
+    Settings (DR 576-1080 handheld, 720-1440 docked, FSR, effect budget),
+    env.txt = LO_GUEST_AFFINITY=1, report checklist, build commands
+    (Switch2.cmake toolchain), Switch 2 notes (heap backend, no
+    SetCurrentProcess on sm sessions, clear split/merge, GPU-stop logs).
+  * Switch 1 screenshots and the Discord link removed (not Switch 2 / not
+    this fork's).
+NOT CHANGED: the GitHub release text, docs/INSTALL-SWITCH.md (Switch 1).
+================================================================================
