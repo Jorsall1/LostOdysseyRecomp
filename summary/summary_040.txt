@@ -1,0 +1,26 @@
+================================================================================
+LostOdysseyRecomp - Nintendo Switch 2 port
+Summary - TURN 40: DLSS availability and upscaling check (no code changes)
+================================================================================
+DLSS
+  * No Switch 2 DLSS library on this machine: nothing named dlss/ngx in
+    /opt/devkitpro or elsewhere; libouncevk.a (Mesa NVK) has only the string
+    "dlss_backwards_compat", no NGX entry points. Nintendo's DLSS for Switch 2
+    ships with the official NVN SDK, which homebrew does not have.
+  * The project's DLSS code (gpu/dlss_*.cpp, cmake/LoDlss.cmake) is NVIDIA's
+    PC NGX SDK (Windows/Linux x86). Log: "DLSS P0: state=sdk_disabled
+    reason='built without LO_ENABLE_DLSS and a usable local NGX SDK'".
+UPSCALING (verified in code and runtime-1795055623434490.log)
+  * Path: dynamic resolution renders the scene at 576-1080 rows
+    (frame_plan.cpp DynamicHeight), video.cpp passes Graphics -> FSR /
+    FSR sharpness 88% (gpu/switch_upscaler.h FromSettings: EASU + RCAS 0.24
+    stops) to Presentation::Draw, which runs EASU to 1920x1080 then RCAS
+    whenever scale > 1.001 (presentation.cpp fsrUpscale).
+  * Log: "video: Switch upscaler fsr (RCAS 0.24 stops, from settings)",
+    "presentation: FSR 1 EASU + RCAS (1280x720 to 1920x1080 ...)", "FSR 1 off
+    (1920x1080 to 1920x1080)" at native height. The line prints only when the
+    mode changes, so the later 1024x576 -> 1920x1080 frames used EASU + RCAS
+    without a new line. Working as designed.
+  * It is spatial (FSR 1), not temporal. A temporal upscaler (FSR 2/3 class)
+    would need a Vulkan port of the PC path plus motion vectors on Switch 2
+    and costs GPU time per frame; not attempted.
