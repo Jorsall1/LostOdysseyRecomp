@@ -6581,14 +6581,29 @@ void main()
                 // is the size it supports, so calls carry at most 80 rectangles.
                 static constexpr size_t kMaxClearRects = 80;
                 thread_local std::vector<RenderRect> rects;
+                thread_local std::vector<DepthClearRect> merged;
                 for (const auto& op : ops) {
                     rects.clear();
-                    for (const auto& r : op.rects) rects.push_back({r.left, r.top, r.right, r.bottom});
-                    if (rects.size() > largestClearRects) {
-                        largestClearRects = rects.size();
+                    // Equal-value clears of a target append their rectangles to one op
+                    // (pending_clear::Queue::Record) until the target is used, so a
+                    // per-frame tile clear repeats the same rectangles: up to 49552 in
+                    // the 2026-11-19 turn 67 log. Every rectangle of an op has the same
+                    // value, so merging them (exact union, no holes filled) changes no
+                    // pixel and drops the repeats.
+                    if (op.rects.size() > kMaxClearRects) {
+                        merged.clear();
+                        for (const auto& r : op.rects) merged.push_back({r.left, r.top, r.right, r.bottom});
+                        CoalesceDepthClearRects(merged);
+                        for (const auto& r : merged) rects.push_back({r.left, r.top, r.right, r.bottom});
+                        // Only empty rectangles: nothing to clear (an empty list would mean the whole target).
+                        if (rects.empty()) continue;
+                    } else
+                        for (const auto& r : op.rects) rects.push_back({r.left, r.top, r.right, r.bottom});
+                    if (op.rects.size() > largestClearRects) {
+                        largestClearRects = op.rects.size();
                         if (largestClearRects > kMaxClearRects)
-                            LOG_INFO("renderer: clear of {} rectangles split into {} calls of at most {} (largest so far)",
-                                largestClearRects, (largestClearRects + kMaxClearRects - 1) / kMaxClearRects, kMaxClearRects);
+                            LOG_INFO("renderer: clear of {} rectangles ({} after merging) split into {} calls of at most {} (largest so far)",
+                                largestClearRects, rects.size(), (rects.size() + kMaxClearRects - 1) / kMaxClearRects, kMaxClearRects);
                     }
                     const bool depth = IsDepthTarget(tex);
                     if (depth && traceClearCall)

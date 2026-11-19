@@ -1,0 +1,55 @@
+================================================================================
+LostOdysseyRecomp - Nintendo Switch 2 port
+Summary - TURN 68: turn 67 confirmed on HW (no GPU stop, Settings changes OK);
+huge clears now merged; Settings overlay band copy restored; review of the
+GPU-stop workarounds from turns 35-66
+================================================================================
+Build: NRO md5 ce75f6ccf2a64d254b7cec472ba429f9 (Desktop copy matches).
+ELF build/clearmerge_turn68.elf. kaiHEN fix untouched. Not on HW yet.
+LOG READ (Desktop\lo project, runtime-1795125873437932.log, turn 67 NRO,
+  handheld, 190 s, env LO_GUEST_AFFINITY=1, clean HOME -> X exit)
+  * No GPU stop. Settings saved three times (DR off + bilinear 1080, overlay
+    on, DR + FSR back on); resolution changes 1856..1080..1216 all fine.
+  * Overrun confirmed: "clear of N rectangles" maxima 16188, 20748, 46740,
+    49552 (limit before the fix: 2730). So the 738 refusals, the "completion
+    join failed status 7" stops and the PBDMA errors since turn 35 were all
+    NVK writing clear commands past its 64 KiB command block.
+  * Perf: field 60 FPS with DR + FSR (scene up to 1920x1080, gpu 10-13 ms).
+    DR off at fixed 1080 / bilinear: 51-57 FPS (gpu 14.5 ms, batch max 22).
+    Settings open: 70-90 ms frames, present_ms 64-66 (CPU raster of the
+    menu at output size), only while the menu is up.
+CHANGES
+  1. gpu/renderer.cpp ReplayClears: an op with more than 80 rects is merged
+     with CoalesceDepthClearRects (exact union; all rects of an op share one
+     value) before splitting. Cause of the huge counts: Queue::Record appends
+     equal-value clears to one op until the target is used, so per-frame tile
+     clears repeat. Host check on mapped + repeated rect sets: 2865 -> 61,
+     5660 -> 45, 7806 -> 113; 2000 random cases, pixel coverage identical.
+     An op whose rects are all empty is skipped (an empty list would mean
+     the whole target). Log line now "clear of N rectangles (M after
+     merging) split into K calls".
+  2. gpu/video.cpp DrawSettingsOverlay: copies only the band of changed rows
+     again (reverts turn 48, which removed it as a GPU-stop suspect).
+WORKAROUND REVIEW (added while chasing the stops)
+  Already back / kept on purpose:
+  * Restore skip + blit resolve (off in turn 47, back on in turn 53).
+  * Batch split every 1024 draws (turn 35): 2048 tested in turn 57, no gain.
+  * Upload split 96 uploads / 24 MiB (turn 36): rare, cheap, keeps batches
+    small. Kept.
+  * Released targets kept until the next resize (turn 45): tens of MiB, VRAM
+    1393 of 7017 MiB. Harmless, kept.
+  * Framebuffer extent = min of colour and depth (turn 49), transfer
+    constants before Begin (turn 60), 512 MiB vertex clamp (turn 63): real
+    Vulkan correctness fixes. Kept.
+  * OunceVK 20261118 (turn 62), channel error tap (turn 64), batch/op dump
+    (turns 50, 65): kept; the op ring is lock-free since turn 57.
+  * Light-screen DR hold (turn 43): avoids rebuild hitches. Kept.
+  Restored this turn: Settings band copy (turn 48).
+  Nothing else was removed for the stops. sdmc:/config/ouncevk/debug-sync.txt
+  is gone (no "native debug sync" line in stderr).
+TESTS: pending_clear_test, depth_clear_layout_test pass; coverage check
+  above; Switch 2 build ok.
+NEXT (user): normal play with this NRO (same env.txt). Check for "after
+  merging" lines and any hitches when a big clear happens.
+  Open item: Settings menu raster 64-66 ms per change at 1080p.
+================================================================================
