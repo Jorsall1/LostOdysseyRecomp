@@ -123,10 +123,6 @@ inline bool FsrSharpnessFromEnvironment()
 // Whether dynamic resolution and FSR run with these settings and env.txt.
 inline bool DynamicResolutionOn(const Config& config)
 {
-#if defined(__SWITCH2__)
-    (void)config;
-    return false; // removed on Switch 2 (gpu/frame_plan.cpp)
-#endif
     return DynamicResolutionFromEnvironment() ? gpu::dynamic_resolution::EnvironmentEnabled() == 1 : config.dynamicResolution;
 }
 inline bool FsrOn(const Config& config)
@@ -139,7 +135,8 @@ inline bool FsrOn(const Config& config)
 // for weak hardware, Original keeps their retail state.
 #if LO_PLATFORM_SWITCH
 // The Switch's presets with FSR on (it scales the scene rows to the screen), at the console's rate: 30 FPS on
-// Switch 1, 60 on Switch 2 (1440 rows docked, 1080 handheld):
+// Switch 1, 60 on Switch 2. On Switch 2 every preset is dynamic over the Automatic range (1080 -> 576 rows
+// handheld, 1440 -> 1152 docked) and they differ in effects only. Switch 1:
 //   Quality      a fixed scene at the Automatic height, every effect;
 //   Balanced     dynamic resolution 360 rows to the Automatic height, depth of field at 50%, no bloom (the default,
 //                Config's own values);
@@ -151,9 +148,11 @@ inline void ApplyPreset(Config& config, Preset preset)
 {
     const bool low = preset == Preset::Performance;
 #ifdef __SWITCH2__
-    // Switch 2: every preset renders a fixed scene height (no mid-battle target rebuilds, 2026-11-18).
-    const bool dynamic = false;
+    // Switch 2: every preset is dynamic over the Automatic range (minimum 0: SwitchAutomaticMinimum).
+    const bool dynamic = true;
+    constexpr uint32_t presetMinimum = 0;
 #else
+    constexpr uint32_t presetMinimum = SwitchPresetMinimumHeight;
     const bool dynamic = preset != Preset::Quality;
 #endif
 #ifdef __SWITCH2__
@@ -170,7 +169,7 @@ inline void ApplyPreset(Config& config, Preset preset)
     for (uint32_t mode = 0; mode < 2; ++mode)
     {
         config.maximumHeight[mode] = 0;
-        config.minimumHeight[mode] = dynamic ? SwitchPresetMinimumHeight : 0;
+        config.minimumHeight[mode] = dynamic ? presetMinimum : 0;
     }
 }
 inline constexpr Preset PresetChoices[] = {Preset::Quality, Preset::Balanced, Preset::Performance};

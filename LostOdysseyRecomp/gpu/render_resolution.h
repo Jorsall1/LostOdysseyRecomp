@@ -83,17 +83,37 @@ inline constexpr uint32_t Scale(uint32_t guest, uint32_t internalHeight) {
 inline constexpr uint32_t ScaleX(uint32_t guest, uint32_t internalWidth) {
     return uint32_t((uint64_t(guest) * internalWidth + 640) / 1280);
 }
-inline constexpr Size TargetSize(uint32_t pitch, uint32_t height, Size internal) {
+// The shadow map's EDRAM family: the 880-pixel pitch that backs the 864-square
+// ShadowDepthRT/Z atlas (padded to 896 rows) and its 440 half. The shadow pass
+// binds a colour surface of that pitch beside its depth (depth only, colour
+// masked); it is not in the surface catalog, so it took the scene scale
+// (Switch 2, 2026-11-18: guest=880x896 physical=1320x1344 next to an 880x896
+// shadow depth) and was rebuilt at every dynamic resolution step. No scene
+// surface has these pitches (1280 and its halves, 640 and 320).
+inline constexpr bool ShadowFamilySurface(uint32_t pitch, uint32_t height) {
+    return (pitch == 880 || pitch == 440) && height <= 896;
+}
+// Switch 2 keeps that family at its guest size by default (LO_SHADOW_COLOR_SCALED=1
+// restores the scene scale for A/B runs). Elsewhere it scales as before.
+#ifdef __SWITCH2__
+inline constexpr bool kShadowFamilyUnscaled = true;
+#else
+inline constexpr bool kShadowFamilyUnscaled = false;
+#endif
+inline constexpr Size TargetSize(uint32_t pitch, uint32_t height, Size internal, bool shadowFamilyUnscaled = kShadowFamilyUnscaled) {
     // Square EDRAM surfaces include shadow maps and luminance reductions. Their
     // texture resolution is independent of the scene's output resolution.
     if (pitch == height || ScaleX(pitch, internal.width) > 16384 || Scale(height, internal.height) > 16384)
+        return {};
+    if (shadowFamilyUnscaled && ShadowFamilySurface(pitch, height))
         return {};
     return internal;
 }
 // Catalogued scene surfaces use both dimensions of the CPU frame plan. Fixed
 // surfaces retain their guest texels. Until the catalog proves a role, retain
 // the historical isotropic height scale rather than widening by output aspect.
-inline constexpr Size TargetSizeForRole(TargetRole role, uint32_t pitch, uint32_t height, Size plan) {
+inline constexpr Size TargetSizeForRole(TargetRole role, uint32_t pitch, uint32_t height, Size plan,
+                                        bool shadowFamilyUnscaled = kShadowFamilyUnscaled) {
     switch (role) {
     case TargetRole::Scene: return plan;
     case TargetRole::Fixed: case TargetRole::Shadow: return {};
@@ -101,7 +121,7 @@ inline constexpr Size TargetSizeForRole(TargetRole role, uint32_t pitch, uint32_
         // Scale by the plan's 16:9 area, which is its full height only on
         // outputs at least as wide as 16:9.
         const uint32_t area = (std::min)(plan.height, uint32_t((uint64_t(plan.width) * 9) / 16));
-        return TargetSize(pitch, height, { uint32_t((uint64_t(area) * 16) / 9), area });
+        return TargetSize(pitch, height, { uint32_t((uint64_t(area) * 16) / 9), area }, shadowFamilyUnscaled);
     }
     }
     return {};
@@ -109,12 +129,13 @@ inline constexpr Size TargetSizeForRole(TargetRole role, uint32_t pitch, uint32_
 // A plan may carry a sub-720 official DLSS input. Only catalogued Scene targets
 // receive that size; Fixed and Unknown retain their legacy mappings and never
 // invent an aspect ratio from a rounded recommended input.
-inline constexpr Size TargetSizeForPlan(TargetRole role, uint32_t pitch, uint32_t height, Size input, Size legacy, uint32_t shadowMultiplier = 1) {
+inline constexpr Size TargetSizeForPlan(TargetRole role, uint32_t pitch, uint32_t height, Size input, Size legacy, uint32_t shadowMultiplier = 1,
+                                        bool shadowFamilyUnscaled = kShadowFamilyUnscaled) {
     if (role == TargetRole::Shadow) {
         const auto scale = ShadowMultiplier(shadowMultiplier);
         return {1280 * scale, 720 * scale};
     }
-    return role == TargetRole::Scene ? input : TargetSizeForRole(role, pitch, height, legacy);
+    return role == TargetRole::Scene ? input : TargetSizeForRole(role, pitch, height, legacy, shadowFamilyUnscaled);
 }
 inline constexpr uint32_t TargetHeight(uint32_t pitch, uint32_t height, uint32_t internalHeight) {
     return TargetSize(pitch, height, {uint32_t((uint64_t(internalHeight) * 16) / 9), internalHeight}).height;

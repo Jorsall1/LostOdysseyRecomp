@@ -131,6 +131,8 @@ namespace gpu::renderer
     bool AcquireFgCompositeInputs(uint32_t physicalAddress, frame_generation::CompositeHandoff& handoff);
     // Diagnostic invalidation only. Submitted copies retain their GPU-slot owners.
     void CancelFgHandoffs();
+    // Error lines with the last renderer batches (gpu/submission_ring.h): video::StopGpuWork, once.
+    void LogSubmissionRing();
     // Same renderer/presentation thread, after XE_SWAP Flush and acquisition.
     // True only for a full resolve of the actual processed scene target in the
     // just-completed frame; stale surfaces and unrecognized paths return false.

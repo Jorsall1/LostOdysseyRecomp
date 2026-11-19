@@ -1854,6 +1854,7 @@ namespace gpu::video
             dred::LogRemovedDevice(static_cast<plume::D3D12Device*>(g_device.get())->d3d);
 #endif
 #if !defined(LO_VIDEO_SUBMISSION_UNIT)
+        if (first) renderer::LogSubmissionRing();
         g_fgPresent.CancelAll(frame_generation::HandoffCancel::DeviceLost);
         renderer::CancelFgHandoffs();
 #endif

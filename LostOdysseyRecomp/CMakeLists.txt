@@ -851,6 +851,13 @@ add_executable(LoTargetMappingTest EXCLUDE_FROM_ALL ${CMAKE_SOURCE_DIR}/tools/te
 target_include_directories(LoTargetMappingTest PRIVATE ${LO_RUNTIME_ROOT})
 target_compile_features(LoTargetMappingTest PRIVATE cxx_std_20)
 
+# Turn 35 (Switch 2 60 FPS): header-only fixtures; build them with or without -D__SWITCH2__.
+foreach(lo_test IN ITEMS gpu_busy dynamic_resolution submission_ring pass_timing host_cores title_policy)
+    add_executable(Lo_${lo_test}_test EXCLUDE_FROM_ALL ${CMAKE_SOURCE_DIR}/tools/tests/${lo_test}_test.cpp)
+    target_include_directories(Lo_${lo_test}_test PRIVATE ${LO_RUNTIME_ROOT})
+    target_compile_features(Lo_${lo_test}_test PRIVATE cxx_std_20)
+endforeach()
+
 add_executable(LoTemporalSceneTest EXCLUDE_FROM_ALL ${CMAKE_SOURCE_DIR}/tools/tests/temporal_scene_test.cpp)
 target_include_directories(LoTemporalSceneTest PRIVATE ${LO_RUNTIME_ROOT})
 target_compile_features(LoTemporalSceneTest PRIVATE cxx_std_20)

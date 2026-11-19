@@ -75,13 +75,17 @@ uint32_t SwitchMaximumHeight(const Config &config, bool docked)
 uint32_t SwitchMinimumHeight(const Config &config, bool docked)
 {
     const uint32_t base = SwitchMaximumHeight(config, docked);
-    const uint32_t minimum = config.minimumHeight[docked ? 1 : 0];
+    uint32_t minimum = config.minimumHeight[docked ? 1 : 0];
+    if (!minimum) minimum = std::min(SwitchAutomaticMinimum(docked), base);
     return gpu::dynamic_resolution::Floor(base, minimum ? minimum : gpu::dynamic_resolution::DefaultMinimum(base));
 }
 uint32_t DynamicResolutionMinimum(const Config &config)
 {
 #if LO_PLATFORM_SWITCH
-    return config.minimumHeight[Docked() ? 1 : 0];
+    // 0: the automatic minimum (SwitchAutomaticMinimum on Switch 2, else 80% of the scene height).
+    const bool docked = Docked();
+    if (const uint32_t minimum = config.minimumHeight[docked ? 1 : 0]) return minimum;
+    return std::min(SwitchAutomaticMinimum(docked), SwitchMaximumHeight(config, docked));
 #else
     (void)config;
     return 0;
@@ -203,8 +207,9 @@ Config Validate(Config value)
     // The scene renders at Graphics → Maximum resolution for the current mode:
     // automatically 960x540 in both modes (the GPU-bound console gains about a
     // third in battle; 720p docked is a choice, not yet tested with deko3d); the
-    // final pass scales to the 720p output (bilinear, or FSR 1). Switch 2 renders 1440 rows docked (supersampled
-    // down to its 1920x1080 output) and 1080 rows on its 1080p handheld screen.
+    // final pass scales to the 720p output (bilinear, or FSR 1). Switch 2 renders at most 1440 rows docked (its
+    // 2560x1440 output) and 1080 rows on its 1080p handheld screen, with dynamic resolution down to 1152 / 576
+    // rows (SwitchAutomaticMinimum) and FSR 1 below native.
     // gpu/video.cpp re-applies this when the console is docked or undocked.
     // LO_SWITCH_RENDER_HEIGHT (env.txt, RenderHeightOverride) wins over the menu.
     for (uint32_t *heights : {value.maximumHeight, value.minimumHeight})
@@ -216,8 +221,8 @@ Config Validate(Config value)
         value.minimumHeight[mode] = std::min(value.minimumHeight[mode], SwitchMaximumHeight(value, mode == 1));
 #if defined(__SWITCH2__)
     // The output size, not the scene. The handheld screen is 1920x1080 and the
-    // docked output 2560x1440, while the scene still renders at the Maximum
-    // resolution rows above (1080 rows handheld, 1440 docked). SDL's Switch
+    // docked output 2560x1440, while the scene renders at the Maximum
+    // resolution rows above, or below them with dynamic resolution. SDL's Switch
     // driver forwards the window size to libnx's nwindow, which is what the
     // Vulkan swap chain reads (thirdparty/plume/plume_vulkan.cpp), so this is
     // the whole output path. gpu/video.cpp re-applies it on dock/undock through
@@ -225,14 +230,7 @@ Config Validate(Config value)
     value.width = Docked() ? 2560u : 1920u;
     value.height = Docked() ? 1440u : 1080u;
 #endif
-#if defined(__SWITCH2__)
-    // Locked scene height (2026-11-18): 1080 rows handheld, 1440 docked (SwitchAutomaticHeight). A saved
-    // settings.ini's Maximum/Minimum resolution and dynamic resolution no longer apply.
-    value.dynamicResolution = false;
-    for (uint32_t mode = 0; mode < 2; ++mode)
-        value.maximumHeight[mode] = value.minimumHeight[mode] = 0;
-    value.frameRate = 60;
-#endif
+
     if (const uint32_t rows = RenderHeightOverride()) value.internalResolution = int(rows);
     else value.internalResolution = int(SwitchMaximumHeight(value, Docked()));
     value.shadowResolution = 1;
@@ -293,6 +291,7 @@ Config Read()
     bool hasHdrPeakAuto = false, hasHdrPeakNits = false, hasAspectRatio = false, hasVsync = false;
     bool hasLanguageChosen = false;
     bool hasSwitchFsr = false;
+    uint32_t resolutionLayout = 0;
     const auto path = os::user_paths::SettingsPath();
     std::ifstream input(path);
     std::string key;
@@ -492,6 +491,8 @@ Config Read()
             hasSwitchFsr = true;
             value.switchFsr = number == 1;
         }
+        else if (key == "resolution_layout")
+            resolutionLayout = number;
         else if (key == "dynamic_resolution" && number <= 1)
             value.dynamicResolution = number == 1;
         else if (key == "maximum_height_handheld" || key == "maximum_height_docked")
@@ -552,9 +553,25 @@ Config Read()
 #if LO_PLATFORM_SWITCH
     // Files from before the FSR row saved fsr_sharpness=0 while the row was hidden: take the Switch's default.
     if (!hasSwitchFsr) value.fsrSharpnessPercent = Config{}.fsrSharpnessPercent;
+#if defined(__SWITCH2__)
+    // Before layout 2 (turn 35) the Switch 2 build forced dynamic resolution off and the heights to Automatic,
+    // and saved them so whatever the player had picked: those values were never a choice. Take the new defaults
+    // (dynamic, 1080 -> 576 handheld, 1440 -> 1152 docked) once; later saves carry layout 2 and are kept.
+    if (resolutionLayout < 2)
+    {
+        const Config defaults;
+        value.dynamicResolution = defaults.dynamicResolution;
+        for (uint32_t mode = 0; mode < 2; ++mode)
+        {
+            value.maximumHeight[mode] = defaults.maximumHeight[mode];
+            value.minimumHeight[mode] = defaults.minimumHeight[mode];
+        }
+    }
+#endif
     FollowSystemLanguage(value);
 #endif
     (void)hasSwitchFsr;
+    (void)resolutionLayout;
     return Validate(value);
 }
 Config &Current()
@@ -730,6 +747,7 @@ static bool WriteConfig(const Config &value)
            << "\ndebug_deko3d_vs_outputs=" << (debug.deko3dVsOutputs ? 1 : 0)
            << "\ndebug_server=" << (debug.debugServer ? 1 : 0)
            << "\nswitch_fsr=" << (value.switchFsr ? 1 : 0)
+           << "\nresolution_layout=2"
            << "\ndynamic_resolution=" << (value.dynamicResolution ? 1 : 0)
            << "\nmaximum_height_handheld=" << value.maximumHeight[0]
            << "\nmaximum_height_docked=" << value.maximumHeight[1]

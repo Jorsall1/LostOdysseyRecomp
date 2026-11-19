@@ -85,6 +85,12 @@ namespace os::switch_platform
     void PinCurrentThread(int core);
     void SleepNanoseconds(int64_t nanoseconds);
 
+    // The cores this process may use (svcGetInfo InfoType_CoreMask; 0 if unknown). The Switch 2 under kaiHEN
+    // reports 0x3f: cores 3-5 as well as the 0-2 the guest threads use (LO_GUEST_AFFINITY).
+    uint64_t ProcessCoreMask();
+    // Restricts the calling thread to `mask` (ideal core: its lowest). False if the kernel refused.
+    bool RestrictCurrentThreadToCores(uint64_t mask);
+
     // Appends to a file in the app folder through a file system session of this module's own, opened
     // in Initialize: no newlib, no allocation and none of libnx's shared file system sessions, so it
     // still works when the rest of the process's file access is stuck (crash handler, hang watchdog).

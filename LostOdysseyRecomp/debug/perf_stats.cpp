@@ -356,6 +356,10 @@ void MonitorMain()
         std::string gpu = gpuNs && frames
             ? fmt::format("gpu_ms={:.1f} gpu_pct={:.0f}", Ms(gpuNs) / frames, 100.0 * double(gpuNs) / (seconds * 1e9))
             : std::string("gpu_ms=- gpu_pct=-");
+        // The longest single GPU batch in the window (gpu_busy.h): a long submission is the first suspect for a
+        // device loss (2026-11-18, docked 1440p).
+        if (const uint64_t batchNs = gpu::gpu_busy::TakeMaxBatchNs())
+            gpu += fmt::format(" gpu_batch_max_ms={:.1f}", Ms(batchNs));
         std::string console;
 #if LO_PLATFORM_SWITCH
         if (SampleThreads(threadsAfter, false))
@@ -698,6 +702,7 @@ void SceneSize(uint32_t width, uint32_t height)
 {
     g_sceneSize.store(uint64_t(width) << 32 | height, std::memory_order_relaxed);
 }
+uint64_t CurrentSceneSize() { return g_sceneSize.load(std::memory_order_relaxed); }
 
 std::string MapName() { return MapText(); }
 

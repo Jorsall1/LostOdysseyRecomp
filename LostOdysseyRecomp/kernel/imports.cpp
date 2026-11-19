@@ -217,7 +217,9 @@ namespace HangWatch
 #if LO_PLATFORM_SWITCH
         os::switch_cpu_profiler::TryGetCurrentThreadName(name, sizeof(name));
 #endif
-        LOG_WARNING("watch: {} {:#x} by [{}] t{:04x} pcr={:#x} lr={:#x}{}", operation, key, name,
+        // A notice, not a warning (debug audit, turn 35): warnings go to the SD card before Log() returns, and these
+        // come from guest threads in their waits. The queued writer and the crash/exit drains still record them.
+        LOG_NOTICE("watch: {} {:#x} by [{}] t{:04x} pcr={:#x} lr={:#x}{}", operation, key, name,
             os::logger::ThreadTag(), g_ppcContext ? g_ppcContext->r13.u32 : 0,
             g_ppcContext ? uint32_t(g_ppcContext->lr) : 0,
             count + 1 == kLogsPerObject ? " (last line for this object)" : "");
@@ -639,6 +641,17 @@ void DumpGuestAliasUsage()
 void LogStutterSample(int sample, uint32_t hitches)
 {
     LOG_WARNING("stutter sample {}: {} hitches in under 3 s (last {})", sample, hitches, perf_stats::LastPerfLine());
+}
+// Applet events in the runtime log (os/switch/switch_runtime.cpp): HOME menu, sleep, focus and dock changes, with
+// the scene size at the time (2026-11-18: a device loss came after a dock and a sleep the log never mentioned).
+void LogAppletEvent(const char* what, uint64_t suspendedMs)
+{
+    const uint64_t scene = perf_stats::CurrentSceneSize();
+    const uint32_t width = uint32_t(scene >> 32), height = uint32_t(scene);
+    if (suspendedMs)
+        LOG_NOTICE("applet: {} (suspended {} ms; scene {}x{})", what, suspendedMs, width, height);
+    else
+        LOG_NOTICE("applet: {} (scene {}x{})", what, width, height);
 }
 #endif
 static inline void CloseKernelObject(XDISPATCHER_HEADER& header)

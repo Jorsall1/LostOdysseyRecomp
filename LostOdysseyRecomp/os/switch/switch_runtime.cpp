@@ -6,6 +6,7 @@
 #include <os/netlog.h>
 #include <os/switch_platform.h>
 #include <os/switch_cpu_profiler.h>
+#include <os/suspend_clock.h>
 #include <switch.h>
 #include <switch/runtime/env.h>
 #include <sys/iosupport.h>
@@ -76,6 +77,7 @@ void DumpFenceWaiters();                              // cpu/poll_wait.cpp: open
 void LogStutterSample(int sample, uint32_t hitches);  // kernel/imports.cpp: the runtime-log header of a stutter sample
 namespace perf_stats { uint32_t HitchCount(); }      // debug/perf_stats.cpp: hitches since the start
 namespace movie { uint32_t NativeMovieStallMs(); void LogNativeMovieState(); } // movie/movie_hooks.cpp
+void LogAppletEvent(const char* what, uint64_t suspendedMs); // kernel/imports.cpp: an applet line in the runtime log
 
 namespace os::switch_platform
 {
@@ -113,7 +115,19 @@ void OnAppletEvent(AppletHookType hook, void*)
     if (hook == AppletHookType_OnExitRequest)
         g_homeCloseRequested.store(true, std::memory_order_release);
     if (hook == AppletHookType_OnOperationMode)
+    {
         g_operationModeChanged.store(true, std::memory_order_release);
+        LogAppletEvent(appletGetOperationMode() == AppletOperationMode_Console ? "docked" : "handheld", 0);
+    }
+    if (hook == AppletHookType_OnFocusState)
+    {
+        const AppletFocusState focus = appletGetFocusState();
+        LogAppletEvent(focus == AppletFocusState_InFocus ? "in focus" :
+                       focus == AppletFocusState_OutOfFocus ? "out of focus (library applet)" :
+                       "in the background (HOME menu or sleep)", 0);
+    }
+    if (hook == AppletHookType_OnResume)
+        LogAppletEvent("resumed", 0);
     // A game started docked gets the handheld GPU configuration when it is first undocked.
     if (hook == AppletHookType_OnPerformanceMode && appletGetPerformanceMode() == ApmPerformanceMode_Normal)
         StartBoostThread();
@@ -1653,13 +1667,36 @@ constexpr uint64_t kExitWatchPollNs = 100'000'000ull; // 100 ms
 constexpr auto kGuestDumpAfter = std::chrono::seconds(15);
 constexpr auto kSecondGuestDumpAfter = std::chrono::seconds(40);
 
+uint64_t SteadyNs()
+{
+    return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
 void ExitWatchdogMain(void*)
 {
     const auto started = std::chrono::steady_clock::now();
-    int guestDumps = 0;
+    // Debug audit (turn 35): the fixed 15 s / 40 s guest dumps (1.5 s of stack sampling, a C/E scan, synchronous
+    // warning lines) ran in every session. LO_GUEST_DUMPS=1 brings them back.
+    static const bool fixedDumps = [] {
+        const char* v = std::getenv("LO_GUEST_DUMPS");
+        return v && v[0] == '1';
+    }();
+    int guestDumps = fixedDumps ? 0 : 2;
+    // A poll that took over 2 s: the process was suspended (HOME menu, sleep mode). os/suspend_clock.h keeps the
+    // total so the movie watchdog and the movie status lines leave it out.
+    os::suspend_clock::Detector suspend;
+    suspend.period = kExitWatchPollNs;
     for (;;)
     {
         svcSleepThread(int64_t(kExitWatchPollNs)); // a kernel sleep: nothing else has to run
+        if (const uint64_t suspendedNs = suspend.Observe(SteadyNs()))
+        {
+            os::suspend_clock::Add(suspendedNs);
+            std::fprintf(stderr, "[watchdog] the process was suspended for %llu ms (HOME menu or sleep)\n",
+                         (unsigned long long)(suspendedNs / 1'000'000ull));
+            LogAppletEvent("suspended, now running again", suspendedNs / 1'000'000ull);
+        }
         const auto now = std::chrono::steady_clock::now();
         // The GPU-stall watchdog in gpu/command_processor.cpp only dumps when
         // swaps stop. A fade or loading bar that keeps presenting while the
@@ -1710,10 +1747,11 @@ void ExitWatchdogMain(void*)
         // command processor idle 43 ms of each, so the guest was late, not the
         // GPU): when 8 or more hitches come within 3 s, sample the guest stacks
         // (1.5 s), the fence waits and the C/E views. Three times at most, 30 s
-        // apart. LO_STUTTER_SAMPLES=0 turns it off.
+        // apart. Off by default since turn 35 (the sampling itself made hitches
+        // in a GPU-bound battle); LO_STUTTER_SAMPLES=1 turns it on.
         static const bool stutterSamples = [] {
             const char* v = std::getenv("LO_STUTTER_SAMPLES");
-            return !(v && v[0] == '0');
+            return v && v[0] == '1';
         }();
         static int stutterDumps = 0;
         static uint32_t hitchMark = 0;
@@ -1743,6 +1781,9 @@ void ExitWatchdogMain(void*)
                 std::fprintf(stderr, "[watchdog] stutter sample %d done\n", stutterDumps);
             }
         }
+        // The dumps above take seconds (1.5 s of stack sampling): not a suspension. appletMainLoop below may
+        // block while the game is in the background, and that time is one.
+        suspend.last = SteadyNs();
         // HOME -> X: am asks the applet to exit. SDL's Switch driver turns that
         // into SDL_EVENT_QUIT - the clean shutdown that logged exit_code=0 - but
         // only while the main loop pumps events, which a hung game never does;
@@ -1919,6 +1960,19 @@ void PinCurrentThread(int core)
 {
     if (R_SUCCEEDED(svcSetThreadCoreMask(CUR_THREAD_HANDLE, core, 1u << core)))
         g_pinnedThread.store(threadGetCurHandle(), std::memory_order_relaxed);
+}
+
+uint64_t ProcessCoreMask()
+{
+    u64 mask = 0;
+    return R_SUCCEEDED(svcGetInfo(&mask, InfoType_CoreMask, CUR_PROCESS_HANDLE, 0)) ? mask : 0;
+}
+
+bool RestrictCurrentThreadToCores(uint64_t mask)
+{
+    if (!mask) return false;
+    const s32 ideal = s32(__builtin_ctzll(mask));
+    return R_SUCCEEDED(svcSetThreadCoreMask(CUR_THREAD_HANDLE, ideal, u32(mask)));
 }
 
 void SetCurrentThreadPriority(int priority)

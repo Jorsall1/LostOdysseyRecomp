@@ -32,6 +32,8 @@ void CpIdle(uint64_t ns);
 void FrameDraws(uint32_t draws);
 // The scene's render size for the frame being planned.
 void SceneSize(uint32_t width, uint32_t height);
+// The last SceneSize, any thread (width << 32 | height; 0 before the first frame).
+uint64_t CurrentSceneSize();
 
 // For the performance overlay: draws since the start, and the GPU clock the perf line last read (MHz; 0 unknown).
 uint64_t TotalDraws();

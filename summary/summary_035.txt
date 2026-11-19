@@ -1,0 +1,136 @@
+================================================================================
+LostOdysseyRecomp - Nintendo Switch 2 port
+Summary - TURN 35: 60 FPS work (dynamic resolution back, true GPU time), device-loss
+forensics + shorter submissions, debug audit, Y: Settings on the title
+================================================================================
+Build: NRO md5 60d844ab551bd8fa927046236cb33ed5 (Desktop copy matches).
+ELF: build/fps_turn35_60d844ab.elf. kaiHEN fix untouched (RawInitialize still
+fsOpenSdCardFileSystem; no SetCurrentProcess on smGetService sessions).
+Desktop env.txt: LO_GUEST_AFFINITY=1 only (A/B lines commented out).
+NOT yet run on hardware: everything below is built and host-tested only.
+
+LOGS READ
+  A. runtime-1795039975443157.log (handheld, ~458 s): battles 20-22 FPS at a
+     fixed 1920x1080, gpu_ms 71-89 at gpu_pct ~158, cp_idle 0, Guest_Main
+     28-37 %. GPU-bound. Pipelines were all built by 102 s and fps did not
+     change. Title 36-39 FPS while one pipeline worker + the library thread
+     used two full cores for 40 s; a 32.3-34.6 s run of 163 ms frames was
+     present-bound (present_ms 155) with the settings menu open.
+  B. runtime-1795042202439993.log (crash): "video: Vulkan submission stopped
+     raw_vk=-4" (VK_ERROR_DEVICE_LOST) at 1083.5 s, 0.6 s after "scene ready:
+     map u11_0_scrw" (Highlands of Wohl - Hypocenter, first field map after the
+     intro battle). MESA: "context failed at nvkmd_nvgpu_native_ctx.c:738",
+     "primary arena is poisoned". Docked, 2560x1440. VRAM 1792/7017 MiB,
+     guest committed flat 564 MiB: not memory. The previous 100 s (mv_02v) ran
+     at 34.6 ms GPU steady. The user docked at ~398 s ("render fence wait
+     14.0 s") and tested sleep (log gaps 427->822 s and ~827->904 s). The
+     sleep made the movie watchdog dump "movie without a frame for 394591 ms".
+     The Mesa source is not on this machine: line 738 (fault vs timeout) is
+     unknown. exit.log: "still running: Memory Monitor".
+
+CHANGES
+  GPU time (gpu/gpu_busy.h)
+    * AddBatch counts the union of batch intervals: overlap between the two
+      in-flight GPU slots was counted twice (gpu_pct 158). gpu_ms/gpu_pct now
+      mean real busy time, and dynamic resolution reads the real cost.
+    * Longest single batch per perf window: new perf field gpu_batch_max_ms.
+  Dynamic resolution (Switch 2)
+    * Back on by default. Max = native (1080 rows handheld, 1440 docked: no
+      upscale there, FSR is skipped at scale 1); floor 576 handheld, 1152
+      docked (settings::SwitchAutomaticMinimum, used when Minimum is Auto).
+      1152 added to SwitchSceneHeights. Budget 16.7 ms (60 FPS).
+    * Removed the Switch 2 hard-off in gpu/frame_plan.cpp, graphics_menu.h
+      DynamicResolutionOn and the config.cpp Validate lock; every preset is
+      dynamic over the Auto range (they differ in effects only); Graphics shows
+      Maximum/Dynamic/Minimum resolution again with new help texts.
+    * settings.ini: new key resolution_layout=2. A file without it (written
+      while turn 34 forced the values) takes the new defaults once.
+  Shadow targets (gpu/render_resolution.h)
+    * The 880/440-pitch shadow colour family (880x896, 880x448, 440x448) keeps
+      its guest size on Switch 2 instead of the scene scale (was
+      880x896 -> 1320x1344 at 1080p) and so is no longer re-sized by dynamic
+      resolution. LO_SHADOW_COLOR_SCALED=1 restores the old scaling.
+      Not done: keeping guest-size targets across a resize (the whole target
+      map is still cleared on a step; they are re-created at the same size).
+  Device loss
+    * gpu/submission_ring.h: the last 16 renderer batches (frame, draws,
+      resolves, GS rect lists, occlusion queries, scene size, scene tag, GPU
+      ms once completed) are printed as [error] lines by video::StopGpuWork,
+      with the longest batch since the last perf line.
+    * Batches end every 1024 draws on Switch 2 (as well as when descriptors
+      run out), so no single submission runs as long. LO_SWITCH_BATCH_DRAWS=
+      <n> (0 = old behaviour). Logged at startup ("batches end every ...").
+      Unverified that this prevents the loss; the ring will say what ran.
+    * Applet events in the runtime log: "applet: docked/handheld", focus
+      changes, resume, and "applet: suspended, now running again (suspended N
+      ms)" from the watchdog's poll gap (os/suspend_clock.h).
+    * Not done: an explicit GPU drain on resume/dock (a dock that changes the
+      base height already drains in the resize path). The new applet lines
+      will show whether the 14 s dock fence wait was a suspension.
+  Bugs
+    * Movie stall timer and "native movie ... status" lines leave suspended
+      time out (fixes the bogus 394591 ms dump after sleep).
+    * Memory Monitor sleeps 30 s in 500 ms steps, so the exit ends it.
+    * Negative "fence wait open 1844...ms" / "-1844... ms" values clamped.
+  Pipeline workers (gpu/host_cores.h)
+    * With process core mask 0x38 available (log said 0x3f), the long-lived
+      pipeline pool sizes from 6 threads (3 workers, 2 for draw-time jobs) and
+      the workers and the library thread are moved to cores 3-5. Logged:
+      "renderer: pipeline worker threads on cores 3-5: yes/refused". Short
+      synchronous-load pools keep 3.
+  Title (settings/title_policy.h, title_entry.cpp)
+    * Y: Settings footer and the Y shortcut back on Switch 2. No Back quit
+      dialog and no quit legend (HOME -> X only). Prep bar and achievement
+      toast stay off.
+  Debug audit (quiet by default; all still available)
+    * "pipeline workers frame=N" per-frame lines only when a pipeline was
+      queued/built/skipped; hits/shader loads summed every 10 s
+      (LO_PIPELINE_MISS_LOG=1: every frame as before).
+    * Watchdog 15 s / 40 s guest dumps off (LO_GUEST_DUMPS=1).
+    * Stutter samples off (LO_STUTTER_SAMPLES=1).
+    * "watch:" lines are notices (queued writer), not synchronous warnings.
+    * Fence-wait host backtrace off (LO_FENCE_BACKTRACE=1).
+    * Kept: perf lines every 10 s, hitch lines, movie-stall dump.
+  GPU pass timing (gpu/pass_timing.h)
+    * LO_GPU_PASS_TIMING=1: every 10 s "gpu passes (ms per frame ...):
+      scene= shadow= gs_rect= resolve= total= draw_splits=". Approximate
+      (bottom-of-pipe timestamps at category changes). Off = no cost.
+
+ENV SWITCHES (new or changed default)
+  LO_SWITCH_BATCH_DRAWS (1024)   LO_SHADOW_COLOR_SCALED (0)
+  LO_GPU_PASS_TIMING (0)         LO_GUEST_DUMPS (0, was always on)
+  LO_STUTTER_SAMPLES (0, was 1)  LO_FENCE_BACKTRACE (0, was always on)
+  LO_DYNAMIC_RESOLUTION / _MIN still override the menu.
+
+TESTS (host g++, with and without -D__SWITCH2__)
+  New: tools/tests/{gpu_busy,dynamic_resolution,submission_ring,pass_timing,
+  host_cores,title_policy}_test.cpp (CMake targets Lo_<name>_test,
+  EXCLUDE_FROM_ALL). Updated target_mapping_test (shadow family). All pass;
+  shadow_resolution_test passes; settings_menu ctest 11/11 passes (needs a
+  clean env: env -i PATH=/usr/bin:/bin, devkitPro's CPPFLAGS leak otherwise).
+  Pre-existing, not from this turn: render_resolution_test fails "16:9 output
+  keeps the previous size" (fails on the turn-34 commit too).
+  Not tested: title footer raster without the quit legend (that test is
+  WIN32-only, menu_render_test.cpp).
+
+EXPECTED
+  Handheld at 576 rows: ~0.28x the 1080 pixels; at current cost ~14-20 ms in
+  battle (true GPU time now, ~1/1.5 of the old gpu_ms). Docked 1152 rows on
+  the 1007 MHz GPU: likely near or under 16.7 ms in battle; 1440 in light
+  scenes. Each dynamic step still rebuilds scene targets (a hitch per step,
+  one jump down, one rung up per 3 s).
+
+NEXT (user)
+  1. Copy the NRO and the Desktop env.txt (LO_GUEST_AFFINITY=1 only). Play
+     title -> intro battle -> first field map, handheld, then docked. Send the
+     runtime log. Look for: "dynamic resolution: on, 576 to 1080 rows",
+     "scene at N rows", perf fps / gpu_ms / gpu_batch_max_ms, "applet:" lines,
+     and on a device loss the "last 16 GPU batches" block.
+  2. Title: Y opens Settings; Back does nothing.
+  3. A/B (one line per run, ~60 s of the same battle, screenshot each):
+       a) LO_GPU_PASS_TIMING=1            (where the GPU time goes)
+       b) a) + LO_ZPD_MODE=fast           (watch for objects popping)
+       c) a) + LO_SHADOW_COLOR_SCALED=1   (confirms the shadow change)
+       d) a) + LO_SWITCH_BATCH_DRAWS=512 / =0 (cost of splitting)
+     If gs_rect is a large share, next step is CPU-side rect-list expansion
+     (xenos::rect_list::ExpandIndices) behind LO_RECT_LIST_GS=0.

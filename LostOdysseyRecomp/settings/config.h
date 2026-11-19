@@ -82,21 +82,25 @@ inline constexpr uint32_t ScalingMetalFx = 2;
 inline constexpr int InternalResolutionNative = 1;
 // The Switch's Minimum and Maximum resolution rows: scene heights in rows. Each is a multiple of 36, dynamic
 // resolution's step, so every one is a 16:9 width and a rung down from 540 and 720 (no 480: 853.3 columns).
-// Switch 2 adds the 1080- and 1440-row rungs: its docked output is 1920x1080 (a 1440-row scene supersamples
-// it), and its handheld screen is 1080p.
+// Switch 2 adds the 1080-, 1152- and 1440-row rungs: its handheld screen is 1920x1080 and its docked output
+// 2560x1440, so 1080 and 1440 rows are native there; 1152 is the docked dynamic floor.
 #ifdef __SWITCH2__
-inline constexpr uint32_t SwitchSceneHeights[] = {360, 432, 504, 540, 576, 648, 720, 1080, 1440};
+inline constexpr uint32_t SwitchSceneHeights[] = {360, 432, 504, 540, 576, 648, 720, 1080, 1152, 1440};
 #else
 inline constexpr uint32_t SwitchSceneHeights[] = {360, 432, 504, 540, 576, 648, 720};
 #endif
 // Automatic maximum: 540 rows in both modes (720 docked is not yet tested with deko3d; the Maximum resolution
-// row offers it). The release env.txt sets no height, so these rows decide it. Switch 2 renders 1440 rows docked
-// (supersampled down to its 1920x1080 output) and 1080 rows on its 1080p handheld screen.
+// row offers it). The release env.txt sets no height, so these rows decide it.
 #ifdef __SWITCH2__
-// Fixed by default (dynamic resolution off, 2026-11-18): 1080 rows handheld, 1440 docked, at 60 FPS.
+// Switch 2 (turn 35, 2026-11-18): native 1080 rows handheld and 1440 docked at most, dynamic resolution down to
+// SwitchAutomaticMinimum at 60 FPS; FSR 1 scales a scene below the output's height up to it.
 inline constexpr uint32_t SwitchAutomaticHeight(bool docked) { return docked ? 1440 : 1080; }
+// Automatic minimum (minimumHeight 0): 576 rows handheld, 1152 docked (80% of 1440). 0 elsewhere: 80% of the
+// maximum (dynamic_resolution::DefaultMinimum).
+inline constexpr uint32_t SwitchAutomaticMinimum(bool docked) { return docked ? 1152 : 576; }
 #else
 inline constexpr uint32_t SwitchAutomaticHeight(bool docked) { return docked ? 540 : 540; }
+inline constexpr uint32_t SwitchAutomaticMinimum(bool) { return 0; }
 #endif
 // The Balanced and Performance presets' Minimum resolution, in both operation modes.
 inline constexpr uint32_t SwitchPresetMinimumHeight = 360;
@@ -220,7 +224,8 @@ struct Config
     // gpu/switch_upscaler.h) scales a scene smaller than the output, in place of the bilinear scale.
     // dynamicResolution: the scene height follows the GPU's time per frame (gpu/dynamic_resolution.h) from the
     // maximum height down to the minimum. Heights are SwitchSceneHeights rows per operation mode ([0] handheld,
-    // [1] docked), 0 automatic: maximum SwitchAutomaticHeight, minimum 80% of the maximum. With dynamic resolution
+    // [1] docked), 0 automatic: maximum SwitchAutomaticHeight, minimum SwitchAutomaticMinimum (Switch 2) or 80% of
+    // the maximum. With dynamic resolution
     // off the maximum is the scene height. env.txt's LO_SWITCH_UPSCALER, LO_SWITCH_RCAS_STOPS,
     // LO_SWITCH_RENDER_HEIGHT and LO_DYNAMIC_RESOLUTION(_MIN) win over them. Applied when saved.
 #if defined(__SWITCH__)
@@ -228,8 +233,8 @@ struct Config
     // depth of field at 50% and no bloom. A saved settings.ini keeps its own values.
     bool switchFsr = true;
 #if defined(__SWITCH2__)
-    // Switch 2: the Balanced preset keeps a fixed scene height (graphics_menu.h); Dynamic resolution is a choice.
-    bool dynamicResolution = false;
+    // Switch 2: dynamic resolution on, Automatic heights (1080 -> 576 handheld, 1440 -> 1152 docked).
+    bool dynamicResolution = true;
     uint32_t maximumHeight[2] = {0, 0};
     uint32_t minimumHeight[2] = {0, 0};
 #else

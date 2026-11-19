@@ -1,6 +1,8 @@
 #pragma once
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <mutex>
 
 // GPU busy time for the Detailed performance overlay (ui/performance_overlay.cpp).
 // While the overlay asks for it, timestamp queries bracket each renderer queue
@@ -9,12 +11,38 @@
 // GPU wait. The command processor thread records and reads both.
 namespace gpu::gpu_busy
 {
+// The union of batch intervals. Two GPU slots are in flight at once, and a
+// batch's begin timestamp lands while the previous batch is still executing:
+// summing end - begin counted the overlap twice (Switch 2, 2026-11-18:
+// gpu_pct 158 in a GPU-bound battle, and dynamic resolution saw 1.5x the
+// real cost). Only the part of a batch after the latest end seen so far adds.
+struct BusyUnion
+{
+    uint64_t lastEnd = 0;
+    uint64_t total = 0;
+    // Returns the time added. Unwritten (0) or reversed results add nothing.
+    uint64_t Add(uint64_t begin, uint64_t end)
+    {
+        if (!begin || end <= begin) return 0;
+        const uint64_t from = std::max(begin, lastEnd);
+        lastEnd = std::max(lastEnd, end);
+        if (end <= from) return 0;
+        total += end - from;
+        return end - from;
+    }
+};
+
 inline std::atomic<bool> g_requested{false};
 // Dynamic resolution (gpu/dynamic_resolution.h) needs the measurement for as long as it runs, whatever the overlay does.
 inline std::atomic<bool> g_dynamicResolution{false};
 // So does the perf line (debug/perf_stats.cpp, LO_PERF_GPU), whatever the overlay does.
 inline std::atomic<bool> g_perf{false};
 inline std::atomic<uint64_t> g_busy{0};
+// The longest single batch (end - begin, overlap included) since the last TakeMaxBatchNs: the perf line's
+// gpu_batch_max_ms. A very long submission is the first suspect for a GPU device loss.
+inline std::atomic<uint64_t> g_maxBatch{0};
+inline std::mutex g_unionMutex;
+inline BusyUnion g_union;
 
 inline bool Requested()
 {
@@ -26,8 +54,18 @@ inline void Request(bool requested) { g_requested.store(requested, std::memory_o
 // (nanoseconds on Vulkan and D3D12). Unwritten or reordered results add nothing.
 inline void AddBatch(uint64_t begin, uint64_t end)
 {
-    if (begin && end > begin) g_busy.fetch_add(end - begin, std::memory_order_relaxed);
+    if (!begin || end <= begin) return;
+    uint64_t added;
+    {
+        std::lock_guard lock(g_unionMutex);
+        added = g_union.Add(begin, end);
+    }
+    if (added) g_busy.fetch_add(added, std::memory_order_relaxed);
+    uint64_t span = end - begin, seen = g_maxBatch.load(std::memory_order_relaxed);
+    while (span > seen && !g_maxBatch.compare_exchange_weak(seen, span, std::memory_order_relaxed)) {}
 }
-// Running total of AddBatch.
+// Running total of AddBatch (overlap counted once).
 inline uint64_t Total() { return g_busy.load(std::memory_order_relaxed); }
+inline uint64_t TakeMaxBatchNs() { return g_maxBatch.exchange(0, std::memory_order_relaxed); }
+inline uint64_t PeekMaxBatchNs() { return g_maxBatch.load(std::memory_order_relaxed); }
 }

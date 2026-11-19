@@ -101,6 +101,12 @@
 #include <debug/debug_options.h>
 #endif
 #include "gpu_busy.h"
+#include "submission_ring.h"
+#include "pass_timing.h"
+#include "host_cores.h"
+#if LO_PLATFORM_SWITCH
+#include <os/switch_platform.h>
+#endif
 #include <debug/perf_stats.h>
 #include "render_batch_policy.h"
 #include "render_arena_policy.h"
@@ -121,6 +127,35 @@ static unsigned HostLogicalThreads()
     return 3;
 #else
     return std::thread::hardware_concurrency();
+#endif
+}
+
+// The long-lived pipeline worker pool's size. Switch 2: 6 when cores 3-5 are available (gpu/host_cores.h) and the
+// workers move there (PinWorkerThread). The short pools of synchronous loads keep HostLogicalThreads: their
+// threads are not moved and would crowd the guest's cores.
+static unsigned PrefetchLogicalThreads()
+{
+#if defined(__SWITCH2__)
+    static const unsigned threads = gpu::host_cores::LogicalThreads(os::switch_platform::ProcessCoreMask());
+    return threads;
+#else
+    return HostLogicalThreads();
+#endif
+}
+
+// Switch 2: a pipeline worker or library thread moves to cores 3-5 when the process may use them, off the guest's
+// cores 0-2 (gpu/host_cores.h). Logged once.
+static void PinWorkerThread(const char* what)
+{
+#if defined(__SWITCH2__)
+    const uint64_t mask = os::switch_platform::ProcessCoreMask();
+    if (!gpu::host_cores::WorkersOffGuestCores(mask)) return;
+    const bool pinned = os::switch_platform::RestrictCurrentThreadToCores(gpu::host_cores::kWorkerCores);
+    static std::atomic<bool> logged{false};
+    if (!logged.exchange(true))
+        LOG_NOTICE("renderer: {} threads on cores 3-5: {}", what, pinned ? "yes" : "refused, staying on 0-2");
+#else
+    (void)what;
 #endif
 }
 
@@ -174,6 +209,24 @@ namespace plume {
 
 namespace gpu::renderer
 {
+    // The last renderer batches (gpu/submission_ring.h), printed when the GPU stops.
+    static std::mutex g_submissionRingMutex;
+    static gpu::submission_ring::Ring<16> g_submissionRing;
+    void LogSubmissionRing()
+    {
+        std::lock_guard lock(g_submissionRingMutex);
+        const auto nowMs = uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+        LOG_ERROR("renderer: last {} GPU batches (oldest first; longest batch since the last perf line {:.1f} ms):",
+            g_submissionRing.Size(), double(gpu_busy::PeekMaxBatchNs()) / 1e6);
+        for (size_t i = 0; i < g_submissionRing.Size(); ++i) {
+            const auto& e = g_submissionRing.At(i);
+            LOG_ERROR("renderer:   batch {} frame {} submitted {} ms ago: draws={} resolves={} rect_lists={} occlusion={} "
+                "scene={}x{} tag={:08x} {}", e.serial, e.frame, nowMs >= e.submitMs ? nowMs - e.submitMs : 0, e.draws,
+                e.resolves, e.rectLists, e.occlusionQueries, e.width, e.height, e.scene,
+                e.completed ? fmt::format("completed, GPU {:.1f} ms", e.gpuUs / 1000.0) : std::string("not completed"));
+        }
+    }
     namespace binding = gpu::taa_collection::binding;
     namespace {
 #ifdef LO_GPU_PLUME
@@ -788,6 +841,11 @@ namespace gpu::renderer
                 uint64_t srSubmissionSerial = 0;
                 bool srPrefixClosed = false, srIsolatedAccepted = false, srContinuationOpen = false;
                 bool submitted = false;
+                uint64_t ringSerial = 0; // this batch in g_submissionRing (0: none)
+                // LO_GPU_PASS_TIMING=1 (gpu/pass_timing.h): this batch's timestamps by kind of work.
+                std::unique_ptr<RenderQueryPool> passQueries;
+                gpu::pass_timing::Timeline passTimeline;
+                bool passTimed = false;
                 std::vector<std::shared_ptr<dlss::EvaluateCapture>> evaluateCaptures;
 #if defined(LO_GPU_PLUME)
                 // Every submitted producer batch owns its raw alpha target and
@@ -1084,7 +1142,7 @@ namespace gpu::renderer
             // LO_PIPELINE_MISS_WORKERS=0 turns siblings and skipped draws off.
             const size_t drawWorkerCap = [] {
                 if (const char* value = getenv("LO_PIPELINE_MISS_WORKERS")) return size_t(std::clamp(atoi(value), 0, 16));
-                return size_t(std::clamp(HostLogicalThreads() / 4, 2u, 6u));
+                return size_t(std::clamp(PrefetchLogicalThreads() / 4, 2u, 6u));
             }();
             const bool pipelineSiblings = drawWorkerCap && !getenv("LO_NO_PIPELINE_SIBLINGS");
             const bool pipelineAsync = drawWorkerCap && getenv("LO_PIPELINE_ASYNC") &&
@@ -2149,6 +2207,21 @@ namespace gpu::renderer
             const bool gpuStatsEnabled = getenv("LO_GPU_STATS") != nullptr;
             const bool cpuTimingEnabled = gpuStatsEnabled || render_timing::Enabled();
             uint32_t descriptorBatchLimit = 500;
+            // The open batch's work, for the submission ring and the Switch 2 draw split (gpu/submission_ring.h).
+            uint32_t batchDraws = 0, batchResolves = 0, batchRectLists = 0;
+            uint64_t nextBatchSerial = 0;
+            const uint32_t batchDrawLimit = gpu::submission_ring::BatchDrawLimit(getenv("LO_SWITCH_BATCH_DRAWS"));
+            uint32_t drawSplits = 0;
+            std::array<uint64_t, gpu::pass_timing::kCategories> passTotals{};
+            uint64_t passFrames = 0, passBatches = 0;
+            std::chrono::steady_clock::time_point passSince = std::chrono::steady_clock::now();
+            // A draw or pass of `category` starts in the open batch (LO_GPU_PASS_TIMING=1 only).
+            void MarkPass(gpu::pass_timing::Category category)
+            {
+                if (!Gpu().passTimed) return;
+                if (const uint32_t index = Gpu().passTimeline.Mark(category); index != ~0u)
+                    commandList->writeTimestamp(Gpu().passQueries.get(), index);
+            }
             uint32_t descriptorSplits = 0, textureSetSplits = 0, samplerVersionSplits = 0;
             uint32_t uploadSplits = 0, arenaSplits = 0;
             // Draws skipped because they write nothing (see DrawImpl).
@@ -3275,6 +3348,8 @@ namespace gpu::renderer
                 descriptorBatchLimit = render_batch::DescriptorLimit(vulkan, batchOverride ? batchOverride : "");
                 LOG_INFO("renderer: descriptor reuse={} backend={} limit={} gpu_slots={} (LO_DESCRIPTOR_REUSE=0 disables reuse)",
                     descriptorReuse, nativeVulkan ? "Vulkan" : vulkan ? "Metal" : "D3D12", descriptorBatchLimit, kGpuSlots);
+                LOG_NOTICE("renderer: batches end every {} draws (LO_SWITCH_BATCH_DRAWS; 0: only when descriptors run out)",
+                    batchDrawLimit);
                 binaryFormat = vulkan ? xenos::ShaderBinaryFormat::Spirv : xenos::ShaderBinaryFormat::Dxil;
                 renderFormat = vulkan ? RenderShaderFormat::SPIRV : RenderShaderFormat::DXIL;
                 if (!device || !queue)
@@ -5722,11 +5797,21 @@ void main()
                 fgHandoffPool.Collect();
                 for (const auto& e : s.evaluateCaptures) if (e->checkedSubmit) e->completed = true;
                 s.evaluateCaptures.clear();
+                if (s.passTimed) {
+                    s.passTimed = false;
+                    s.passQueries->queryResults();
+                    gpu::pass_timing::Collect(s.passTimeline, s.passQueries->getResults(), passTotals);
+                    ++passBatches;
+                }
                 if (s.timed) {
                     s.timed = false;
                     s.timingQueries->queryResults();
                     const auto* results = s.timingQueries->getResults();
                     if (results) gpu_busy::AddBatch(results[0], results[1]);
+                    if (results && s.ringSerial && results[0] && results[1] > results[0]) {
+                        std::lock_guard lock(g_submissionRingMutex);
+                        g_submissionRing.Complete(s.ringSerial, uint32_t(std::min<uint64_t>((results[1] - results[0]) / 1000, UINT32_MAX)));
+                    }
                     if (render_timing::Enabled()) {
                         if (results) gpuTiming.AddBatch(results[0], results[1]);
                         else gpuTiming.AddUnavailableBatch();
@@ -5883,6 +5968,16 @@ void main()
                         Gpu().occlusionUsed = 0;
                         Gpu().occlusionBatch = nextOcclusionBatch++;
                     }
+                    batchDraws = batchResolves = batchRectLists = 0;
+                    Gpu().passTimed = false;
+                    if (gpu::pass_timing::Enabled() && device->getCapabilities().queryPools) {
+                        if (!Gpu().passQueries) Gpu().passQueries = device->createQueryPool(gpu::pass_timing::kQueries);
+                        if (Gpu().passQueries && Gpu().passQueries->getCount() == gpu::pass_timing::kQueries) {
+                            commandList->resetQueryPool(Gpu().passQueries.get(), 0, gpu::pass_timing::kQueries);
+                            commandList->writeTimestamp(Gpu().passQueries.get(), Gpu().passTimeline.Begin());
+                            Gpu().passTimed = true;
+                        }
+                    }
                     listOpen = true;
                 }
                 return true;
@@ -5937,6 +6032,7 @@ void main()
                 if (motionReplay) motionReplay->SealTimings(commandList);
                 if (!Gpu().srPrefixClosed) Gpu().drawProbe.End(commandList);
                 if (Gpu().timed) commandList->writeTimestamp(timingQueries, 1);
+                if (Gpu().passTimed) commandList->writeTimestamp(Gpu().passQueries.get(), Gpu().passTimeline.End());
                 if (!video::EndGpuCommands(commandList)) {
 #if defined(LO_GPU_PLUME)
                     for (const auto& capture : Gpu().fgUiUses) {
@@ -6025,6 +6121,23 @@ void main()
                     ClearDlssSubmit(Gpu(), true);
                     ReleaseOcclusionWaiters();
                     return false;
+                }
+                {
+                    gpu::submission_ring::Entry entry;
+                    entry.serial = ++nextBatchSerial;
+                    entry.frame = frame;
+                    entry.submitMs = uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch()).count());
+                    entry.draws = batchDraws;
+                    entry.resolves = batchResolves;
+                    entry.rectLists = batchRectLists;
+                    entry.occlusionQueries = hostOcclusion ? Gpu().occlusionUsed : 0;
+                    entry.width = internalSize.width;
+                    entry.height = internalSize.height;
+                    entry.scene = sceneTag;
+                    std::lock_guard lock(g_submissionRingMutex);
+                    g_submissionRing.Push(entry);
+                    Gpu().ringSerial = entry.serial;
                 }
 #if defined(LO_GPU_PLUME)
                 const bool orderedPresentQueue = queue && queue == video::GetQueue() &&
@@ -6918,6 +7031,7 @@ void main()
                 if (loading) LOG_INFO("renderer: pipeline libraries: {} recipes, {} make their shader modules on the library thread", items.size(), loading);
                 libraryPrecompile.thread = std::thread([this, items = std::move(items)] {
                     os::SetCurrentThreadName("Pipeline Libraries");
+                    PinWorkerThread("pipeline library");
                     const auto started = std::chrono::steady_clock::now();
                     std::unique_ptr<xenos::portable_pack::Reader> reader;
                     bool readerTried = false;
@@ -7101,9 +7215,25 @@ void main()
                     LOG_INFO("renderer: pipeline prefetch waits frame={} prefetched={} prefetch_wait_ms={:.2f} scene={:08x}",
                         frame, prefetchServed, prefetchWaitMs, sceneTag);
                 }
-                if (const auto& w = workerStats; w.queued || w.built || w.hits || w.skipped || w.shaders)
+                // Debug audit (turn 35): hits and shader-module loads alone came almost every frame (one line a frame
+                // in battle); those are summed and logged every 10 s. A frame that queued, built or skipped a
+                // pipeline still gets its own line, and LO_PIPELINE_MISS_LOG prints every frame as before.
+                static WorkerStats summed{};
+                static auto summedSince = std::chrono::steady_clock::now();
+                if (const auto& w = workerStats; pipelineMissVerbose || w.queued || w.built || w.skipped)
                     LOG_INFO("renderer: pipeline workers frame={} {} queued={} built={} hits={} skipped={} shaders={}",
                         frame, SceneLabel(), w.queued, w.built, w.hits, w.skipped, w.shaders);
+                else {
+                    summed.hits += w.hits;
+                    summed.shaders += w.shaders;
+                    if (const auto now = std::chrono::steady_clock::now(); now - summedSince >= std::chrono::seconds(10)) {
+                        if (summed.hits || summed.shaders)
+                            LOG_INFO("renderer: pipeline workers in the last 10 s {}: hits={} shaders={}", SceneLabel(),
+                                summed.hits, summed.shaders);
+                        summed = {};
+                        summedSince = now;
+                    }
+                }
                 pipelineMissCount = 0;
                 pipelineMissMs = 0;
                 prefetchServed = 0;
@@ -7360,8 +7490,8 @@ void main()
             void StartPrefetchWorkers()
             {
                 if (!prefetchPool.workers.empty()) return;
-                // Half the threads: the game keeps loading and running beside them.
-                const unsigned logical = HostLogicalThreads();
+                // Half the threads: the game keeps loading and running beside them (Switch 2 with cores 3-5: 3 workers there).
+                const unsigned logical = PrefetchLogicalThreads();
                 size_t count = std::max<size_t>(1, std::min<size_t>(xenos::preparation::HostWorkerCap(logical), logical / 2));
                 if (const char* value = getenv("LO_PIPELINE_PREFETCH_WORKERS")) count = std::max<size_t>(1, strtoul(value, nullptr, 10));
                 prefetchPool.smallCap = std::max<size_t>(1, std::min(drawWorkerCap, count));
@@ -7430,6 +7560,7 @@ void main()
             void PrefetchWorker()
             {
                 os::SetCurrentThreadName("Pipeline Worker");
+                PinWorkerThread("pipeline worker");
                 std::unique_ptr<xenos::portable_pack::Reader> reader;
                 bool readerTried = false;
                 for (;;) {
@@ -8856,7 +8987,14 @@ void main()
                 if (it != renderTargets.end())
                     effectiveHeight = std::max(effectiveHeight, it->second->guestHeight);
                 const resolution::Size legacySize{activePlan.legacyWidth,activePlan.legacyHeight};
-                resolution::Size desiredSize = resolution::TargetSizeForPlan(role, pitch, effectiveHeight, internalSize, legacySize, shadowResolution);
+                // LO_SHADOW_COLOR_SCALED=1: the shadow map's 880/440-pitch colour family takes the scene scale again
+                // (render_resolution.h ShadowFamilySurface; Switch 2 keeps it at guest size by default).
+                static const bool shadowFamilyUnscaled = [] {
+                    const char* value = getenv("LO_SHADOW_COLOR_SCALED");
+                    return resolution::kShadowFamilyUnscaled && !(value && value[0] == '1');
+                }();
+                resolution::Size desiredSize = resolution::TargetSizeForPlan(role, pitch, effectiveHeight, internalSize, legacySize,
+                    shadowResolution, shadowFamilyUnscaled);
                 if (sceneCopyPromotion.activeMapping && key == sceneCopyPromotion.key && sceneCopyPromotion.frame == frame &&
                     sceneCopyPromotion.epoch == activePlan.geometryEpoch)
                     desiredSize = {activePlan.output.width, activePlan.output.height};
@@ -10633,7 +10771,11 @@ void main()
                 const bool textureSetsFull = Gpu().setPoolUsed[1] >= descriptorBatchLimit ||
                     Gpu().setPoolUsed[2] >= descriptorBatchLimit || Gpu().setPoolUsed[3] >= descriptorBatchLimit;
                 const bool samplerVersionsFull = Gpu().samplerVersions.size() >= kSamplerVersionsPerBatch;
-                const bool poolsFull = textureSetsFull || samplerVersionsFull;
+                // Switch 2: also end the batch every LO_SWITCH_BATCH_DRAWS draws (1024 by default), so no single
+                // submission runs long enough to trip a GPU timeout (gpu/submission_ring.h).
+                const bool drawsFull = listOpen && gpu::submission_ring::SplitBeforeDraw(batchDraws, batchDrawLimit);
+                drawSplits += drawsFull;
+                const bool poolsFull = textureSetsFull || samplerVersionsFull || drawsFull;
                 const bool ringLow = Gpu().uploadOffset + kUploadHeadroom > kUploadRingSize;
                 const auto wrap = gpu::render_arena::EvaluateWrap(
                     gpuSlot, Gpu().arenaOffset, gpuSlots[(gpuSlot + 1) % kGpuSlots].arenaOffset);
@@ -13247,6 +13389,8 @@ void main()
                     Gpu().occlusionPoolUsed = std::max(Gpu().occlusionPoolUsed, occlusionIndex + 1);
                     commandList->beginOcclusionQuery(occlusionPool, occlusionIndex % kOcclusionPoolQueries);
                 }
+                MarkPass(key.prim == 8 && rectListGs ? gpu::pass_timing::Category::RectList :
+                    depth && depth->shadowMap ? gpu::pass_timing::Category::Shadow : gpu::pass_timing::Category::Scene);
                 recordProbe.Enter(record_timing::Phase::Draw);
                 if (useIndices)
                 {
@@ -14222,6 +14366,8 @@ void main()
                 if (video::GpuWorkStopped()) return;
  #endif
                 drawsThisFrame++;
+                batchDraws++;
+                if (key.prim == 8 && rectListGs) batchRectLists++;
 
                 recordProbe.Enter(record_timing::Phase::MvTrack);
                 if (motionDepthWrite) {
@@ -15727,6 +15873,8 @@ void main()
                 FlushMotionReplayQueue();
                 ScopedTimer timer{ tResolve, cpuTimingEnabled };
                 nResolve++;
+                batchResolves++;
+                if (listOpen) MarkPass(gpu::pass_timing::Category::Resolve);
                 consecutiveResolveCopies.BeginResolve();
                 ResolveImpl();
                 consecutiveResolveCopies.EndResolve();
@@ -16656,6 +16804,29 @@ void main()
                         r.uploadSplits, r.arenaSplits, r.descriptorHits, r.descriptorMisses);
                 r.descriptorSplits = r.textureSetSplits = r.samplerVersionSplits = r.uploadSplits = r.arenaSplits = 0;
                 r.descriptorHits = r.descriptorMisses = 0;
+            }
+            if (gpu::pass_timing::Enabled())
+            {
+                // LO_GPU_PASS_TIMING=1: GPU ms per frame by kind of work, every 10 s (gpu/pass_timing.h).
+                auto& r = *g_renderer;
+                ++r.passFrames;
+                const auto now = std::chrono::steady_clock::now();
+                if (now - r.passSince >= std::chrono::seconds(10) && r.passFrames) {
+                    std::string parts;
+                    uint64_t total = 0;
+                    for (size_t c = 0; c < gpu::pass_timing::kCategories; ++c) {
+                        total += r.passTotals[c];
+                        parts += fmt::format(" {}={:.2f}", gpu::pass_timing::Name(gpu::pass_timing::Category(c)),
+                            double(r.passTotals[c]) / 1e6 / double(r.passFrames));
+                    }
+                    LOG_NOTICE("gpu passes (ms per frame, {} frames, {} batches, {}x{}):{} total={:.2f} draw_splits={}",
+                        r.passFrames, r.passBatches, r.internalSize.width, r.internalSize.height, parts,
+                        double(total) / 1e6 / double(r.passFrames), r.drawSplits);
+                    r.passTotals = {};
+                    r.passFrames = r.passBatches = 0;
+                    r.drawSplits = 0;
+                    r.passSince = now;
+                }
             }
             if (g_renderer->frame % 300 == 0 && g_renderer->noopDrawsSkipped)
             {

@@ -294,7 +294,11 @@ static int RunGuest(uint32_t entry)
         os::SetCurrentThreadName("Memory Monitor");
         for (;;)
         {
-            std::this_thread::sleep_for(std::chrono::seconds(30));
+            // 30 s in 500 ms sleeps: each sleep is where the exit ends this thread (switch_runtime.cpp
+            // ShouldEndThisThread), and the exit waits 1.5 s at most. One 30 s sleep left it "still running"
+            // at every exit (exit.log, 2026-11-18).
+            for (int step = 0; step < 60; ++step)
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
             std::string cpu;
             os::switch_cpu_profiler::AppendThreadCpuUsage(cpu);
             LOG_INFO("switch: {}, guest committed {} MiB; CPU {}", os::switch_platform::MemorySummary(),

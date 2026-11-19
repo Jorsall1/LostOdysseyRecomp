@@ -329,7 +329,13 @@ namespace
         w.startValue = w.counter >= 0x10000 && w.counter < 0xFFFF0000u ? PPC_LOAD_U32(w.counter) : 0;
         w.pcr = ctx.r13.u32;
         w.lr = uint32_t(ctx.lr);
-        _Unwind_Backtrace(CollectHostFrame, &w.trace);
+        // The host stack of every fence wait (a few per frame) only for hang dumps: LO_FENCE_BACKTRACE=1
+        // (debug audit, turn 35). The guest lr above still names the waiter.
+        static const bool backtrace = [] {
+            const char* value = getenv("LO_FENCE_BACKTRACE");
+            return value && value[0] == '1';
+        }();
+        if (backtrace) _Unwind_Backtrace(CollectHostFrame, &w.trace);
         g_fenceEvents.Add("wait begin", w.counter, w.startValue, w.threshold, w.lr, w.pcr);
         std::lock_guard lock(g_fenceWaiterMutex);
         for (size_t i = 0; i < kFenceWaiterSlots; ++i)
@@ -377,7 +383,7 @@ void DumpFenceWaiters()
             const uint32_t value = w.counter >= 0x10000 && w.counter < 0xFFFF0000u ? PPC_LOAD_U32(w.counter) : 0;
             LOG_WARNING("fence wait open {} ms: pcr={:#x} lr={:#x} counter@{:#x} = {} (was {} on entry, waits for <= {}) "
                         "host stack {} frames (guest fn+host offset):{}",
-                now - w.sinceMs, w.pcr, w.lr, w.counter, value, w.startValue, w.threshold, w.trace.count,
+                now > w.sinceMs ? now - w.sinceMs : 0, w.pcr, w.lr, w.counter, value, w.startValue, w.threshold, w.trace.count,
                 FormatHostTrace(w.trace));
         }
         if (!any)
@@ -392,7 +398,7 @@ void DumpFenceWaiters()
         for (uint32_t i = ring->next - count; i != ring->next; ++i)
         {
             const FenceEvent& e = ring->events[i % EventRing::kSize];
-            LOG_WARNING("  -{} ms {} a={:#x} b={:#x} c={:#x} d={:#x} pcr={:#x}", now - e.ms, e.what ? e.what : "?", e.a,
+            LOG_WARNING("  -{} ms {} a={:#x} b={:#x} c={:#x} d={:#x} pcr={:#x}", now > e.ms ? now - e.ms : 0, e.what ? e.what : "?", e.a,
                 e.b, e.c, e.d, e.pcr);
         }
     }

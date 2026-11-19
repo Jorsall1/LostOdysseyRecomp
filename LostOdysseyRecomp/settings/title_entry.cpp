@@ -15,6 +15,7 @@
 #include "quit_action_hook.h"
 #include "title_entry.h"
 #include "title_input_gate.h"
+#include "title_policy.h"
 #include "translations.h"
 
 extern "C" PPC_FUNC(__imp__sub_8288AC10);
@@ -42,14 +43,9 @@ constexpr uint32_t ConfirmSound = 0x10000001;
 constexpr uint32_t ProfileError = 0x832631D0;
 // All state belongs to the title guest thread.
 bool entered = false;
-// Switch 2 keeps the retail title menu (2026-11-18): no "Y: Settings" / "Back:
-// Quit game" footer, no Y shortcut into Settings and no Back quit dialog. The
-// debug menu (LB + RB) stays the only host menu there.
-#if defined(__SWITCH2__)
-constexpr bool kTitleExtras = false;
-#else
-constexpr bool kTitleExtras = true;
-#endif
+// Y: Settings everywhere; the Back quit dialog and its legend everywhere but
+// Switch 2, which closes with HOME -> X (settings/title_policy.h).
+constexpr settings::title_policy::Policy kTitlePolicy{};
 
 // The menu waits for input and Y would open Settings now.
 bool MenuIdle(uint8_t* base, uint32_t title)
@@ -207,8 +203,11 @@ const settings::title_entry::Hint* settings::title_entry::DrawHint(uint32_t outp
         snapshot.help = Translate(language, L"Y: Settings", L"Y：設定");
         if (keyboard)
             snapshot.help[0] = L'S';
-        snapshot.titleQuitKey = keyboard ? L"Backspace" : L"Back";
-        snapshot.titleQuitLabel = Translate(language, L"Quit game", L"退出遊戲");
+        if (settings::title_policy::ShowQuitLegend(kTitlePolicy))
+        {
+            snapshot.titleQuitKey = keyboard ? L"Backspace" : L"Back";
+            snapshot.titleQuitLabel = Translate(language, L"Quit game", L"退出遊戲");
+        }
         // Only the credit and legend's footer rectangle is rasterized.
         const auto bounds = TitleHintBounds(outputWidth, outputHeight);
         std::vector<uint32_t> pixels;
@@ -235,11 +234,13 @@ PPC_FUNC(sub_8234B9B8)
         entered = false;
         LOG_INFO("settings: title entry closed, title state {}", state);
     }
-    const bool idle = kTitleExtras && MenuIdle(base, title);
-    const bool quitOwnsInput = settings::UpdateTitleQuit(base, idle);
-    if (settings::ConsumeTitleShortcut(idle && !quitOwnsInput))
+    namespace policy = settings::title_policy;
+    const bool idle = MenuIdle(base, title);
+    const bool quitOwnsInput = settings::UpdateTitleQuit(base, policy::QuitIdle(kTitlePolicy, idle));
+    const auto tick = policy::Decide(kTitlePolicy, idle, quitOwnsInput);
+    if (settings::ConsumeTitleShortcut(tick.settingsIdle))
         OpenSettings(ctx, base, title);
-    ReportHint(kTitleExtras && MenuIdle(base, title) && !quitOwnsInput);
+    ReportHint(tick.hint && MenuIdle(base, title));
     settings::title_entry::TickWithMenuInputMuted(quitOwnsInput, ctx.r4.u32,
         [base](uint32_t address) { return PPC_LOAD_U32(address); },
         [base](uint32_t address, uint32_t mask) { PPC_STORE_U32(address, mask); },

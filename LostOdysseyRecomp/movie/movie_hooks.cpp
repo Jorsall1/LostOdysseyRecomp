@@ -25,6 +25,7 @@
 
 #include <os/logger.h>
 #include <os/thread_name.h>
+#include <os/suspend_clock.h>
 #include <kernel/memory.h>
 #include <kernel/io/file_system.h>
 #include <host_ui/host_ui.h>
@@ -100,6 +101,8 @@ struct Movie
     bool failed = false;
     // Diagnostics (2026-11-18: mv_01v never showed a frame after New Game).
     std::chrono::steady_clock::time_point openedAt = std::chrono::steady_clock::now();
+    // Suspended time (HOME, sleep) at open: the ages below leave it out (os/suspend_clock.h).
+    uint64_t suspendedAtOpen = os::suspend_clock::SuspendedNs();
     std::chrono::steady_clock::time_point lastStatusAt{};
     uint32_t calls = 0, noNew = 0, guestWrote = 0, errors = 0;
     uint32_t lastResult = 0, lastTimeMs = 0;
@@ -267,8 +270,9 @@ void LogStatus(Movie& movie, const char* why)
     uint32_t frontPts = 0;
     bool ended = false;
     if (movie.stream) movie.stream->Status(queued, frontPts, ended);
-    const auto age = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - movie.openedAt);
-    LOG_WARNING("native movie: {} status ({}): {} ms since start, GetNextFrame calls {} (no new {}, guest wrote {}, "
+    const auto wall = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - movie.openedAt);
+    const auto age = std::chrono::milliseconds(os::suspend_clock::AwakeNs(uint64_t(wall.count()), movie.suspendedAtOpen) / 1'000'000ull);
+    LOG_WARNING("native movie: {} status ({}): {} ms since start (suspended time left out), GetNextFrame calls {} (no new {}, guest wrote {}, "
                 "errors {}, last result {:#x}), movie time {} ms, shown {}, host decoded {}, queued {} (first pts {}), "
                 "decoder ended {}, error '{}'",
                 movie.name, why, age.count(), movie.calls, movie.noNew, movie.guestWrote, movie.errors, movie.lastResult,
@@ -723,7 +727,8 @@ uint32_t movie::NativeMovieStallMs()
     std::lock_guard lock(g_mutex);
     if (!g_movie || g_movie->shown || g_movie->loggedEnd) return 0;
     const auto age = std::chrono::steady_clock::now() - g_movie->openedAt;
-    return uint32_t(std::chrono::duration_cast<std::chrono::milliseconds>(age).count());
+    const uint64_t wallNs = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(age).count());
+    return uint32_t(std::min<uint64_t>(os::suspend_clock::AwakeNs(wallNs, g_movie->suspendedAtOpen) / 1'000'000ull, UINT32_MAX));
 }
 
 void movie::LogNativeMovieState()
