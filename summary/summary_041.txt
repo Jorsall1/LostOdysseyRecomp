@@ -1,0 +1,14 @@
+================================================================================
+LostOdysseyRecomp - Nintendo Switch 2 port
+Summary - TURN 41: measurement env.txt written to the Desktop (no code changes)
+================================================================================
+Desktop env.txt (replaced the turn-36 one, which had only commented A/B lines):
+  LO_GUEST_AFFINITY=1
+  LO_GPU_PASS_TIMING=1   (gpu/pass_timing.h: "gpu passes (ms per frame ...):
+                          scene= shadow= gs_rect= resolve= total=" every 10 s)
+  Commented for later single-line A/B runs: LO_SWITCH_BATCH_DRAWS=2048,
+  LO_EFFECT_BUDGET=0, LO_DR_KEEP_FIXED=0, LO_RESOLVE_BLIT=0, LO_SKIP_RESTORE=0.
+Build to use: turn 39 NRO 9b653c40 (Desktop).
+Run: field ~60 s, one battle ~60 s, HOME -> X; logs into "lo project".
+Next: read "gpu passes", "effect budget: level", "scene at N rows", perf lines;
+pick between lean SPIR-V (no precise), gs_rect CPU expansion, resolve work.
