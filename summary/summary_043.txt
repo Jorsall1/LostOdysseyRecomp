@@ -1,0 +1,39 @@
+================================================================================
+LostOdysseyRecomp - Nintendo Switch 2 port
+Summary - TURN 43: docked heights 1440 -> 720 (correcting turn 42), GPU stop
+after the save screen, dynamic resolution held on light screens
+================================================================================
+Build: NRO md5 1a9fc4415337400ed9658f35c74750b7 (Desktop copy matches).
+ELF: build/savecrash_turn43_1a9fc441.elf. kaiHEN fix untouched. Not yet on HW.
+DOCKED HEIGHTS
+  Turn 42 misread the request. Now SwitchAutomaticHeight(docked) = 1440
+  (native, as before) and SwitchAutomaticMinimum(docked) = 720 (was 1152).
+  Help texts (EN/ZH) say 1440p down to 720p docked. The user's settings.ini
+  already had minimum_height docked = 720. No softer image: the FSR / RCAS
+  settings are unchanged (EASU-only A/B from turn 42 dropped).
+CRASH LOG (lo project/crash, runtime-1795060614444081.log, turn 39 build)
+  * The save was written whole before the crash: 721.86 s "write
+    .../user00/save.bin offset=0 bytes=206000/206000 status=0x0".
+  * The save screen ran 30-draw frames (~5.3 ms GPU). Dynamic resolution
+    stepped behind it: 612 (718.9 s), 648 (722.0 s), 684 (725.0 s).
+  * Back in the field: batch 39611 (343 draws, 36 occlusion queries) not
+    completed, batch 39612 (463 draws, 69 occlusion) REFUSED by the queue,
+    raw_vk=-4. stderr: "MESA: native: context failed at
+    nvkmd_nvgpu_native_ctx.c:793", "primary arena is poisoned". Exit to
+    hbmenu was clean (exit.log).
+  * Same shape as turn 37 (after Settings): a light 2D screen, resolution
+    steps taken behind it, then a stop on the first heavy 3D batches. Dozens
+    of steps during 3D play never stopped the GPU. Root cause in the driver
+    still unproven (no Mesa source for line 793).
+CHANGE (gpu/frame_plan.cpp)
+  * Dynamic resolution and the effect budget hold while the last 30 CPU frames
+    averaged under 80 renderer draws a frame (menus, save screen, title:
+    17-30; field/battle: 250-500). Logged: "dynamic resolution: held on a
+    light screen (N draws per frame)" / "following the scene".
+  * With turn 39's Settings hold, no resolution change happens behind any
+    menu now, which removes the common factor of both stops.
+TESTS: settings ctest 11/11; Switch 2 build ok.
+NEXT (user)
+  * Save over a slot again, return to the field; repeat a few times.
+  * If it still stops, send the crash logs: the batch block will show whether
+    a resize happened before it (there should be none now).

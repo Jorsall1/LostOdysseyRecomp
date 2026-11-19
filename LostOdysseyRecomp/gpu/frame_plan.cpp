@@ -173,7 +173,27 @@ namespace gpu::frame_plan
             // Settings open over the game: the paused scene (about 130 draws in the field, 2026-11-18) is not the
             // game's load. Dynamic resolution stepped from 576 up to 972 rows in 30 s there (eleven target rebuilds
             // behind the menu) and fell back to 576 at 31.9 ms the moment the field resumed. Hold, as for a load.
-            const bool hold = gpu::loading::inProgress.load(std::memory_order_acquire) || settings::IsOpen();
+            // Menus and 2D screens (the game's save screen, about 30 draws a frame, 2026-11-18): their GPU time says
+            // nothing about the 3D scene either, and both GPU stops so far (turn 37 after Settings, turn 43 after
+            // the save screen) came on the first heavy 3D batches right after steps taken behind such a screen. Hold
+            // while the last half second averaged under LightDraws draws a frame (the field and battles run
+            // 250-500, the title 17-30).
+            static constexpr uint64_t LightDraws = 80;
+            static uint64_t lastDraws = perf_stats::TotalDraws();
+            static uint64_t drawWindow = 0, drawFrames = 0;
+            static bool light = false;
+            const uint64_t totalDraws = perf_stats::TotalDraws();
+            drawWindow += totalDraws - lastDraws;
+            lastDraws = totalDraws;
+            if (++drawFrames >= 30) {
+                const bool nowLight = drawWindow < LightDraws * drawFrames;
+                if (nowLight != light)
+                    LOG_INFO("dynamic resolution: {} ({} draws per frame)", nowLight ? "held on a light screen" : "following the scene",
+                        drawWindow / drawFrames);
+                light = nowLight;
+                drawWindow = drawFrames = 0;
+            }
+            const bool hold = gpu::loading::inProgress.load(std::memory_order_acquire) || settings::IsOpen() || light;
             UpdateEffectBudget(true, hold, now, budgetMs);
             // Loading (the guest loader hooks, gpu/loading_pacing.h): keep the height; a change there rebuilds every
             // scene target for a loading screen, and its new uncleared targets can show for a frame.
