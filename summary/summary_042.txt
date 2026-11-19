@@ -1,0 +1,47 @@
+================================================================================
+LostOdysseyRecomp - Nintendo Switch 2 port
+Summary - TURN 42: pass-timing log read, docked Automatic 1440 -> 720 rows,
+timestamp read fix (vkGetQueryPoolResults VK_NOT_READY)
+================================================================================
+Build: NRO md5 bc6fd44057190999808a9636a82090fb (Desktop copy matches).
+ELF: build/docked720_turn42_bc6fd440.elf. kaiHEN fix untouched. Not yet on HW.
+User report: turn 39 build "runs really smoothly".
+LOG READ (runtime-1795060213439449.log, handheld, LO_GPU_PASS_TIMING=1)
+  * Title: DR 792 -> 972 rows, 60 FPS. Field/battle: 60.0 FPS, p99 17.0-17.2,
+    no hitches, at 1024x576-1152x648, gpu_ms 12.3-13.4 (gpu_pct 74-80).
+  * "scene size step keeps 5 fixed-size targets" on every step (turn 39 ok).
+  * Effect budget: level 1 at 6.4 s, level 2 at 53.6 s (GPU 24.1 ms: the
+    battle load at 52.7 s, loading flag not yet set), held at 12-13 ms (inside
+    the 9.8-14 band) until 168 s, back to 0 by 173.6 s. DR in battle could not
+    step up: 12.5 ms x 1.08 (next rung) > 13.4 ms.
+  * gpu passes (battle, 1024x576): scene 5.3-6.2, shadow 0.1-0.17 (Low),
+    gs_rect 0.5-0.8, resolve 2.4-2.9, total 8.8-9.8 ms; gpu_ms 12.3-13.4.
+    The ~3.5 ms not in the renderer batches is presentation (FSR 1 EASU at
+    1920x1080 + RCAS + overlay; the present list is timed with the overlay on).
+    Resolves are the largest fixed share after the scene.
+  * NEW [error] "vkGetQueryPoolResults VkResult 0x1" (VK_NOT_READY), 8192+
+    times: the pass-timing pool has 512 slots and a batch writes only some,
+    so plume's timestamp read failed for most batches and the readers kept the
+    previous values. The pass numbers above are from the minority of reads
+    that succeeded: approximate.
+CHANGES
+  * thirdparty/plume/plume_vulkan.cpp VulkanQueryPool::queryResults: on
+    VK_NOT_READY for a timestamp pool, re-read with availability; unwritten
+    slots read 0 (pass_timing::Collect skips 0). No error line.
+    tools/patches/plume-switch-perf.patch regenerated (chain lostodyssey ->
+    sdl3 -> switch -> switch2 -> switch-perf on d890ac8 reproduces the tree:
+    all 5 files cmp equal).
+  * settings/config.h: SwitchAutomaticHeight(docked) 1440 -> 720,
+    SwitchAutomaticMinimum(docked) 1152 -> 576 (Floor(720, 576) = 576). A
+    settings.ini with maximum_height_docked=0 (Auto, the user's) takes it;
+    Graphics -> Maximum resolution still offers 1080/1440 docked. FSR 1 scales
+    720 to the docked output.
+  * settings/menu.cpp: Preset / Maximum / Minimum help texts (EN + ZH) say
+    720p / 576p docked.
+TESTS: settings ctest 11/11; Switch 2 build ok.
+NEXT
+  * Docked run: expect "dynamic resolution: on, 576 to 720 rows".
+  * Pass timing again (now every batch counts) to confirm resolve ~2.5 ms.
+  * A/B LO_SWITCH_UPSCALER=easu (one pass, no RCAS) for the ~3.5 ms
+    presentation cost; candidates after that: lean SPIR-V (no precise),
+    resolve copies.

@@ -2131,9 +2131,9 @@ void Publish(uint8_t *base, uint32_t config)
             break;
         case GraphicsRow::Preset:
 #if defined(__SWITCH2__)
-            next.help = Tr(L"All run at 60 FPS with dynamic resolution: 1080p down to 576p handheld, 1440p down to 1152p docked, FSR below native. "
+            next.help = Tr(L"All run at 60 FPS with dynamic resolution: 1080p down to 576p handheld, 720p down to 576p docked, FSR below native. "
                            L"Quality: every effect. Balanced: depth of field 50%, no bloom. Performance: also no dynamic shadows, motion blur or depth of field.",
-                           L"皆為 60 FPS 並使用動態解析度：掌機 1080p 至 576p，主機 1440p 至 1152p，低於原生時以 FSR 放大。品質：所有效果。平衡：景深 50%，無光暈。效能：另關閉動態陰影、動態模糊與景深。");
+                           L"皆為 60 FPS 並使用動態解析度：掌機 1080p 至 576p，主機 720p 至 576p，低於原生時以 FSR 放大。品質：所有效果。平衡：景深 50%，無光暈。效能：另關閉動態陰影、動態模糊與景深。");
 #elif LO_PLATFORM_SWITCH
             next.help = Tr(L"All use FSR at 30 FPS. Quality: fixed 540p, every effect. Balanced: dynamic 360-540p, depth of field 50%, no bloom. "
                            L"Performance: also no dynamic shadows, motion blur or depth of field.",
@@ -2146,10 +2146,10 @@ void Publish(uint8_t *base, uint32_t config)
         case GraphicsRow::RenderResolution:
 #if defined(__SWITCH2__)
             next.help = graphics_menu::DynamicResolutionOn(edit)
-                ? Tr(L"The highest scene height dynamic resolution uses. Auto: native, 1080p handheld / 1440p docked.",
-                     L"動態解析度使用的最高場景高度。自動：原生，掌機 1080p／主機 1440p。")
-                : Tr(L"Scene height; FSR scales it to the screen when below native. Auto: 1080p handheld / 1440p docked.",
-                     L"場景高度；低於原生時以 FSR 縮放至畫面。自動：掌機 1080p／主機 1440p。");
+                ? Tr(L"The highest scene height dynamic resolution uses. Auto: 1080p handheld (native) / 720p docked.",
+                     L"動態解析度使用的最高場景高度。自動：掌機 1080p（原生）／主機 720p。")
+                : Tr(L"Scene height; FSR scales it to the screen when below native. Auto: 1080p handheld / 720p docked.",
+                     L"場景高度；低於原生時以 FSR 縮放至畫面。自動：掌機 1080p／主機 720p。");
             SwitchEnvironmentHelp(next.help, graphics_menu::MaximumHeightFromEnvironment(), L"LO_SWITCH_RENDER_HEIGHT");
             break;
 #elif LO_PLATFORM_SWITCH
@@ -2180,8 +2180,8 @@ void Publish(uint8_t *base, uint32_t config)
             break;
         case GraphicsRow::MinimumResolution:
 #if defined(__SWITCH2__)
-            next.help = Tr(L"The lowest scene height dynamic resolution steps down to. Auto: 576p handheld / 1152p docked.",
-                           L"動態解析度降低時的最低場景高度。自動：掌機 576p／主機 1152p。");
+            next.help = Tr(L"The lowest scene height dynamic resolution steps down to. Auto: 576p handheld / 576p docked.",
+                           L"動態解析度降低時的最低場景高度。自動：掌機 576p／主機 576p。");
 #else
             next.help = Tr(L"The lowest scene height dynamic resolution steps down to. Auto: 80% of the maximum.",
                            L"動態解析度降低時的最低場景高度。自動：最高解析度的 80%。");

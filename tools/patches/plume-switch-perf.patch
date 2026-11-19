@@ -414,7 +414,7 @@ index 0000000..e9914b8
 +    }
 +};
 diff --git a/plume_vulkan.cpp b/plume_vulkan.cpp
-index 9db5baa..82de1f5 100644
+index 3f15073..c24c9c9 100644
 --- a/plume_vulkan.cpp
 +++ b/plume_vulkan.cpp
 @@ -9,6 +9,11 @@
@@ -429,7 +429,7 @@ index 9db5baa..82de1f5 100644
  #include <cstdlib>
  #include <cstring>
  #include "plume_log.h"
-@@ -182,6 +187,8 @@ namespace plume {
+@@ -194,6 +199,8 @@ namespace plume {
              return VK_FORMAT_A2B10G10R10_UNORM_PACK32;
          case RenderFormat::B10G10R10A2_UNORM:
              return VK_FORMAT_A2R10G10B10_UNORM_PACK32;
@@ -438,7 +438,7 @@ index 9db5baa..82de1f5 100644
          case RenderFormat::R16G16B16A16_FLOAT:
              return VK_FORMAT_R16G16B16A16_SFLOAT;
          case RenderFormat::R16G16B16A16_UNORM:
-@@ -1384,6 +1391,78 @@ namespace plume {
+@@ -1401,6 +1408,78 @@ namespace plume {
  
      // VulkanShader
  
@@ -517,7 +517,7 @@ index 9db5baa..82de1f5 100644
      VulkanShader::VulkanShader(VulkanDevice *device, const void *data, uint64_t size, const char *entryPointName, RenderShaderFormat format) {
          assert(device != nullptr);
          assert(data != nullptr);
-@@ -1404,14 +1483,25 @@ namespace plume {
+@@ -1421,14 +1500,25 @@ namespace plume {
              PLUME_LOG_ERROR("Vulkan", "vkCreateShaderModule", LogErrorDomain::VkResult, res, "");
              return;
          }
@@ -543,7 +543,7 @@ index 9db5baa..82de1f5 100644
      void VulkanShader::setName(const std::string &name) {
          setObjectName(device->vk, VK_OBJECT_TYPE_SHADER_MODULE, uint64_t(vk), name);
      }
-@@ -1537,7 +1627,7 @@ namespace plume {
+@@ -1554,7 +1644,7 @@ namespace plume {
              VkPipelineShaderStageCreateInfo stageInfo = {};
              stageInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
              stageInfo.stage = VK_SHADER_STAGE_VERTEX_BIT;
@@ -552,7 +552,7 @@ index 9db5baa..82de1f5 100644
              stageInfo.pName = vertexShader->entryPointName.c_str();
              stageInfo.pSpecializationInfo = pSpecInfo;
              stages.emplace_back(stageInfo);
-@@ -2063,7 +2153,7 @@ namespace plume {
+@@ -2080,7 +2170,7 @@ namespace plume {
          });
  
          // Pre-rasterization: depth bias enable is static (it needs extended dynamic state 2).
@@ -561,7 +561,7 @@ index 9db5baa..82de1f5 100644
          const VkShaderModule geometryModule = (desc.geometryShader != nullptr) ? static_cast<const VulkanShader *>(desc.geometryShader)->vk : VK_NULL_HANDLE;
          const VkBool32 depthClamp = !desc.depthClipEnabled;
          const VkBool32 depthBias = (desc.depthBias != 0) || (desc.depthBiasClamp != 0.0f) || (desc.slopeScaledDepthBias != 0.0f);
-@@ -2080,6 +2170,7 @@ namespace plume {
+@@ -2097,6 +2187,7 @@ namespace plume {
              VkPipelineShaderStageCreateInfo stages[2];
              uint32_t stageCount = 0;
              stages[stageCount++] = libraryStage(desc.vertexShader, VK_SHADER_STAGE_VERTEX_BIT);
@@ -569,7 +569,27 @@ index 9db5baa..82de1f5 100644
              if (desc.geometryShader != nullptr) {
                  stages[stageCount++] = libraryStage(desc.geometryShader, VK_SHADER_STAGE_GEOMETRY_BIT);
              }
-@@ -5027,7 +5118,8 @@ namespace plume {
+@@ -3487,6 +3578,19 @@ namespace plume {
+         }
+ 
+ 	    VkResult res = vkGetQueryPoolResults(device->vk, vk, 0, uint32_t(results.size()), sizeof(uint64_t) * results.size(), results.data(), sizeof(uint64_t), VK_QUERY_RESULT_64_BIT);
++        if (res == VK_NOT_READY) {
++            // A pool whose timestamps are not all written this use (LO_GPU_PASS_TIMING's 512-slot pool writes one
++            // per change of work): read each with its availability, unwritten ones as 0, which the readers skip.
++            // Before, the whole read was dropped and logged as an error, and the readers saw the previous use's values.
++            std::vector<uint64_t> values(results.size() * 2);
++            res = vkGetQueryPoolResults(device->vk, vk, 0, uint32_t(results.size()), sizeof(uint64_t) * values.size(), values.data(),
++                sizeof(uint64_t) * 2, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
++            if (res == VK_SUCCESS || res == VK_NOT_READY) {
++                for (size_t i = 0; i < results.size(); i++)
++                    results[i] = values[i * 2 + 1] != 0 ? values[i * 2] : 0;
++                res = VK_SUCCESS;
++            }
++        }
+         if (res != VK_SUCCESS) {
+             PLUME_LOG_ERROR("Vulkan", "vkGetQueryPoolResults", LogErrorDomain::VkResult, res, "");
+             return;
+@@ -5069,7 +5173,8 @@ namespace plume {
          }
  
          VkPhysicalDeviceTimelineSemaphoreFeatures timelineFeatures = {};
@@ -580,7 +600,7 @@ index 9db5baa..82de1f5 100644
          if (timelineFound) {
              timelineFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES;
 diff --git a/plume_vulkan.h b/plume_vulkan.h
-index 293ce15..0812fd5 100644
+index 843ef81..b047a03 100644
 --- a/plume_vulkan.h
 +++ b/plume_vulkan.h
 @@ -183,6 +183,14 @@ namespace plume {
@@ -598,7 +618,7 @@ index 293ce15..0812fd5 100644
          VulkanShader(VulkanDevice *device, const void *data, uint64_t size, const char *entryPointName, RenderShaderFormat format);
          ~VulkanShader() override;
          virtual void setName(const std::string &name) override;
-@@ -590,6 +598,9 @@ namespace plume {
+@@ -591,6 +599,9 @@ namespace plume {
          // interpolation extensions and features. Other SDKs can supply aggregate
          // Vulkan feature structs that must not coexist with these individual structs.
          bool enableFrameInterpolationFeatures = false;

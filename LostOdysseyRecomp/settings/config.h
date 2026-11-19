@@ -92,12 +92,13 @@ inline constexpr uint32_t SwitchSceneHeights[] = {360, 432, 504, 540, 576, 648, 
 // Automatic maximum: 540 rows in both modes (720 docked is not yet tested with deko3d; the Maximum resolution
 // row offers it). The release env.txt sets no height, so these rows decide it.
 #ifdef __SWITCH2__
-// Switch 2 (turn 35, 2026-11-18): native 1080 rows handheld and 1440 docked at most, dynamic resolution down to
-// SwitchAutomaticMinimum at 60 FPS; FSR 1 scales a scene below the output's height up to it.
-inline constexpr uint32_t SwitchAutomaticHeight(bool docked) { return docked ? 1440 : 1080; }
-// Automatic minimum (minimumHeight 0): 576 rows handheld, 1152 docked (80% of 1440). 0 elsewhere: 80% of the
-// maximum (dynamic_resolution::DefaultMinimum).
-inline constexpr uint32_t SwitchAutomaticMinimum(bool docked) { return docked ? 1152 : 576; }
+// Switch 2: native 1080 rows handheld at most; docked 720 rows at most (turn 42, the player's choice: was 1440),
+// dynamic resolution down to SwitchAutomaticMinimum at 60 FPS; FSR 1 scales a scene below the output's height up
+// to it. Maximum resolution in Graphics still offers 1080 and 1440 docked.
+inline constexpr uint32_t SwitchAutomaticHeight(bool docked) { return docked ? 720 : 1080; }
+// Automatic minimum (minimumHeight 0): 576 rows in both modes (docked was 1152, 80% of 1440). 0 elsewhere: 80% of
+// the maximum (dynamic_resolution::DefaultMinimum).
+inline constexpr uint32_t SwitchAutomaticMinimum(bool docked) { return docked ? 576 : 576; }
 #else
 inline constexpr uint32_t SwitchAutomaticHeight(bool docked) { return docked ? 540 : 540; }
 inline constexpr uint32_t SwitchAutomaticMinimum(bool) { return 0; }
@@ -233,7 +234,7 @@ struct Config
     // depth of field at 50% and no bloom. A saved settings.ini keeps its own values.
     bool switchFsr = true;
 #if defined(__SWITCH2__)
-    // Switch 2: dynamic resolution on, Automatic heights (1080 -> 576 handheld, 1440 -> 1152 docked).
+    // Switch 2: dynamic resolution on, Automatic heights (1080 -> 576 handheld, 720 -> 576 docked).
     bool dynamicResolution = true;
     uint32_t maximumHeight[2] = {0, 0};
     uint32_t minimumHeight[2] = {0, 0};
