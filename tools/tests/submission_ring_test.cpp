@@ -38,6 +38,33 @@ int main()
         CHECK(kDefaultBatchDraws == 0);
 #endif
     }
+    {
+        // Turn 36: a batch is noted before the queue call and accepted after it.
+        Ring<4> ring;
+        Entry e{7, 70};
+        e.rejected = true;
+        ring.Push(e);
+        CHECK(ring.At(0).rejected);
+        ring.Accept(7);
+        CHECK(!ring.At(0).rejected);
+        e.serial = 8;
+        ring.Push(e);
+        ring.Accept(99); // unknown: nothing changes
+        CHECK(ring.At(1).rejected);
+        CHECK(BatchUploadLimit("0") == 0);
+        CHECK(BatchUploadLimit("2") == 8);
+        CHECK(BatchUploadLimit("200") == 200);
+        CHECK(BatchUploadLimit("x") == kDefaultBatchUploads);
+        CHECK(!SplitForUploads(100000, 1ull << 40, 0));
+#ifdef __SWITCH2__
+        CHECK(kDefaultBatchUploads == 96);
+        CHECK(!SplitForUploads(95, 1 << 20, 96) && SplitForUploads(96, 0, 96));
+        CHECK(SplitForUploads(1, kBatchUploadBytes, 96) && !SplitForUploads(1, kBatchUploadBytes - 1, 96));
+#else
+        CHECK(kDefaultBatchUploads == 0);
+        CHECK(SplitForUploads(96, 0, 96) && !SplitForUploads(1, 1ull << 40, 96));
+#endif
+    }
     if (failures) return EXIT_FAILURE;
     std::puts("submission_ring_test: ok");
     return 0;

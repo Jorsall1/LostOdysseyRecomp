@@ -1,0 +1,110 @@
+================================================================================
+LostOdysseyRecomp - Nintendo Switch 2 port
+Summary - TURN 36: field-map crash is a driver-side submit refusal, GPU timer
+fix (real GPU time is 1/1.63 of what we measured), green flash, resolve/restore
+savings on Switch 2
+================================================================================
+Build: NRO md5 973e3536cc14d8676cb10ace119ffdd4 (Desktop copy matches).
+ELF: build/fieldmap_turn36_973e3536.elf. kaiHEN fix untouched (RawInitialize
+still fsOpenSdCardFileSystem; no SetCurrentProcess on smGetService sessions).
+Desktop env.txt: LO_GUEST_AFFINITY=1 only; A/B lines commented.
+NOT yet run on hardware.
+
+LOG READ (lo project/runtime-1795046994431949.log, handheld, 571 s)
+  * Crash: same spot as turn 35. "scene ready: map u11_0_scrw" at 570.359,
+    "video: Vulkan submission stopped raw_vk=-4" at 570.962, MESA "context
+    failed at nvkmd_nvgpu_native_ctx.c:738" + "primary arena is poisoned",
+    then libnx exit to hbmenu. Handheld 1024x576 this time, docked 2560x1440
+    last time: not resolution, not GPU load.
+  * The 16 batches in the ring were tiny (3 draws, 0.5 ms GPU, completed). The
+    refused batch was never in the ring (it was pushed only after success).
+  * Clocks: handheld cpu 1101 MHz, gpu 561 MHz, mem 2133 MHz the whole run.
+    The apm request (Switch 1 config 0x92220008) reads 561 -> 561: no effect
+    on Switch 2. 561 MHz handheld / 1007 MHz docked are the Switch 2 game
+    maximums; nothing higher is available to an application.
+  * Battle at 576 rows: fps 42-48, gpu_ms 26-30, gpu_pct 110-141 (!).
+    Movie: 60 fps, gpu_ms 12.2. Title/loading: DR stepped 576 -> 612 -> 648
+    -> 684 on the loading screen before mv_01v (GPU 0.3 ms), each a rebuild of
+    every scene target, then back to 576 at the battle (one more rebuild).
+
+ROOT CAUSES
+  1. Crash (disassembly of libouncevk.a vulkan.o, no Mesa source needed):
+     line 738 is in native_ctx_flush_locked, the branch taken when
+     native_ctx_prepare_batch -> nvkmd_nvgpu_native_batch_prepare_sources
+     returns non-zero. That function validates the batch's command ranges
+     before submission: at most ~2043 ranges (16-byte entries at ctx+0x108),
+     each 4-aligned and <= 8 MiB, every range inside a known span, and the
+     summed size must fit the primary arena ([arena+40]); then it allocates
+     from the arena (failure -> 4). So the GPU never faulted; the driver
+     refused one oversized submission and poisoned its context. The refused
+     batch is the first frame of the field map, where the map's textures are
+     created and copied in all at once (no per-batch bound on uploads).
+     Not proven which limit (count / size / arena), the new ring line will say
+     what the refused batch held.
+  2. GPU timer: plume-switch.patch scales NVK timestamps by 625/384 (the
+     Switch 1's 614.4 MHz GPU timer). Batch timestamps are bottom-of-pipe, so
+     batch intervals cannot overlap; their union reached 141% of wall time,
+     which is only possible if the scale is wrong (true period <= 1.156 ns,
+     so NVK's 1 ns is right on Switch 2). Every GPU number since turn 35 was
+     1.63x too high: dynamic resolution held the scene far lower than needed.
+     Real battle GPU at 576 rows is ~18 ms, not 29.
+  3. Green flash before the intro movie: the loading-screen DR step above,
+     plus new render targets on NVK are not cleared (only deko3d cleared them),
+     so a resized target shows old memory for a frame.
+
+CHANGES
+  Crash
+    * gpu/submission_ring.h: Entry has textureUploads, uploadBytes, rejected;
+      Ring::Accept. New Switch 2 split: a batch also ends after 96 texture
+      uploads or 24 MiB of upload-ring bytes (SplitForUploads,
+      LO_SWITCH_BATCH_UPLOADS=<n>, 0 = off). Logged at startup ("batches also
+      end after ...") and every 300 frames when it happens.
+    * gpu/renderer.cpp: Flush pushes the ring entry BEFORE the queue call with
+      rejected=true and accepts it after. A refused batch now prints as
+      "REFUSED by the queue (this submission stopped the GPU)" with its draws,
+      resolves, texture_uploads and upload_kib. Upload() counts bytes;
+      the guest-texture create path counts uploads.
+    * Draw split stays at 1024 (LO_SWITCH_BATCH_DRAWS).
+  GPU timing
+    * plume_vulkan.cpp + tools/patches/plume-switch.patch (same line count, the
+      chain lostodyssey -> sdl3 -> switch -> switch2 -> switch-perf applies on
+      clean d890ac8 and reproduces the tree): the 625/384 factor is Switch 1
+      only (#if __SWITCH__ && !__SWITCH2__). Expect gpu_ms ~1/1.63 of before
+      and gpu_pct <= 100. Dynamic resolution now sees true cost, so it holds
+      higher heights in fields and movies.
+  Dynamic resolution (gpu/dynamic_resolution.h, frame_plan.cpp)
+    * No step up from frames under 3 ms GPU (loading screens, fades, movies).
+    * No change at all while the guest loader runs (gpu::loading::inProgress);
+      Controller::Hold restarts the window and strikes.
+  Green flash
+    * New render targets get the queued zero clear on Switch 2 too (was
+      deko3d only; the game's own full clear replaces it at no cost).
+  GPU work (both were measured on Switch 1 deko3d, generic renderer logic)
+    * Restore skip (LO_SKIP_RESTORE=0 to turn off): the game's copy-back draw
+      after a resolve, and the clear before it, are skipped when the target
+      still holds the resolved image.
+    * Resolve blit (LO_RESOLVE_BLIT=0 to turn off): same-format resolves are a
+      3D-engine blit, not a copy-engine copy between two barriers (on NVK the
+      copy engine shares the channel and each engine switch waits for idle).
+TESTS (host g++, with and without -D__SWITCH2__)
+  submission_ring_test (Accept, BatchUploadLimit, SplitForUploads),
+  dynamic_resolution_test (0.3 ms frames never step up, Hold, a 6 ms scene
+  still steps up), gpu_busy_test: all ok. Switch 2 build ok.
+
+COST MODEL (with the timer fix applied to the logged numbers)
+  Battle GPU ~= 13 ms fixed + 8.4 ms per million pixels (1080: ~31 ms,
+  576: ~18 ms). Resolution is not the main lever in battle; the fixed 13 ms
+  (shadow maps, fixed-size targets, per-draw/barrier overhead for ~1400
+  draws) is. The restore skip and resolve blit cut part of it; how much is
+  unmeasured on Switch 2.
+
+NEXT (user)
+  1. Copy the NRO (env.txt unchanged except comments). Title -> intro battle
+     -> first field map (u11_0_scrw), handheld. If it still crashes, the log's
+     "last 16 GPU batches" block now ends with the REFUSED batch: send it.
+  2. Check: perf lines gpu_pct <= 100; battle fps; "scene at N rows" lines
+     (fewer, none on loading screens); no green flash before mv_01v.
+  3. Then one A/B per run, same battle ~60 s: LO_GPU_PASS_TIMING=1 (where the
+     fixed 13 ms goes), LO_SWITCH_BATCH_DRAWS=2048 (one batch per battle frame
+     instead of two; 2 GPU slots let the CPU run only one batch ahead),
+     LO_RESOLVE_BLIT=0 and LO_SKIP_RESTORE=0 (confirm they help on NVK).

@@ -19,7 +19,10 @@ struct Entry
     uint32_t width = 0, height = 0; // internal scene size
     uint32_t scene = 0;        // renderer scene tag
     uint32_t gpuUs = 0;        // completed batch GPU time (end - begin), 0 until completed or without timestamps
+    uint32_t textureUploads = 0; // guest textures created (and copied in) in this batch
+    uint64_t uploadBytes = 0;  // bytes written to the upload ring in this batch
     bool completed = false;
+    bool rejected = false;     // pushed before the queue call and cleared by Accept: still set, the queue refused it
 };
 
 template <size_t N = 16>
@@ -41,6 +44,12 @@ struct Ring
     {
         for (auto& e : entries)
             if (e.serial == serial && serial) { e.completed = true; e.gpuUs = gpuUs; return; }
+    }
+    // The queue took batch `serial`.
+    void Accept(uint64_t serial)
+    {
+        for (auto& e : entries)
+            if (e.serial == serial && serial) { e.rejected = false; return; }
     }
     size_t Size() const { return next < N ? size_t(next) : N; }
     // Oldest first: i = 0 is the oldest kept entry.
@@ -66,4 +75,31 @@ inline uint32_t BatchDrawLimit(const char* value)
 }
 // Whether the open batch, with `batchDraws` draws recorded, ends before the next draw.
 inline constexpr bool SplitBeforeDraw(uint32_t batchDraws, uint32_t limit) { return limit && batchDraws >= limit; }
+// Switch 2 (turn 36): the device losses at the first field map (u11_0_scrw) are not GPU faults. OunceVK's
+// native_ctx_flush_locked fails in native_ctx_prepare_batch (the "context failed at nvkmd_nvgpu_native_ctx.c:738"
+// line), which checks the batch's command ranges against fixed per-submission limits (count, total size, the
+// primary arena) before anything reaches the GPU. The batch it refused is the first frame of a new map, when many
+// textures are created and copied in at once. A batch therefore also ends after this many texture uploads or upload
+// bytes, so a map's first frame becomes several ordinary submissions. LO_SWITCH_BATCH_UPLOADS=<n> (0: no limit).
+#ifdef __SWITCH2__
+inline constexpr uint32_t kDefaultBatchUploads = 96;
+inline constexpr uint64_t kBatchUploadBytes = 24ull << 20;
+#else
+inline constexpr uint32_t kDefaultBatchUploads = 0;
+inline constexpr uint64_t kBatchUploadBytes = 0;
+#endif
+inline uint32_t BatchUploadLimit(const char* value)
+{
+    if (!value || !*value) return kDefaultBatchUploads;
+    char* end = nullptr;
+    const unsigned long parsed = std::strtoul(value, &end, 10);
+    if (end == value || *end) return kDefaultBatchUploads;
+    if (parsed == 0) return 0;
+    return parsed < 8 ? 8u : parsed > 1u << 16 ? 1u << 16 : uint32_t(parsed);
+}
+// Whether the open batch, with `uploads` texture uploads and `bytes` upload bytes, ends before the next draw.
+inline constexpr bool SplitForUploads(uint32_t uploads, uint64_t bytes, uint32_t limit)
+{
+    return limit && (uploads >= limit || (kBatchUploadBytes && bytes >= kBatchUploadBytes));
+}
 }

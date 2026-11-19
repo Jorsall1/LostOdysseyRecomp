@@ -222,8 +222,10 @@ namespace gpu::renderer
         for (size_t i = 0; i < g_submissionRing.Size(); ++i) {
             const auto& e = g_submissionRing.At(i);
             LOG_ERROR("renderer:   batch {} frame {} submitted {} ms ago: draws={} resolves={} rect_lists={} occlusion={} "
-                "scene={}x{} tag={:08x} {}", e.serial, e.frame, nowMs >= e.submitMs ? nowMs - e.submitMs : 0, e.draws,
-                e.resolves, e.rectLists, e.occlusionQueries, e.width, e.height, e.scene,
+                "texture_uploads={} upload_kib={} scene={}x{} tag={:08x} {}", e.serial, e.frame,
+                nowMs >= e.submitMs ? nowMs - e.submitMs : 0, e.draws, e.resolves, e.rectLists, e.occlusionQueries,
+                e.textureUploads, e.uploadBytes >> 10, e.width, e.height, e.scene,
+                e.rejected ? std::string("REFUSED by the queue (this submission stopped the GPU)") :
                 e.completed ? fmt::format("completed, GPU {:.1f} ms", e.gpuUs / 1000.0) : std::string("not completed"));
         }
     }
@@ -2209,9 +2211,12 @@ namespace gpu::renderer
             uint32_t descriptorBatchLimit = 500;
             // The open batch's work, for the submission ring and the Switch 2 draw split (gpu/submission_ring.h).
             uint32_t batchDraws = 0, batchResolves = 0, batchRectLists = 0;
+            uint32_t batchTextureUploads = 0;
+            uint64_t batchUploadBytes = 0;
             uint64_t nextBatchSerial = 0;
             const uint32_t batchDrawLimit = gpu::submission_ring::BatchDrawLimit(getenv("LO_SWITCH_BATCH_DRAWS"));
-            uint32_t drawSplits = 0;
+            const uint32_t batchUploadLimit = gpu::submission_ring::BatchUploadLimit(getenv("LO_SWITCH_BATCH_UPLOADS"));
+            uint32_t drawSplits = 0, uploadVolumeSplits = 0;
             std::array<uint64_t, gpu::pass_timing::kCategories> passTotals{};
             uint64_t passFrames = 0, passBatches = 0;
             std::chrono::steady_clock::time_point passSince = std::chrono::steady_clock::now();
@@ -3350,6 +3355,8 @@ namespace gpu::renderer
                     descriptorReuse, nativeVulkan ? "Vulkan" : vulkan ? "Metal" : "D3D12", descriptorBatchLimit, kGpuSlots);
                 LOG_NOTICE("renderer: batches end every {} draws (LO_SWITCH_BATCH_DRAWS; 0: only when descriptors run out)",
                     batchDrawLimit);
+                LOG_NOTICE("renderer: batches also end after {} texture uploads or {} MiB of uploads (LO_SWITCH_BATCH_UPLOADS; 0: no limit)",
+                    batchUploadLimit, gpu::submission_ring::kBatchUploadBytes >> 20);
                 binaryFormat = vulkan ? xenos::ShaderBinaryFormat::Spirv : xenos::ShaderBinaryFormat::Dxil;
                 renderFormat = vulkan ? RenderShaderFormat::SPIRV : RenderShaderFormat::DXIL;
                 if (!device || !queue)
@@ -5969,6 +5976,8 @@ void main()
                         Gpu().occlusionBatch = nextOcclusionBatch++;
                     }
                     batchDraws = batchResolves = batchRectLists = 0;
+                    batchTextureUploads = 0;
+                    batchUploadBytes = 0;
                     Gpu().passTimed = false;
                     if (gpu::pass_timing::Enabled() && device->getCapabilities().queryPools) {
                         if (!Gpu().passQueries) Gpu().passQueries = device->createQueryPool(gpu::pass_timing::kQueries);
@@ -6074,6 +6083,27 @@ void main()
                 Gpu().sceneTaaHdrSerial = sceneTaaHdrHistory ? sceneTaaHdrHistory->RecordedSerial() : 0;
                 Gpu().motionSerial = motionReplay ? motionReplay->RecordedSerial() : 0;
                 bool submitted = true;
+                // Noted before the queue call, so a refused batch is in the ring that StopGpuWork prints.
+                uint64_t ringSerial = 0;
+                {
+                    gpu::submission_ring::Entry entry;
+                    entry.serial = ringSerial = ++nextBatchSerial;
+                    entry.frame = frame;
+                    entry.submitMs = uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch()).count());
+                    entry.draws = batchDraws;
+                    entry.resolves = batchResolves;
+                    entry.rectLists = batchRectLists;
+                    entry.occlusionQueries = hostOcclusion ? Gpu().occlusionUsed : 0;
+                    entry.width = internalSize.width;
+                    entry.height = internalSize.height;
+                    entry.scene = sceneTag;
+                    entry.textureUploads = batchTextureUploads;
+                    entry.uploadBytes = batchUploadBytes;
+                    entry.rejected = true;
+                    std::lock_guard lock(g_submissionRingMutex);
+                    g_submissionRing.Push(entry);
+                }
 #if defined(LO_GPU_PLUME)
                 int32_t rawVkResult = 0;
                 uint64_t submissionSerial = 0;
@@ -6123,21 +6153,9 @@ void main()
                     return false;
                 }
                 {
-                    gpu::submission_ring::Entry entry;
-                    entry.serial = ++nextBatchSerial;
-                    entry.frame = frame;
-                    entry.submitMs = uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(
-                        std::chrono::steady_clock::now().time_since_epoch()).count());
-                    entry.draws = batchDraws;
-                    entry.resolves = batchResolves;
-                    entry.rectLists = batchRectLists;
-                    entry.occlusionQueries = hostOcclusion ? Gpu().occlusionUsed : 0;
-                    entry.width = internalSize.width;
-                    entry.height = internalSize.height;
-                    entry.scene = sceneTag;
                     std::lock_guard lock(g_submissionRingMutex);
-                    g_submissionRing.Push(entry);
-                    Gpu().ringSerial = entry.serial;
+                    g_submissionRing.Accept(ringSerial);
+                    Gpu().ringSerial = ringSerial;
                 }
 #if defined(LO_GPU_PLUME)
                 const bool orderedPresentQueue = queue && queue == video::GetQueue() &&
@@ -6251,6 +6269,7 @@ void main()
                 if (data)
                     CopyToUploadRing(uploadMapped + offset, data, size);
                 Gpu().uploadOffset = offset + size;
+                batchUploadBytes += size;
                 return offset;
             }
 
@@ -9067,7 +9086,9 @@ void main()
                 // deko3d: a new target's memory still holds what an earlier image left there, in that image's layout (the
                 // targets a size change replaces show as stripes and blocks) until the game clears it. It starts cleared
                 // to zero instead, as a queued clear that the game's own whole clear replaces at no cost.
-                if (resizeFix && video::IsDeko3d() && !preserveOverlap) {
+                // Switch 2 (NVK) as well since turn 36: its new targets show old memory too, the green flash on the
+                // loading screen when dynamic resolution resized the targets there (2026-11-18).
+                if (resizeFix && (video::IsDeko3d() || LO_PLATFORM_SWITCH2) && !preserveOverlap) {
                     static constexpr float zero[4]{};
                     tex->pendingClear.Record(depth ? pending_clear::DepthOp(true, true, 0.0f, 0) : pending_clear::ColorOp(zero),
                         tex->width, tex->height);
@@ -10095,6 +10116,7 @@ void main()
                 if (dred::Enabled()) tex->texture->setName(fmt::format("guest {:08x}", tex->guestAddress));
 
                 texBytes += upload.size();
+                ++batchTextureUploads;
                 const size_t keepFree = upload.size() + kUploadHeadroom <= kUploadRingSize ? kUploadHeadroom : 0;
                 uint64_t offset = Upload(upload.data(), upload.size(), 512, keepFree);
                 if (offset == UINT64_MAX)
@@ -10775,7 +10797,11 @@ void main()
                 // submission runs long enough to trip a GPU timeout (gpu/submission_ring.h).
                 const bool drawsFull = listOpen && gpu::submission_ring::SplitBeforeDraw(batchDraws, batchDrawLimit);
                 drawSplits += drawsFull;
-                const bool poolsFull = textureSetsFull || samplerVersionsFull || drawsFull;
+                // Switch 2: and after a run of texture uploads (a new map's first frame), see SplitForUploads.
+                const bool uploadsFull = listOpen && !drawsFull &&
+                    gpu::submission_ring::SplitForUploads(batchTextureUploads, batchUploadBytes, batchUploadLimit);
+                uploadVolumeSplits += uploadsFull;
+                const bool poolsFull = textureSetsFull || samplerVersionsFull || drawsFull || uploadsFull;
                 const bool ringLow = Gpu().uploadOffset + kUploadHeadroom > kUploadRingSize;
                 const auto wrap = gpu::render_arena::EvaluateWrap(
                     gpuSlot, Gpu().arenaOffset, gpuSlots[(gpuSlot + 1) % kGpuSlots].arenaOffset);
@@ -10880,7 +10906,9 @@ void main()
                 // copy shader, often right after the resolve cleared the target. Here the target still holds it, unless
                 // the queued clear runs. A target stays in COPY_SOURCE after a resolve until something writes it, and
                 // that layout proves the two images are the same, so the clear and the draw can both go.
-                static const bool skipRestores = video::IsDeko3d() && !(getenv("LO_SKIP_RESTORE") && getenv("LO_SKIP_RESTORE")[0] == '0');
+                // Switch 2 (Vulkan) too since turn 36: the check is the renderer's own layout bookkeeping, not deko3d's.
+                static const bool skipRestores = (video::IsDeko3d() || LO_PLATFORM_SWITCH2) &&
+                    !(getenv("LO_SKIP_RESTORE") && getenv("LO_SKIP_RESTORE")[0] == '0');
                 constexpr uint64_t kPlainCopyShader = 0x38b953b91dcfd9ceull;
                 if (skipRestores && psHash == kPlainCopyShader && info.indexCount <= 6 && !(depthControl & 7) &&
                     Reg(REG_RB_BLENDCONTROL0) == 0x10001 && (Reg(REG_RB_COLOR_MASK) & 0xF) == 0xF && !(Reg(REG_RB_COLORCONTROL) & 8))
@@ -15697,7 +15725,10 @@ void main()
                     // The same pixels through the blit shader on the 3D engine, not a copy-engine copy between two barriers
                     // (exact for these formats: each value round-trips through float32). First battle, 3 runs: 26.62 to
                     // 27.72 FPS, GPU 37.01 to 35.34 ms. LO_RESOLVE_BLIT=0 goes back to the copy.
-                    static const bool resolveBlit = video::IsDeko3d() && !(getenv("LO_RESOLVE_BLIT") && getenv("LO_RESOLVE_BLIT")[0] == '0');
+                    // Switch 2 too since turn 36: NVK's copy runs on the copy engine's subchannel of the same channel, and
+                    // each switch between it and the 3D engine waits for the GPU to go idle.
+                    static const bool resolveBlit = (video::IsDeko3d() || LO_PLATFORM_SWITCH2) &&
+                        !(getenv("LO_RESOLVE_BLIT") && getenv("LO_RESOLVE_BLIT")[0] == '0');
                     const resolve_copy::Copy copy{color.allocationSerial, rs.tex->allocationSerial,
                         color.width, color.height, texW, texH, uint32_t(color.format), x0, y0, w, h};
                     const bool reuse = resolveCopyReuse && consecutiveResolveCopies.CanReuse(copy);
@@ -16827,6 +16858,12 @@ void main()
                     r.drawSplits = 0;
                     r.passSince = now;
                 }
+            }
+            if (g_renderer->frame % 300 == 0 && g_renderer->uploadVolumeSplits)
+            {
+                LOG_INFO("renderer: {} batches ended after {} texture uploads or {} MiB of uploads in the last 300 frames",
+                    g_renderer->uploadVolumeSplits, g_renderer->batchUploadLimit, gpu::submission_ring::kBatchUploadBytes >> 20);
+                g_renderer->uploadVolumeSplits = 0;
             }
             if (g_renderer->frame % 300 == 0 && g_renderer->noopDrawsSkipped)
             {

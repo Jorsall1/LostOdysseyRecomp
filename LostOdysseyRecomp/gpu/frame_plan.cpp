@@ -7,6 +7,7 @@
 #include "gpu/video.h"
 #include "gpu/dynamic_resolution.h"
 #include "gpu/gpu_busy.h"
+#include "gpu/loading_pacing.h"
 #include <debug/perf_stats.h>
 #include <chrono>
 #include <cstdlib>
@@ -142,6 +143,13 @@ namespace gpu::frame_plan
             const uint64_t now = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now().time_since_epoch()).count());
             bool changed = false;
+            // Loading (the guest loader hooks, gpu/loading_pacing.h): keep the height; a change there rebuilds every
+            // scene target for a loading screen, and its new uncleared targets can show for a frame.
+            if (gpu::loading::inProgress.load(std::memory_order_acquire) && controller.base == configured &&
+                controller.requestedMinimum == minimum) {
+                controller.Hold(now, gpu_busy::Total());
+                return controller.height;
+            }
             const uint32_t height = controller.Update(now, gpu_busy::Total(), configured, minimum, budgetMs, changed, step);
             if (controller.minimum != announcedMinimum || configured != announcedBase) {
                 announcedMinimum = controller.minimum;

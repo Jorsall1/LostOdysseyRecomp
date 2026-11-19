@@ -77,6 +77,21 @@ int main()
         uint64_t now = 1'000'000'000ull, busy = 1;
         CHECK(Run(c, now, busy, 10, 1080, 576, [](uint32_t) { return 8.0; }) == 1080);
     }
+    {
+        // Turn 36: a loading screen (0.3 ms) never steps up, and Hold keeps the height and its strikes clear.
+        dr::Controller c;
+        uint64_t now = 1, busy = 0;
+        const auto heavy = [](uint32_t h) { return 30.0 * double(h) * h / (1080.0 * 1080.0); };
+        const uint32_t low = Run(c, now, busy, 5, 1080, 576, heavy);
+        CHECK(low < 1080);
+        const uint32_t after = Run(c, now, busy, 20, 1080, 576, [](uint32_t) { return 0.3; });
+        CHECK(after == low);
+        c.Hold(now, busy);
+        CHECK(c.height == low && c.upStrikes == 0 && c.downStrikes == 0);
+        // A light real scene (6 ms at this height) still steps up.
+        const uint32_t up = Run(c, now, busy, 20, 1080, 576, [low](uint32_t h) { return 6.0 * double(h) * h / (double(low) * low); });
+        CHECK(up > low);
+    }
     if (failures) return EXIT_FAILURE;
     std::puts("dynamic_resolution_test: ok");
     return 0;

@@ -63,6 +63,10 @@ namespace gpu::dynamic_resolution
         // must stay under (its cost scaled by its pixel count) before stepping up.
         static constexpr double DownAt = 0.92, UpBelow = 0.80;
         static constexpr uint64_t WindowNs = 500'000'000ull, DownHoldNs = 1'000'000'000ull, UpHoldNs = 3'000'000'000ull;
+        // A frame that costs less than this says nothing about the scene: a loading screen, a fade or a movie (Switch 2,
+        // 2026-11-18: 576 -> 612 rows on the loading screen at 0.3 ms before mv_01v, a rebuild of every scene target
+        // there and again when the battle started). It never steps up.
+        static constexpr double MeaningfulMs = 3.0;
 
         uint32_t base = 0, minimum = 0, height = 0, step = Rung;
         uint64_t windowStart = 0, windowBusy = 0, lastChange = 0;
@@ -114,7 +118,9 @@ namespace gpu::dynamic_resolution
                 return height;
             }
             downStrikes = 0;
-            if (height < base) {
+            if (height < base && busyMs < MeaningfulMs) {
+                upStrikes = 0;
+            } else if (height < base) {
                 const double up = double(height + step) / height;
                 if (busyMs * up * up < budgetMs * UpBelow) {
                     if (++upStrikes >= 6 && nowNs - lastChange >= UpHoldNs) {
@@ -128,6 +134,13 @@ namespace gpu::dynamic_resolution
             return height;
         }
 
+        // While a load runs: no change, and the frames until then do not count (their GPU time is a loading screen's).
+        void Hold(uint64_t nowNs, uint64_t busyTotalNs)
+        {
+            if (!base) return;
+            Restart(nowNs, busyTotalNs);
+            downStrikes = upStrikes = 0;
+        }
     private:
         void Restart(uint64_t nowNs, uint64_t busyTotalNs)
         {

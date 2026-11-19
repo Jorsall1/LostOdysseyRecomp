@@ -115,10 +115,10 @@ index cf5b792..093248d 100644
  
          // Store properties.
          vkGetPhysicalDeviceProperties(physicalDevice, &physicalDeviceProperties);
-+#   if defined(__SWITCH__)
-+        // NVK reports a 1 ns timestamp period, as on desktop GPUs, but the Switch
-+        // GPU timer runs at 614.4 MHz (625/384 ns per tick). Timings read as 1 ns
-+        // ticks come out 1.63x too short.
++#   if defined(__SWITCH__) && !defined(__SWITCH2__)
++        // NVK reports a 1 ns timestamp period. The Switch 1 GPU timer runs at 614.4 MHz
++        // (625/384 ns per tick). The Switch 2's counts nanoseconds: with this factor its
++        // GPU read 110-141% busy (2026-11-18), so it keeps NVK's 1 ns.
 +        if (physicalDeviceProperties.limits.timestampPeriod == 1.0f) {
 +            physicalDeviceProperties.limits.timestampPeriod = 625.0f / 384.0f;
 +        }
