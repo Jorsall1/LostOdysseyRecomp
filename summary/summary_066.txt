@@ -1,0 +1,55 @@
+================================================================================
+LostOdysseyRecomp - Nintendo Switch 2 port
+Summary - TURN 66: first GPU error type: PBDMA error (bad command stream), not
+a shader or memory-read fault; shader rewrites ruled out; push_sync test
+================================================================================
+No code changes. NRO on the Desktop is still turn 65 (md5 31382c35...).
+LOGS READ (Desktop\lo project\crash1, crash2; turn 65 NRO, handheld)
+  crash1 (test A, env.txt LO_GUEST_AFFINITY=1, 1920x1080):
+    49.13 s "GPU fence wait failed raw_vk=-4", driver status 8.
+    Channel tap: info32 32 = PBDMA error, status 0xffff.
+    Error info (NvError): type 3, words 0x00200000 0x80000000 0 0 0x0000c797,
+    rest 0. 0xc797 is the Ampere 3D class (AMPERE_B), so the error is tied
+    to the 3D engine's command stream. 0x00200000 matches the METHOD bit
+    (bit 21) of the PBDMA interrupt register in nvgpu's headers (invalid
+    method); the Horizon layout of NvError is not documented, so this
+    reading is likely, not proven.
+    Batches: 3302 menu closing frame (13 draws), 3303 first 3D frame (389
+    draws, 29 occlusion, 1911 KiB), both dumped (turn 65 change works).
+  crash2 (test B, LO_TRIM_VARYINGS=0 LO_LEAN_SPIRV=0 LO_EARLY_Z=0, confirmed
+    in stderr: no [trim]/[lean] lines):
+    90.96 s "Vulkan submission stopped", 738 refusal (prepare_sources), batch
+    5834 (first 3D frame, 295 draws) REFUSED. Tap: "GPU channel reports no
+    error" (the driver refused the batch before the GPU ran it).
+  "Took longer": no. crash2 stayed ~30 s longer on the title screen (map=-
+    until 62 s, vs ~20 s). Both stopped ~7-8 s after opening the in-game
+    menu, on the first close, about 30 s into the field.
+CONCLUSIONS
+  * Shader rewrites ([trim], [lean], early-Z) are not the cause: test B
+    stopped the same way. (The [arena] clamp stays; it was on in both.)
+  * PBDMA = the GPU's command fetcher rejected the command stream. A shader
+    reading bad memory would be an MMU fault (31) or GR exception (13). So
+    either the command data in GPU memory was wrong (overwritten, or not
+    written back from the CPU cache), or the driver encoded a bad command.
+    The 738 refusal (crash2) is the driver's own check of the same command
+    ranges failing on the CPU side. Both point at the batch's command
+    memory, on the first heavy batch after the menu.
+DRIVER NOTES (/tmp/ouncevk-src)
+  * NVK_DEBUG is read with getenv at instance creation; env.txt values are set
+    before that. The ELF contains the options and vk_push_print.
+  * push_sync (nvkmd.c nvkmd_ctx_exec): after every exec the driver syncs
+    (flush + drain); if the exec or the sync fails it prints the exec's
+    command buffer, decoded, to stderr (vk_push_print).
+  * full_cmd_flush / full_arena_flush only widen cache flushes, and the
+    native backend's mode-2 memory flush is just "dsb sy", so they test
+    little. Not used.
+TEST FILE (Desktop\lo project\env_test_pushsync.txt -> rename to env.txt)
+  LO_GUEST_AFFINITY=1, NVK_DEBUG=push_sync. Same menu test.
+  * If it stops: stderr.log holds the failing submission's commands; compare
+    with the PBDMA error (method 0x00200000 words) and the batch dump.
+    Writing the dump to the SD card can take a while; let it exit.
+  * If it never stops in several menu closes: timing matters (the CPU
+    reusing command memory too early, or a driver race between batches);
+    push_sync is then a workaround and the bug goes to the OunceVK author.
+NEXT (user): run test C, send the folder (stderr.log is the important one).
+================================================================================
