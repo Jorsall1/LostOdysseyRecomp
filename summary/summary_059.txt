@@ -1,0 +1,37 @@
+================================================================================
+LostOdysseyRecomp - Nintendo Switch 2 port
+Summary - TURN 59: turn 58 log read (good), only connected npads are read,
+clean play env.txt
+================================================================================
+Build: NRO md5 6984894f037bf7e5f0ad35f0d2ab4f01 (Desktop copy matches).
+kaiHEN fix untouched. Not on HW yet.
+
+LOG READ: Desktop\lo project\runtime-1795105219445710.log
+  Turn 58 NRO, LO_GUEST_AFFINITY=1 + LO_CPU_PROFILE=1, handheld, ~280 s:
+  Tolsan -> Uhra -> Main Street -> Central Station Square -> Monorail ->
+  Central Station Square, HOME -> X (exit.log clean). No errors, GPU stops or
+  WAIT_REG_MEM stalls; 6 XMA decode warnings (contexts 3 and 11), stderr no
+  longer flooded.
+  * Gameplay 55.5-60.0 FPS, p99 17-26 ms, DR 1024x576 - 1280x720.
+  * Hitches: 90-255 ms at map loads (cp_idle = waiting for the game, as
+    before); no repeat of the 1.77 s Residential Area freeze.
+  * 229-242 s: 20 hitches incl. one 492 ms present while the settings menu
+    was open (overlay turned off, settings saved). Menu only.
+  * 280 s: 1476 ms pace stall at exit (HOME), harmless.
+
+CHANGES
+  1. hid/switch_npad.h + os/switch/npad_switch.cpp: ConnectedMask() reads the
+     npad style sets (SDL pad 1 = No1 or Handheld, pad i+1 = No(i+1)).
+     Separate file because libnx's Mutex collides with the runtime PCH.
+  2. hid/hid.cpp LiveControllers(): on Switch, the pads read in GetState,
+     PumpHostInput (ReadRawButtonsLocked), PressedSources and rumbled in
+     RumbleAll are only those whose npad has a controller. Rebuilt every
+     250 ms and on SDL add/remove; logs "controller: npads with a controller
+     mask=..." when it changes. Safety: mask 0 -> all pads (old behaviour);
+     pads with ids outside 1-8 always kept. SDL_UpdateGamepads still updates
+     all 8 (thirdparty SDL untouched; padUpdate is a shared-memory read).
+
+TEST ENV: Desktop\lo project\env.txt = LO_GUEST_AFFINITY=1 only (profiler
+removed, it costs speed).
+NEXT (user): check controls handheld, docked with a Pro Controller, and
+detaching/attaching Joy-Cons mid-game; the log should show the mask line.

@@ -17,6 +17,9 @@ extern std::atomic<uint32_t> g_presentedSwaps;
 #include "face_buttons.h"
 #include "input_map.h"
 #include "android_touch.h"
+#include "switch_npad.h"
+#include <bit>
+#include <chrono>
 
 // SDL game controller -> XInput state. Player 1 only for now; the keyboard
 // mirrors the pad so the game can be driven without a controller.
@@ -41,6 +44,51 @@ static_assert(map::DefaultKeyboard[map::A] == SDL_SCANCODE_Z && map::DefaultKeyb
 namespace
 {
     std::vector<SDL_Gamepad*> g_controllers;
+#if LO_PLATFORM_SWITCH
+    // The pads that are read and rumbled (hid/switch_npad.h): SDL adds 8 and reports all 8 connected, so
+    // every pump read 7 empty ones (~40 SDL calls each, ~1% of GPU CmdProc in turn 57's profile). Rebuilt from
+    // the npad styles every kLiveRefresh and when SDL adds or removes a pad. A pad outside SDL's 8 (another
+    // driver, a virtual pad) is always kept; with no npad reporting a controller, every pad is kept, as before.
+    // Guarded by g_hidMutex.
+    std::vector<SDL_Gamepad*> g_liveControllers;
+    std::chrono::steady_clock::time_point g_liveRefreshed{};
+    bool g_liveValid = false;
+    uint32_t g_liveMask = UINT32_MAX;
+    constexpr auto kLiveRefresh = std::chrono::milliseconds(250);
+#endif
+    // Caller holds g_hidMutex.
+    const std::vector<SDL_Gamepad*>& LiveControllers()
+    {
+#if LO_PLATFORM_SWITCH
+        const auto now = std::chrono::steady_clock::now();
+        if (g_liveValid && now - g_liveRefreshed < kLiveRefresh) return g_liveControllers;
+        g_liveRefreshed = now;
+        g_liveValid = true;
+        const uint32_t mask = hid::switch_npad::ConnectedMask();
+        if (mask != g_liveMask)
+        {
+            LOG_INFO("controller: npads with a controller mask=0x{:02x} ({} of {} SDL pads read)", mask,
+                     mask ? std::popcount(mask) : int(g_controllers.size()), g_controllers.size());
+            g_liveMask = mask;
+        }
+        g_liveControllers.clear();
+        for (auto* pad : g_controllers)
+        {
+            const auto id = SDL_GetGamepadID(pad);
+            const bool sdlSwitchPad = id >= 1 && id <= SDL_JoystickID(hid::switch_npad::kPadCount);
+            if (mask == 0 || !sdlSwitchPad || (mask & (1u << (id - 1)))) g_liveControllers.push_back(pad);
+        }
+        return g_liveControllers;
+#else
+        return g_controllers;
+#endif
+    }
+    void InvalidateLiveControllers()
+    {
+#if LO_PLATFORM_SWITCH
+        g_liveValid = false;
+#endif
+    }
     std::vector<SDL_JoystickID> g_physicalControllerIds;
     std::atomic<uint32_t> g_physicalControllerCount{0};
     hid::prompts::ActiveController g_promptController;
@@ -148,7 +196,7 @@ namespace
 
     void RumbleAll(uint16_t left, uint16_t right, uint32_t duration)
     {
-        for (auto* controller : g_controllers)
+        for (auto* controller : LiveControllers())
         {
             if (!SDL_GamepadConnected(controller)) continue;
             SDL_RumbleGamepad(controller, left, right, duration);
@@ -178,6 +226,7 @@ namespace
             if (auto* pad = SDL_OpenGamepad(id))
             {
                 g_controllers.push_back(pad);
+                InvalidateLiveControllers();
                 if (physical)
                 {
                     g_physicalControllerIds.push_back(id);
@@ -247,6 +296,7 @@ void hid::HandleControllerEvent(uint32_t eventType, uint32_t which)
             g_promptController.Disconnected(which);
             PublishPromptStyle();
             SDL_CloseGamepad(pad);
+            InvalidateLiveControllers();
             return true;
         });
     }
@@ -292,7 +342,7 @@ uint32_t hid::PressedSources()
 {
     std::lock_guard lock(g_hidMutex);
     uint32_t pressed = 0;
-    for (auto* controller : g_controllers)
+    for (auto* controller : LiveControllers())
         if (SDL_GamepadConnected(controller)) pressed |= ReadSources(controller).pressed;
     return pressed;
 }
@@ -334,7 +384,7 @@ void hid::ClearKeyboardState()
 static uint16_t ReadRawButtonsLocked(uint8_t& lt, uint8_t& rt, bool observe = true)
 {
     uint16_t buttons = 0;
-    for (auto* controller : g_controllers)
+    for (auto* controller : LiveControllers())
     {
         if (!SDL_GamepadConnected(controller)) continue;
         if (observe) ObserveController(controller);
@@ -507,7 +557,7 @@ uint32_t hid::GetState(uint32_t dwUserIndex, XAMINPUT_STATE* pState)
         // Only prompts use this, so it needn't run on every reading.
         const bool observe = freshPad && (!LO_PLATFORM_SWITCH || pollTime - g_lastControllerObserve >= kControllerObserveEvery);
         if (observe) g_lastControllerObserve = pollTime;
-        if (freshPad) for (auto* controller : g_controllers)
+        if (freshPad) for (auto* controller : LiveControllers())
         {
             if (!SDL_GamepadConnected(controller)) continue;
             if (observe) ObserveController(controller);
