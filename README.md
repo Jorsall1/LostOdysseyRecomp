@@ -23,7 +23,7 @@ Free and open source: if you paid for this, ask for a refund.
 
 A homebrew build of Lost Odyssey Recomp for the Nintendo Switch 2, running under [kaiHEN](https://github.com/ouncebrew/kaihen). The game's Xbox 360 code is statically recompiled to native ARM64. Its graphics run on Vulkan through [OunceVK](https://github.com/ouncebrew/ouncevk), the Switch 2's Mesa NVK driver, and the port is built with [libounce](https://github.com/ouncebrew/libounce) from the [ounce devkit](https://github.com/ouncebrew/ounce-devkit).
 
-You need your own Lost Odyssey discs. This project contains no game files.
+You need your own Lost Odyssey discs. This project contains no disc files.
 
 The game plays through fields, towns, battles and menus, and Settings changes apply while playing. Report crashes, missing effects or anything that looks or sounds different from the Xbox 360 ([how](#reporting-a-problem)).
 
@@ -51,7 +51,7 @@ You need:
 - a **microSD card** with about **25 GB** free (the game data alone is about 21 GB);
 - your **Lost Odyssey discs** (Asian multilingual or USA/Europe edition, as ISOs, Games on Demand data or folders; don't mix editions);
 - a **Windows or Linux PC**, to extract the discs once with the [PC version](https://github.com/freefrank/LostOdysseyRecomp/releases/latest);
-- the **[Switch 2 release ZIP](https://github.com/Jorsall1/LostOdysseyRecomp/releases/latest)** (the game) and the **shader files** from the [Switch release](https://github.com/Ad0ky/LostOdysseyRecomp/releases/latest) (see step 3).
+- the **[release ZIP](https://github.com/Jorsall1/LostOdysseyRecomp/releases/latest)**: the game, its settings file and its shaders.
 
 ### 1. Extract your discs on a PC
 
@@ -65,12 +65,8 @@ You don't need to play the PC version.
 
 ### 2. Copy the game to the SD card
 
-1. Extract the Switch 2 release ZIP to the **root** of the SD card. It creates `switch/LostOdysseyRecomp/` with `LostOdysseyRecomp.nro` and `env.txt`.
+1. Extract the release ZIP to the **root** of the SD card. It creates `switch/LostOdysseyRecomp/` with `LostOdysseyRecomp.nro`, `env.txt` and `shaders/`.
 2. Copy the whole `disc1`…`disc4` folders into `sdmc:/switch/LostOdysseyRecomp/game/`.
-
-### 3. Add the shader files
-
-From the [Switch release ZIP](https://github.com/Ad0ky/LostOdysseyRecomp/releases/latest) (Ad0ky/LostOdysseyRecomp), copy only `shaders/portable_vk.lospv` and `shaders/pipelines_corpus.bin` into `sdmc:/switch/LostOdysseyRecomp/shaders/`. Don't copy that release's `.nro`, `env.txt` or `cache/` folder: they are for the Switch 1 build.
 
 ### SD card layout
 
@@ -78,14 +74,14 @@ From the [Switch release ZIP](https://github.com/Ad0ky/LostOdysseyRecomp/release
 sdmc:/
 └── switch/
     └── LostOdysseyRecomp/
-        ├── LostOdysseyRecomp.nro        the game (Switch 2 release ZIP)
-        ├── env.txt                      extra settings (Switch 2 release ZIP)
+        ├── LostOdysseyRecomp.nro        the game (release ZIP)
+        ├── env.txt                      extra settings (release ZIP)
         ├── game/                        your discs (PC importer)
         │   ├── disc1/                   default.xex, LO.fpi, LO.fpd, xenon_*.fpd
         │   ├── disc2/
         │   ├── disc3/
         │   └── disc4/
-        ├── shaders/                     from the Switch release ZIP
+        ├── shaders/                     the game's shaders (release ZIP)
         │   ├── portable_vk.lospv
         │   └── pipelines_corpus.bin
         │
@@ -102,7 +98,7 @@ sdmc:/
 
 The PC importer stores files that are the same on several discs only once. On the exFAT card they take their full size again, so the card needs the full ~21 GB.
 
-### 4. Start the game
+### 3. Start the game
 
 Start the Homebrew Menu **through title takeover**: hold **R** while starting any installed game, then choose **Lost Odyssey Recomp**.
 
@@ -176,7 +172,7 @@ This repository also carries the rest of upstream's source, so the PC, macOS and
 ## Credits
 
 - **Switch 2 port:** [Jorsall1](https://github.com/Jorsall1) and Claude ([Anthropic](https://www.anthropic.com)).
-- **Switch port**, which this port is built on: [Ad0ky](https://github.com/Ad0ky) and [depende3000](https://github.com/depende3000), in [Ad0ky/LostOdysseyRecomp](https://github.com/Ad0ky/LostOdysseyRecomp).
+- **Switch port**, which this port is built on: [Ad0ky](https://github.com/Ad0ky) and [depende3000](https://github.com/depende3000), in [Ad0ky/LostOdysseyRecomp](https://github.com/Ad0ky/LostOdysseyRecomp). The shader pack (`portable_vk.lospv`) and pipeline list (`pipelines_corpus.bin`) in the release ZIP come from their [v1.2.0 release](https://github.com/Ad0ky/LostOdysseyRecomp/releases/tag/v1.2.0_NX).
 - **Lost Odyssey Recomp**, the original recompilation: [freefrank](https://github.com/freefrank), in [freefrank/LostOdysseyRecomp](https://github.com/freefrank/LostOdysseyRecomp), and its contributors: [MikeRavenelle](https://github.com/MikeRavenelle), [dj5927](https://github.com/dj5927), [Xarishark](https://github.com/Xarishark), [navjack](https://github.com/navjack), [frankzzz](https://github.com/frankzzz), [cngjd](https://github.com/cngjd) and [faisalkindi](https://github.com/faisalkindi).
 - **Switch 2 homebrew:** [ouncebrew](https://github.com/ouncebrew) for [kaiHEN](https://github.com/ouncebrew/kaihen), [libounce](https://github.com/ouncebrew/libounce), [OunceVK](https://github.com/ouncebrew/ouncevk) and the [ounce devkit](https://github.com/ouncebrew/ounce-devkit).
 - **Research and tools:** [UnleashedRecomp](https://github.com/hedge-dev/UnleashedRecomp), [XenonRecomp](https://github.com/hedge-dev/XenonRecomp), [XenosRecomp](https://github.com/hedge-dev/XenosRecomp), [re:Blue](https://github.com/zolaware/reblue), [plume](https://github.com/renderbag/plume), [Xenia](https://github.com/xenia-project/xenia), [devkitPro](https://devkitpro.org) and [Mesa](https://mesa3d.org) (NVK).

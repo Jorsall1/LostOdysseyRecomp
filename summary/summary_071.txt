@@ -1,0 +1,26 @@
+================================================================================
+LostOdysseyRecomp - Nintendo Switch 2 port
+Summary - TURN 71: release ZIP now carries the shader files; no separate
+Switch-release download
+================================================================================
+No code changes.
+FILES IN Downloads\LostOdysseyRecomp-switch-v1.2.0 (Ad0ky's Switch release)
+  Used by the Switch 2 build (runtime log "portable shader pack hit ...
+  147970990 file bytes", "pipeline corpus ... 3974 recipes"):
+    shaders/portable_vk.lospv   (md5 c42d00b0e2b720c2137ab285b8fde32b)
+    shaders/pipelines_corpus.bin (md5 10a05ebe89db8bf8e36997a8ea8c2f75)
+  Not used (no such names in our NRO, or Switch 1 only):
+    shaders/deko3d_shaders.lodk, deko3d_shaders_lean3.lodk, cache/
+    deko3d_runtime.dkcache, cache/lsfg-vk-pipeline-cache.bin, cache/shaders/
+    builtin_v28_dxil.lostore, the .nro and its env.txt (deko3d settings).
+  Not shipped although the names match: cache/shaders/pipeline_cache_vk.bin
+    (Switch 1 NVK driver cache; our OunceVK writes its own, 94 MB in the
+    turn 67 log), cache/shaders/pipelines_vk12_1.bin and shaders_spirv.lostore
+    (learned per console / empty; the game creates them).
+RELEASE v0.1.0 ZIP (182416044 bytes) = switch/LostOdysseyRecomp/{
+  LostOdysseyRecomp.nro (ce75f6cc...), env.txt, shaders/portable_vk.lospv,
+  shaders/pipelines_corpus.bin }. User adds only game/disc1-4.
+README + release notes: shader download step removed, layout chart says the
+  shaders come in the ZIP, credit for the shader pack/corpus to Ad0ky's
+  v1.2.0_NX release, "no game files" -> "no disc files".
+================================================================================
