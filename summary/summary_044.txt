@@ -1,0 +1,29 @@
+================================================================================
+LostOdysseyRecomp - Nintendo Switch 2 port
+Summary - TURN 44: disc changes and the opening movie (code review, no changes)
+================================================================================
+DISC CHANGES
+  * docs/notes/disc-selection.md: the game's own disc request (guest
+    82821E90 / manager 82320428) calls XamSwapDisc (kernel/imports.cpp).
+    FileSystem::SelectDisc picks <game root>/../disc<N> (Switch:
+    sdmc:/switch/LostOdysseyRecomp/game/discN), kernel/io/disc_set.cpp checks
+    default.xex metadata (title, edition, Media ID, disc number), LO.FPI and
+    the 13 archives, then swaps the root; the guest reloads that disc's LO.FPI.
+    No prompt or button. A missing/invalid disc: error 21, old disc stays.
+  * User's SD copy ("lo project/sd card/.../game"): disc1-disc4 each have
+    default.xex, LO.fpi and all 13 .fpd archives.
+  * Tested on PC only (1->2->3->4->1 through the original manager, USA/EU and
+    Asia). Never run on the Switch, and no real chapter-boundary change was
+    ever played on any platform. Log line to look for: "automatically selected
+    installed disc N" (or "disc N unavailable or incomplete").
+OPENING MOVIE
+  * No code skips, blocks or shortens a movie before the title. All WMV
+    movies go through movie/movie_hooks.cpp (FFmpeg VC-1 on a host thread on
+    Switch, LO_NATIVE_MOVIES=0 = guest decoder).
+  * Boot logs (crash run, turn-41 run) have no "native movie" lines before the
+    title: the game did not start a movie at boot. The long opening (mv_01v,
+    196 s) plays after New Game: confirmed in turn 31.
+  * PC docs mention a "title intro movie" (STATUS.md, voice-language trace).
+    When it is triggered (idle title timer vs boot) is not in the code or
+    notes: the game decides. Likely mv_00v (124.7 s). Test: wait 1-2 min on
+    the title without pressing anything; look for "native movie: mv_00v".
