@@ -65,6 +65,9 @@
 #include <os/platform.h>
 #if LO_PLATFORM_SWITCH
 #include <os/switch_platform.h>
+#if LO_PLATFORM_SWITCH2
+#include <os/switch/ouncevk_channel_tap.h>
+#endif
 #include <os/debug_server.h>
 #include <debug/map_info.h>
 #include <movie/movie_player.h>
@@ -1852,6 +1855,22 @@ namespace gpu::video
         if (first)
             LOG_ERROR("video: native GPU work stopped backend={} raw_result={}; device restart required",
                 g_vulkan ? "Vulkan" : g_deko3d ? "deko3d" : g_metal ? "Metal" : "D3D12", nativeResult);
+#if LO_PLATFORM_SWITCH2 && !defined(LO_VIDEO_SUBMISSION_UNIT)
+        if (first) {
+            LoChannelError channel{};
+            if (lo_ouncevk_channel_error(&channel)) {
+                LOG_ERROR("video: GPU channel error fd={} rc={:#x}: info32={} ({}) info16={:#x} status={:#x} timestamp={}",
+                    channel.fd, channel.notificationRc, channel.info32, lo_ouncevk_channel_error_name(channel.info32),
+                    channel.info16, channel.status, channel.timestamp);
+                LOG_ERROR("video: GPU channel error info rc={:#x} type={} words={:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x}",
+                    channel.errorInfoRc, channel.errorInfo[0], channel.errorInfo[1], channel.errorInfo[2],
+                    channel.errorInfo[3], channel.errorInfo[4], channel.errorInfo[5], channel.errorInfo[6],
+                    channel.errorInfo[7], channel.errorInfo[8]);
+            } else {
+                LOG_ERROR("video: GPU channel reports no error (the driver stopped before the GPU did)");
+            }
+        }
+#endif
         g_submissionState.Stop(nativeResult);
 #if defined(_WIN32) && !defined(LO_VIDEO_SUBMISSION_UNIT)
         if (first && !g_vulkan && g_device)

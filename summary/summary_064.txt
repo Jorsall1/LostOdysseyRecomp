@@ -1,0 +1,60 @@
+================================================================================
+LostOdysseyRecomp - Nintendo Switch 2 port
+Summary - TURN 64: GPU stop again with the 512 MiB vertex clamp active; the
+driver's status 8 means the GPU channel reported an error; the error type is
+now logged (nvIoctl tap)
+================================================================================
+Build: NRO md5 aff47262725741d5b3f5067e1dc08967 (Desktop copy matches).
+ELF build/channeltap_turn64.elf. Driver OunceVK 2d6a8aec (unchanged).
+kaiHEN fix untouched (libounce unchanged; the tap only passes calls through).
+LOG READ (Desktop\lo project\runtime-1795118927442590.log, stderr.log,
+exit.log; turn 63 NRO, env.txt LO_GUEST_AFFINITY=1, handheld, Tolsan's Inn)
+  * stderr shows "[arena] ... vertex fetch clamp at 512 MiB": the turn 63 fix
+    was active. It did not stop the crash, so an out-of-arena vertex fetch
+    was not the cause (or not the only one).
+  * 78.45 s "GPU fence wait failed raw_vk=-4". Same shape as every stop since
+    turn 37: menu batches (24 draws) until 5107, batch 5108 = the menu's
+    closing frame (13 draws, starts with a transfer 39 -> 37), 5109 = first
+    3D frame (290 draws, 29 occlusion queries, 1592 KiB uploads).
+  * stderr: "completion join failed: status 8 ... baseline 50407268, target
+    50407271", then "primary arena is poisoned". Exit clean (exit.log).
+DRIVER SOURCE (/tmp/ouncevk-src, nvkmd_nvgpu_native_completion.c)
+  Status 8 = NVKMD_NVGPU_COMPLETION_HEALTH: the counter reached the target
+  AND the batch's marker verified (the GPU did run the batch to its end), but
+  the channel error notification (nvIoctl 0xc0104817) had a non-zero status.
+  So the channel faulted, and the fault did not stop that batch's marker.
+  The driver reads only the notification's status word; the error type
+  (info32: 8 idle timeout, 13 GR exception, 31 MMU fault, 32 PBDMA error,
+  ...) is dropped. Without it we cannot tell a bad memory access from a
+  shader/graphics-engine exception or a bad command stream.
+CHANGES
+  * os/switch/ouncevk_channel_tap.c/.h (new, Switch 2 only), linked with
+    -Wl,--wrap=nvIoctl (LostOdysseyRecomp/CMakeLists.txt, LO_TARGET_SWITCH2).
+    Every nvIoctl call goes to the real one unchanged. When the health query
+    returns a failure or a non-zero status, the first time only, it records
+    the notification (fd, timestamp, info32, info16, status), sends one
+    GetErrorInfo (0x80804816, NvError: type + 31 words) on the same fd and
+    prints both to stderr.log as "[gpu channel] ...".
+    If the stop comes without a health check (738 refusal, 793 refused
+    submit), lo_ouncevk_channel_error() queries the last channel fd itself.
+  * gpu/video.cpp StopGpuWork: on the first stop, runtime log lines
+    "video: GPU channel error ... info32=N (name)" and "video: GPU channel
+    error info ... type=..." or "GPU channel reports no error".
+  * Checked in the ELF: the driver's nvkmd_nvgpu_native_channel_health calls
+    __wrap_nvIoctl.
+WHAT THE RESULT WILL TELL
+  * 31 MMU fault: a GPU access to unmapped memory. Next suspects: a
+    descriptor or vertex/index buffer pointing at memory freed while the
+    menu was up (resources unused in the menu, freed, then used again on the
+    first 3D frame), or the occlusion query buffers.
+  * 13 GR exception: a shader or graphics engine error (bad state, a shader
+    trap); look at the shaders and state of the first 3D frame.
+  * 32 / 80 PBDMA: a bad command stream (driver side; report to OunceVK).
+  * 8 idle timeout: a hang, not a fault.
+  The error info words may also carry a fault address; we will compare it
+  with the renderer's buffer and arena addresses.
+NEXT (user)
+  * Copy the NRO. Same test (field -> menu -> equip -> close, several times).
+  * When it stops, send stderr.log and the runtime log. The lines to look
+    for: "[gpu channel]" in stderr.log, "GPU channel error" in the runtime log.
+================================================================================

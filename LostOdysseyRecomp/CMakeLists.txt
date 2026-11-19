@@ -186,6 +186,9 @@ elseif(LO_TARGET_PLATFORM STREQUAL "switch")
     if(LO_TARGET_SWITCH2)
         target_link_options(LostOdysseyRecomp PRIVATE
             "-Wl,--wrap=__libc_cond_wait,--wrap=__libc_cond_wait_recursive,--wrap=svcSleepThread")
+        # os/switch/ouncevk_channel_tap.c: keeps the GPU channel's error type, which OunceVK's health check drops.
+        target_sources(LostOdysseyRecomp PRIVATE ${LO_RUNTIME_ROOT}/os/switch/ouncevk_channel_tap.c)
+        target_link_options(LostOdysseyRecomp PRIVATE "-Wl,--wrap=nvIoctl")
     endif()
     # thirdparty/plume-deko3d: LO_DEKO3D_PRESENT_THREAD hands deko3d's buffer-queue calls to a worker.
     # Switch 2 (libounce/OunceVK) has no deko3d back end, so neither is built there.
