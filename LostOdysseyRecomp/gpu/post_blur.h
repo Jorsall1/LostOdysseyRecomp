@@ -2,6 +2,7 @@
 #include <cstdlib>
 #include <cstring>
 #include "settings/config.h"
+#include "gpu/effect_budget.h"
 
 // The game's depth of field and bloom are two quarter-size blur chains that only
 // the tone-map pass reads: the depth of field blur in fetch slot 2, where a
@@ -21,6 +22,10 @@ inline bool SkipEnabled()
     }();
     return enabled;
 }
-inline bool SkipDepthOfField(const settings::Config& config) { return SkipEnabled() && config.depthOfFieldPercent == 0; }
+// Also while the effect budget (gpu/effect_budget.h) has the blur off.
+inline bool SkipDepthOfField(const settings::Config& config)
+{
+    return SkipEnabled() && (config.depthOfFieldPercent == 0 || effect_budget::DofBlurSkip());
+}
 inline bool SkipBloom(const settings::Config& config) { return SkipEnabled() && !config.bloom; }
 }

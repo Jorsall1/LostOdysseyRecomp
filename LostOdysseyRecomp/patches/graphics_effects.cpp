@@ -2,6 +2,7 @@
 #include <atomic>
 #include <os/logger.h>
 #include "gpu/post_blur.h"
+#include "gpu/effect_budget.h"
 #include "settings/config.h"
 
 // Player switches for two of the game's own effects, the recompiled
@@ -31,7 +32,7 @@ std::atomic<int> shadowState{-1};
 // guest state, which is where Xenia's inverted beq at 826E1884 sends it.
 PPC_FUNC(sub_826E1860)
 {
-    if (!Logged(motionBlurState, settings::GetConfig().motionBlur, "motion blur"))
+    if (!Logged(motionBlurState, settings::GetConfig().motionBlur && !gpu::effect_budget::MotionBlurOff(), "motion blur"))
     {
         ctx.r3.u64 = 0;
         return;

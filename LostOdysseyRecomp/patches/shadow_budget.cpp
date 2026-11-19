@@ -8,6 +8,7 @@
 #include <kernel/memory.h>
 #include <os/logger.h>
 #include "settings/config.h"
+#include "gpu/effect_budget.h"
 
 // Dynamic shadows Low: per-object shadows only for objects on screen, and for
 // at most the LowCount largest of them. Each shadow costs a depth pass, its
@@ -111,7 +112,9 @@ bool OnScreen(uint32_t renderer, uint32_t primitive)
 
 PPC_FUNC(sub_823BE570)
 {
-    const bool lowNow = settings::GetConfig().dynamicShadows == 2;
+    // Low from the settings, or from the effect budget (gpu/effect_budget.h) when shadows are On.
+    const uint32_t setting = settings::GetConfig().dynamicShadows;
+    const bool lowNow = setting == 2 || (setting == 1 && gpu::effect_budget::ShadowsLow());
     if (lowNow != low)
         LOG_INFO("graphics effects: dynamic shadows {}", lowNow ? "low" : "full");
     low = lowNow;

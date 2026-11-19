@@ -1,0 +1,75 @@
+================================================================================
+LostOdysseyRecomp - Nintendo Switch 2 port
+Summary - TURN 39: effect budget (motion blur / DoF blur / shadows Low above
+14 ms GPU), dynamic resolution holds while Settings is open, fixed-size
+targets survive a dynamic resolution step
+================================================================================
+Build: NRO md5 9b653c40ff91f802b2f1becf7a5b7614 (Desktop copy matches; it
+REPLACED the turn-38 NRO f2214beb, rebuild 79c0e2a6 for that one).
+ELF: build/perf_turn39_9b653c40.elf. kaiHEN fix untouched.
+NOT yet run on hardware.
+DOCS
+  /tmp/ur2/docs/SWITCH-PERFORMANCE*.md and SWITCH-MESA.md do not exist on this
+  machine (no /tmp/ur2; no file of those names anywhere). docs/SWITCH-
+  BENCHMARKS.md read: it is Switch 1 / deko3d (lean shaders, early-Z
+  program headers, Zcull, LO_DEKO3D_*); none of it applies to the NVK path.
+  libouncevk.a env names: NVK_DEBUG (push_dump, zero_memory, gart, edb_bview,
+  no_cbuf...: all debug or slower), NVK_EXPERIMENTAL, MESA_VK_ENABLE_SUBMIT_
+  THREAD, MESA_SHADER_CACHE_*. Nothing to turn on for speed. The submit
+  thread was not enabled: it would sit in front of the native submission path
+  whose completion join failed in turn 37.
+LOG READ (runtime-1795055623434490.log, 523 s, clean, HOME->X exit)
+  * Field (Highlands, 300-500 draws) at 1024x576: 60.0 FPS, p99 17.1 ms,
+    gpu_ms 13.5-16.5 (gpu_pct 81-98). Locked 60 at the floor with no headroom:
+    the GPU cost there is mostly fixed (not pixels).
+  * 422.9-454 s Settings open over the field (134 draws): dynamic resolution
+    stepped 576 -> 972 rows (11 rebuilds behind the menu), then on resume GPU
+    31.9 ms and a jump back to 576. Fixed (below).
+  * Settings: 80 ms frames with present_ms ~68 while navigating = the CPU
+    menu raster at 1920x1080 on the presentation thread. NOT changed (moving
+    RasterizeMenu off the present thread is a larger change).
+  * Occlusion history: 190k reads/10 s, stale 6, no waits: already the cheap
+    path (History policy, no mid-frame sync). Not changed.
+CHANGES
+  gpu/effect_budget.h (new), wired in gpu/frame_plan.cpp (next to dynamic
+  resolution, same gpu_busy total, only with DR on):
+    * Level 1 after 2 windows (1 s) above the budget: motion blur off
+      (sub_826E1860) + depth of field blur off. Level 2 after another second:
+      Dynamic shadows Low (shadow_budget.cpp, 8 largest on-screen casters).
+      Back one level after 3 s under 70% of the budget, >= 5 s apart.
+      Frames under 3 ms and loads/Settings do not count.
+    * Budget = 84% of the frame (14 ms at 60), LO_EFFECT_BUDGET_MS=<ms>;
+      LO_EFFECT_BUDGET=0 off. Never turns on what Settings turned off.
+    * DoF ordering: renderer tone-map weight goes to 0 first, guest blur
+      skip 30 CPU frames later; on restore the blur restarts first and the
+      weight returns 30 frames later (no black-blend frame).
+    * Log: "effect budget: level N (...; GPU x ms per frame, budget y ms)".
+  gpu/frame_plan.cpp: dynamic resolution and the effect budget Hold while
+    settings::IsOpen(), as for a load.
+  gpu/renderer.cpp (internal size change, no upscaler/FG, shadow multiplier
+    unchanged): targets whose scale reference is neither the old scene size,
+    its 16:9 area nor the legacy size are kept (shadow maps, 640x640 and other
+    fixed surfaces, the 880/440 shadow colour family). Before, every step
+    recreated them zero-cleared: a frame of empty shadow map / reset exposure
+    per step (a likely cause of shadow flicker on resolution changes). At a
+    1280x720 old scene everything is rebuilt as before. LO_DR_KEEP_FIXED=0
+    restores the full rebuild. Logged: "scene size step keeps N fixed-size
+    targets" (first 8 steps).
+TESTS
+  tools/tests/effect_budget_test.cpp (new: cut, cap, hold band, restore,
+  DoF ordering never skips blur with weight on, loads) ok;
+  dynamic_resolution_test ok (both -D__SWITCH2__ and not); settings ctest
+  11/11; Switch 2 build ok.
+NOT DONE / NOTES
+  * HUD/UI crispness: the game draws HUD into the scene targets, so it scales
+    with dynamic resolution. Separating it is a renderer change not attempted.
+  * Battle: needs LO_GPU_PASS_TIMING=1 numbers to know whether shadows,
+    gs_rect, resolves or per-draw cost own the fixed time.
+  * Settings menu raster on the present thread (68 ms per change at 1080p).
+NEXT (user)
+  1. Field and a battle, handheld, perf overlay on. Look for "effect budget:
+     level" and "scene at N rows" lines; field should now climb above 576.
+  2. Watch shadows on dynamic resolution steps (should no longer blink).
+  3. If something looks wrong: LO_DR_KEEP_FIXED=0 or LO_EFFECT_BUDGET=0 in
+     env.txt (commented lines added to the Desktop env.txt) to isolate.
+  4. One battle run with LO_GPU_PASS_TIMING=1, send the log.

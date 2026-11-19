@@ -1,4 +1,5 @@
 #include <source_location>
+#include "effect_budget.h"
 #include "taa_binding_evidence.h"
 #include "scene_aa_provenance.h"
 #include "scene_copy_promotion_policy.h"
@@ -8894,7 +8895,39 @@ void main()
                     framebuffers.clear();
                     lastFramebuffer = nullptr;
                     transferDebt = {}; // its textures go with renderTargets
-                    renderTargets.clear();
+                    // A dynamic resolution step (scene size only, no upscaler or frame generation) keeps the targets
+                    // whose size does not follow the scene: shadow maps, square/fixed surfaces and the shadow colour
+                    // family. Recreating them dropped their contents (a zero-cleared shadow map or exposure surface
+                    // for a frame at every step) and cost allocations. A target is kept when its scale reference is
+                    // neither the old scene size nor its 16:9 area (Unknown-role targets), so at a 1280x720 scene
+                    // everything is rebuilt as before. LO_DR_KEEP_FIXED=0 rebuilds all of them on every step.
+                    static const bool keepFixed = [] {
+                        const char* value = getenv("LO_DR_KEEP_FIXED");
+                        return !(value && value[0] == '0');
+                    }();
+                    const bool sceneStepOnly = keepFixed && !shadowChanged && resizeFix &&
+                        activePlan.requestedUpscaler == upscaling::Upscaler::Off &&
+                        activePlan.frameGeneration == upscaling::FrameGeneration::Off;
+                    size_t keptTargets = 0;
+                    if (sceneStepOnly) {
+                        const uint32_t oldArea = std::min(internalSize.height, uint32_t((uint64_t(internalSize.width) * 9) / 16));
+                        const resolution::Size oldAreaSize{uint32_t((uint64_t(oldArea) * 16) / 9), oldArea};
+                        const resolution::Size oldLegacy{activePlan.legacyWidth, activePlan.legacyHeight};
+                        for (auto it = renderTargets.begin(); it != renderTargets.end();) {
+                            const auto& size = it->second ? it->second->resolutionSize : internalSize;
+                            if (!it->second || size == internalSize || size == oldAreaSize || size == oldLegacy) {
+                                it = renderTargets.erase(it);
+                            } else {
+                                ++keptTargets;
+                                ++it;
+                            }
+                        }
+                        static uint32_t loggedKeeps = 0;
+                        if (loggedKeeps++ < 8)
+                            LOG_INFO("renderer: scene size step keeps {} fixed-size targets", keptTargets);
+                    } else {
+                        renderTargets.clear();
+                    }
                     ++targetEpoch;
                     // Without an upscaler or frame generation, resolves keep their images across a size change: the
                     // game samples last frame's resolves (and ones it made once) before it writes them again, and a
@@ -11189,7 +11222,9 @@ void main()
                 // c7.x gates the additive bloom. The FSR alpha replay reads the
                 // same copy; the next draw restores it from the snapshot.
                 if (key.ps == color_qualification::kTonemapPS) {
-                    const auto post = settings::GetConfig();
+                    auto post = settings::GetConfig();
+                    // The effect budget (gpu/effect_budget.h) zeroes the weight before the guest stops the blur.
+                    if (gpu::effect_budget::DofWeightZero()) post.depthOfFieldPercent = 0;
                     if (post.depthOfFieldPercent < 100) {
                         const float scale = float(post.depthOfFieldPercent) / 100.0f;
                         for (const unsigned component : {0u, 1u})

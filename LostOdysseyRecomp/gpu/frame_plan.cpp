@@ -6,6 +6,7 @@
 #include "gpu/dlss_status_log.h"
 #include "gpu/video.h"
 #include "gpu/dynamic_resolution.h"
+#include "gpu/effect_budget.h"
 #include "gpu/gpu_busy.h"
 #include "gpu/loading_pacing.h"
 #include <debug/perf_stats.h>
@@ -22,6 +23,7 @@ extern "C" PPC_FUNC(__imp__sub_827BA640);
 extern "C" PPC_FUNC(__imp__sub_823BC138);
 extern "C" PPC_FUNC(__imp__sub_824DD6F8);
 
+namespace settings { bool IsOpen(); }
 namespace gpu::frame_plan
 {
     bool wire::CatalogStage::Write(uint32_t index, uint32_t value, SurfaceRole& committedRole, uint32_t& committedSurface, uint32_t& committedColor)
@@ -116,6 +118,30 @@ namespace gpu::frame_plan
         // configured height); env.txt's LO_DYNAMIC_RESOLUTION and LO_DYNAMIC_RESOLUTION_MIN win over it, and
         // LO_DYNAMIC_RESOLUTION_STEP=<rows> sets the step (a multiple of 9, default 36). Only without
         // an upscaler, which sizes its own input.
+        // The effect budget (gpu/effect_budget.h) runs beside dynamic resolution, from the same GPU busy time.
+        effect_budget::Controller effectBudget;
+        void UpdateEffectBudget(bool enabled, bool loading, uint64_t nowNs, double frameMs)
+        {
+            static const bool environment = effect_budget::EnvironmentEnabled();
+            if (!enabled || !environment) {
+                if (effectBudget.level || effectBudget.started) {
+                    if (effectBudget.level) LOG_INFO("effect budget: off, effects as set");
+                    effectBudget.Reset();
+                    effect_budget::Publish(effectBudget);
+                }
+                return;
+            }
+            const double budgetMs = effect_budget::BudgetMs(frameMs);
+            if (loading) {
+                effectBudget.Hold(nowNs, gpu_busy::Total());
+            } else if (effectBudget.Update(nowNs, gpu_busy::Total(), budgetMs)) {
+                static constexpr const char* names[] = {"all effects as set", "motion blur and depth of field blur off",
+                    "motion blur and depth of field blur off, dynamic shadows low"};
+                LOG_INFO("effect budget: level {} ({}; GPU {:.1f} ms per frame, budget {:.1f} ms)", effectBudget.level,
+                    names[std::min(effectBudget.level, effect_budget::MaxLevel)], effectBudget.lastBusyMs, budgetMs);
+            }
+            effect_budget::Publish(effectBudget);
+        }
         uint32_t DynamicHeight(uint32_t configured, const settings::Config& config)
         {
             static const int environmentEnabled = dynamic_resolution::EnvironmentEnabled();
@@ -127,6 +153,7 @@ namespace gpu::frame_plan
             // (settings::SwitchAutomaticMinimum). Shadow targets keep their size across steps (render_resolution.h).
             const bool enabled = environmentEnabled >= 0 ? environmentEnabled == 1 : config.dynamicResolution;
             if (!enabled || config.upscaler != upscaling::Upscaler::Off || !dynamic_resolution::Supports(configured)) {
+                UpdateEffectBudget(false, false, 0, 0);
                 gpu_busy::g_dynamicResolution.store(false, std::memory_order_relaxed);
                 if (announcedBase) {
                     // Turned off, or a height it does not take: on again, it starts from the full height.
@@ -143,9 +170,14 @@ namespace gpu::frame_plan
             const uint64_t now = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now().time_since_epoch()).count());
             bool changed = false;
+            // Settings open over the game: the paused scene (about 130 draws in the field, 2026-11-18) is not the
+            // game's load. Dynamic resolution stepped from 576 up to 972 rows in 30 s there (eleven target rebuilds
+            // behind the menu) and fell back to 576 at 31.9 ms the moment the field resumed. Hold, as for a load.
+            const bool hold = gpu::loading::inProgress.load(std::memory_order_acquire) || settings::IsOpen();
+            UpdateEffectBudget(true, hold, now, budgetMs);
             // Loading (the guest loader hooks, gpu/loading_pacing.h): keep the height; a change there rebuilds every
             // scene target for a loading screen, and its new uncleared targets can show for a frame.
-            if (gpu::loading::inProgress.load(std::memory_order_acquire) && controller.base == configured &&
+            if (hold && controller.base == configured &&
                 controller.requestedMinimum == minimum) {
                 controller.Hold(now, gpu_busy::Total());
                 return controller.height;
