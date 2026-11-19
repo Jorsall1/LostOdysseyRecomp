@@ -57,6 +57,8 @@ THREAD_RE = re.compile(r'^  thread (.+): (\d+) samples while running, (\d+) whil
 LINE_RE = re.compile(r'^\s+([0-9.]+)%\s+\+0x([0-9a-fA-F]+)')
 SYSCALLS_RE = re.compile(r'^\s+system calls in (\d+) samples')
 WAIT_RE = re.compile(r'^\s+([0-9.]+)%\s+wait((?:\s+\+0x[0-9a-fA-F]+)*)')
+HELPERS_RE = re.compile(r'^\s+helpers in (\d+) samples')
+HELPER_RE = re.compile(r'^\s+([0-9.]+)%\s+helper((?:\s+\+0x[0-9a-fA-F]+)*)')
 OFFSET_RE = re.compile(r'\+0x([0-9a-fA-F]+)')
 
 
@@ -125,6 +127,7 @@ def parse(log, which):
     # percentages are of its own samples, so they are turned into samples before the threads are merged.
     running = 0
     syscalls = 0
+    helpers = 0
     with open(log, encoding='utf-8', errors='replace') as f:
         for raw in f:
             line = raw.rstrip('\r\n')
@@ -142,9 +145,11 @@ def parse(log, which):
             m = THREAD_RE.match(line)
             if m:
                 thread = current['threads'].setdefault(m.group(1), {'running': 0, 'waiting': 0, 'lines': [],
-                                                                    'syscalls': 0, 'waits': []})
+                                                                    'syscalls': 0, 'waits': [],
+                                                                    'helpers': 0, 'helper_lines': []})
                 running = int(m.group(2))
                 syscalls = 0
+                helpers = 0
                 thread['running'] += running
                 thread['waiting'] += int(m.group(3))
                 continue
@@ -162,6 +167,16 @@ def parse(log, which):
                 callers = [int(x, 16) for x in OFFSET_RE.findall(m.group(2))]
                 thread['waits'].append((float(m.group(1)) / 100.0 * syscalls, callers))
                 continue
+            m = HELPERS_RE.match(line)
+            if m and thread is not None:
+                helpers = int(m.group(1))
+                thread['helpers'] += helpers
+                continue
+            m = HELPER_RE.match(line)
+            if m and thread is not None:
+                offsets = [int(x, 16) for x in OFFSET_RE.findall(m.group(2))]
+                thread['helper_lines'].append((float(m.group(1)) / 100.0 * helpers, offsets))
+                continue
             if not line.startswith('  '):
                 thread = None
     if not reports and not watchdog:
@@ -171,6 +186,13 @@ def parse(log, which):
     return reports, watchdog
 
 
+def describe_helper(starts, names, offsets):
+    # "helper" lines: the sampled 16-byte line (the helper itself), then return addresses.
+    if not offsets:
+        return '(no address)'
+    head = symbolize_bucket(starts, names, offsets[0])
+    rest = describe_callers(starts, names, offsets[1:]) if len(offsets) > 1 else '(no return address)'
+    return f'{head} <- {rest}'
 def describe_callers(starts, names, callers):
     # Named call chain, innermost first, consecutive repeats folded.
     chain = []
@@ -336,6 +358,7 @@ def main():
     parser.add_argument('--top', type=int, default=25)
     parser.add_argument('--report', type=int, default=None)
     parser.add_argument('--waits', type=int, default=8, help='wait sites printed per thread')
+    parser.add_argument('--helpers', type=int, default=16, help='shared helper call sites printed per thread')
     parser.add_argument('--samples', action='store_true', help='the file is cpu-samples.bin (LO_CPU_PROFILE_SAMPLES)')
     parser.add_argument('--from', dest='window_from', type=float, default=None, help='--samples: start, seconds')
     parser.add_argument('--to', dest='window_to', type=float, default=None, help='--samples: end, seconds')
@@ -359,6 +382,8 @@ def main():
     running = collections.Counter()
     waiting = collections.Counter()
     syscalls = collections.Counter()
+    helper_samples = collections.Counter()
+    per_thread_helpers = collections.OrderedDict()   # thread -> helper and call chain -> samples
     for report in reports:
         for name, thread in report['threads'].items():
             running[name] += thread['running']
@@ -370,6 +395,10 @@ def main():
             waits = per_thread_waits.setdefault(name, collections.Counter())
             for samples, callers in thread['waits']:
                 waits[describe_callers(starts, names, callers)] += samples
+            helper_samples[name] += thread['helpers']
+            chains = per_thread_helpers.setdefault(name, collections.Counter())
+            for samples, offsets in thread['helper_lines']:
+                chains[describe_helper(starts, names, offsets)] += samples
 
     everything = collections.Counter()
     if reports:
@@ -390,6 +419,12 @@ def main():
                 print(f'  in system calls in {syscalls[name]} samples, from:')
                 for chain, samples in waits.most_common(args.waits):
                     print(f'    {100.0 * samples / syscalls[name]:5.1f}%  {chain}')
+            chains = per_thread_helpers.get(name)
+            if chains and helper_samples[name] > 0:
+                print(f'  in shared helpers (locks, memcpy, memset, memcmp) in {helper_samples[name]} samples '
+                      f'({100.0 * helper_samples[name] / total:.1f}% of its running samples), from:')
+                for chain, samples in chains.most_common(args.helpers):
+                    print(f'    {100.0 * samples / helper_samples[name]:5.1f}%  {chain}')
             everything.update(functions)
             print()
 

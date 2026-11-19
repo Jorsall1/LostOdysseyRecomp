@@ -11,6 +11,19 @@ index 29cddfd..3972f17 100644
          case RenderFormat::R16G16B16A16_FLOAT:
              return DXGI_FORMAT_R16G16B16A16_FLOAT;
          case RenderFormat::R16G16B16A16_UNORM:
+diff --git a/plume_render_interface.h b/plume_render_interface.h
+index 23e2978..973ec88 100644
+--- a/plume_render_interface.h
++++ b/plume_render_interface.h
+@@ -243,6 +243,8 @@ namespace plume {
+ 
+         virtual ~RenderQueryPool() { }
+         virtual void queryResults() = 0;
++        // LostOdysseyRecomp: reads the first `count` queries only; the rest of getResults() keeps older values.
++        virtual void queryResultsFirst(uint32_t count) { (void)count; queryResults(); }
+         virtual const uint64_t *getResults() const = 0;
+         virtual uint32_t getCount() const = 0;
+     };
 diff --git a/plume_render_interface_types.h b/plume_render_interface_types.h
 index b2149f3..63ab2c6 100644
 --- a/plume_render_interface_types.h
@@ -474,7 +487,7 @@ index 0000000..4159125
 +    }
 +};
 diff --git a/plume_vulkan.cpp b/plume_vulkan.cpp
-index 3f15073..0ef189c 100644
+index 3f15073..6097208 100644
 --- a/plume_vulkan.cpp
 +++ b/plume_vulkan.cpp
 @@ -9,6 +9,11 @@
@@ -705,7 +718,61 @@ index 3f15073..0ef189c 100644
              }
  
              depthReference.attachment = uint32_t(attachments.size());
-@@ -3487,6 +3626,19 @@ namespace plume {
+@@ -3466,27 +3605,58 @@ namespace plume {
+         vkDestroyQueryPool(device->vk, vk, nullptr);
+     }
+ 
+-    void VulkanQueryPool::queryResults() {
+-        if (occlusion) {
+-            // Queries left unused since the last reset are unavailable, so
+-            // VK_NOT_READY is expected; read the availability of each one.
+-            std::vector<uint64_t> values(results.size() * 2);
+-            VkResult res = vkGetQueryPoolResults(device->vk, vk, 0, uint32_t(results.size()), sizeof(uint64_t) * values.size(), values.data(),
+-                sizeof(uint64_t) * 2, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+-            if ((res != VK_SUCCESS) && (res != VK_NOT_READY)) {
+-                PLUME_LOG_ERROR("Vulkan", "vkGetQueryPoolResults", LogErrorDomain::VkResult, res, "");
+-                std::fill(results.begin(), results.end(), ResultUnavailable);
+-                return;
+-            }
++    void VulkanQueryPool::queryResultsFirst(uint32_t count) {
++        if (!occlusion) {
++            queryResults();
++            return;
++        }
+ 
+-            for (size_t i = 0; i < results.size(); i++) {
+-                results[i] = (values[i * 2 + 1] != 0) ? values[i * 2] : ResultUnavailable;
+-            }
++        // LostOdysseyRecomp (turn 57): only the queries the batch used. The renderer's 1024-query pools held ~160
++        // a frame in the busy street, and every completed batch read all 1024 into a freshly allocated 16 KiB
++        // vector (readback 0.3 ms a frame on the command-processor thread).
++        count = std::min<uint32_t>(count, uint32_t(results.size()));
++        if (count == 0) {
++            return;
++        }
++
++        // Queries left unused since the last reset are unavailable, so
++        // VK_NOT_READY is expected; read the availability of each one.
++        if (values.size() < results.size() * 2) {
++            values.resize(results.size() * 2);
++        }
++        VkResult res = vkGetQueryPoolResults(device->vk, vk, 0, count, sizeof(uint64_t) * 2 * count, values.data(),
++            sizeof(uint64_t) * 2, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
++        if ((res != VK_SUCCESS) && (res != VK_NOT_READY)) {
++            PLUME_LOG_ERROR("Vulkan", "vkGetQueryPoolResults", LogErrorDomain::VkResult, res, "");
++            std::fill(results.begin(), results.begin() + count, ResultUnavailable);
++            return;
++        }
++
++        for (uint32_t i = 0; i < count; i++) {
++            results[i] = (values[i * 2 + 1] != 0) ? values[i * 2] : ResultUnavailable;
++        }
++    }
+ 
++    void VulkanQueryPool::queryResults() {
++        if (occlusion) {
++            queryResultsFirst(uint32_t(results.size()));
+             return;
          }
  
  	    VkResult res = vkGetQueryPoolResults(device->vk, vk, 0, uint32_t(results.size()), sizeof(uint64_t) * results.size(), results.data(), sizeof(uint64_t), VK_QUERY_RESULT_64_BIT);
@@ -725,7 +792,7 @@ index 3f15073..0ef189c 100644
          if (res != VK_SUCCESS) {
              PLUME_LOG_ERROR("Vulkan", "vkGetQueryPoolResults", LogErrorDomain::VkResult, res, "");
              return;
-@@ -5069,7 +5221,8 @@ namespace plume {
+@@ -5069,7 +5239,8 @@ namespace plume {
          }
  
          VkPhysicalDeviceTimelineSemaphoreFeatures timelineFeatures = {};
@@ -736,7 +803,7 @@ index 3f15073..0ef189c 100644
          if (timelineFound) {
              timelineFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES;
 diff --git a/plume_vulkan.h b/plume_vulkan.h
-index 843ef81..da8585d 100644
+index 843ef81..1b35dfc 100644
 --- a/plume_vulkan.h
 +++ b/plume_vulkan.h
 @@ -183,6 +183,17 @@ namespace plume {
@@ -757,7 +824,22 @@ index 843ef81..da8585d 100644
          VulkanShader(VulkanDevice *device, const void *data, uint64_t size, const char *entryPointName, RenderShaderFormat format);
          ~VulkanShader() override;
          virtual void setName(const std::string &name) override;
-@@ -591,6 +602,9 @@ namespace plume {
+@@ -365,12 +376,14 @@ namespace plume {
+     struct VulkanQueryPool : RenderQueryPool {
+         VulkanDevice *device = nullptr;
+         std::vector<uint64_t> results;
++        std::vector<uint64_t> values;   // occlusion reads: (result, availability) pairs, kept between reads
+         VkQueryPool vk = VK_NULL_HANDLE;
+         bool occlusion = false;
+ 
+         VulkanQueryPool(VulkanDevice *device, uint32_t queryCount, bool occlusion = false);
+         virtual ~VulkanQueryPool() override;
+         virtual void queryResults() override;
++        virtual void queryResultsFirst(uint32_t count) override;
+         virtual const uint64_t *getResults() const override;
+         virtual uint32_t getCount() const override;
+     };
+@@ -591,6 +604,9 @@ namespace plume {
          // interpolation extensions and features. Other SDKs can supply aggregate
          // Vulkan feature structs that must not coexist with these individual structs.
          bool enableFrameInterpolationFeatures = false;

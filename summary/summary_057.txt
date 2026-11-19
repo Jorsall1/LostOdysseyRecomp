@@ -1,0 +1,51 @@
+================================================================================
+LostOdysseyRecomp - Nintendo Switch 2 port
+Summary - TURN 57: test1/test2 read (Main Street), occlusion readback trimmed,
+op ring lock removed, CPU profiler names who calls locks/memcpy/memcmp
+================================================================================
+Build: NRO md5 f877b4e0689657474489ff523fc840b8 (Desktop copy matches).
+ELF build/turn57_f877b4e0.elf. kaiHEN fix untouched. Not on HW yet.
+
+LOGS READ: Desktop\lo project\test1 and test2 (turn 55 NRO, handheld,
+GPU 561 MHz, CPU 1101 MHz, ~85 s each, Tolsan's Inn -> Main Street, both
+closed with HOME -> X, exit.log clean, no errors / GPU stops / stalls).
+  * Test 2 (LO_SWITCH_BATCH_DRAWS=2048) did not help: Main Street perf lines
+    51.7 / 59.4 / 55.1 / 53.8 FPS vs test 1 55.8 / 51.9 / 56.4 / 57.3 / 53.6.
+    Keep the default 1024; drop that line from env.txt.
+  * Both: GPU_CmdProc 81-87% of a core, Guest_Main 74-82%, gpu_ms 13.5-14.7
+    (gpu_pct 75-80) at the 576-row DR floor, 1185-1630 draws. Both the command
+    processor and the GPU are near their limits there.
+  * Test 1 CPU profile (report 2, 30-60 s, Main Street), GPU CmdProc:
+    91% running; flat profile, no single hot spot. mutexLock 5.3% (largest,
+    caller unknown), DrawImpl 5.0%, frame pacing sleep 4.8% (idle, normal),
+    WritePlainRun 3.7%, driver waits 3.7%, native_mem_sync 2.8%, memcmp 2.4%,
+    ExecutePacket 2.3%, nvk_GetQueryPoolResults 1.8%. Grouped: locks/system
+    calls 27%, command processor 21%, renderer 20%, NVK 17%, plume 6%.
+    Guest Main sleeps 20% (KeDelayExecutionThread) waiting for the GPU side.
+  * Occlusion readback: readback_ms grows ~0.3 ms per frame (test 2: 260 ms
+    over 831 frames) for ~160 queries a frame, because every completed batch
+    read whole 1024-query pools into a new 16 KiB vector.
+
+CHANGES
+  1. plume (plume-switch-perf.patch regenerated, chain reproduces the tree):
+     RenderQueryPool::queryResultsFirst(count) (default: queryResults());
+     VulkanQueryPool reads only the first `count` occlusion queries into a
+     buffer kept between reads. renderer CompleteOcclusionQueries passes the
+     slot's used count. Expect readback_ms to grow much slower.
+  2. gpu/op_ring.h: Record() no longer locks a mutex for every draw (~2100 a
+     frame); single writer (renderer thread), `next` is atomic, the GPU-stop
+     dump takes a snapshot of it.
+  3. CPU profiler (os/switch/cpu_profiler_switch.cpp): samples inside
+     mutexLock, mutexUnlock, pthread_mutex_lock/unlock, memcpy/memmove,
+     memset and memcmp also record the sampled line, LR and 4 stack return
+     addresses. stderr gets "helpers in N samples" blocks per thread;
+     tools/switch/switch-cpu-profile.py prints them as
+     "in shared helpers ... from: mutexLock <- pthread_mutex_lock <- X <- Y"
+     (--helpers N lines). Old logs parse the same as before.
+
+TEST ENV: Desktop env.txt = LO_GUEST_AFFINITY=1 + LO_CPU_PROFILE=1 (turn 57).
+NEXT (user): run the turn 57 NRO with that env.txt at the same Main Street
+spot for 2+ minutes, send runtime + stderr logs. Then: read the helpers blocks
+(python3 tools/switch/switch-cpu-profile.py stderr.log --elf
+build/turn57_f877b4e0.elf --report 2) and remove the per-draw lock / compare
+sources they name. Compare readback_ms per frame with turn 55 (~0.3 ms).

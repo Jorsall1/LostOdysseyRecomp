@@ -1,10 +1,13 @@
 #pragma once
 #include <array>
 #include <cstdint>
+#include <atomic>
 #include <mutex>
 // The renderer's last GPU operations, tagged with the batch that records them, so a GPU stop names what the batch
 // that faulted contained (gpu/renderer.cpp LogSubmissionRing prints the oldest unfinished batch and the refused one).
-// One fixed array, no allocation; a lock per record (uncontended: the renderer thread records, the stop reads).
+// One fixed array, no allocation. Only the renderer thread records, without a lock (turn 57: the lock was taken
+// for every draw, ~2100 a frame in the busy street); the reader (a GPU stop) takes `mutex` against other readers and
+// may see a record being written, which only garbles that one line of a diagnostic dump.
 namespace gpu::op_ring
 {
 enum class Kind : uint8_t { Draw, Clear, Resolve, Transfer, Copy };
@@ -36,11 +39,12 @@ struct Ring
 {
     std::mutex mutex;
     std::array<Op, kOps> ops{};
-    uint64_t next = 0;
+    std::atomic<uint64_t> next{0};
     void Record(const Op& op)
     {
-        std::lock_guard lock(mutex);
-        ops[next++ % kOps] = op;
+        const uint64_t index = next.load(std::memory_order_relaxed);
+        ops[index % kOps] = op;
+        next.store(index + 1, std::memory_order_release);
     }
 };
 inline Ring g_ring;

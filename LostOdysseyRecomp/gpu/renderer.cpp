@@ -239,13 +239,14 @@ namespace gpu::renderer
         }
         auto& ring = gpu::op_ring::g_ring;
         std::lock_guard opLock(ring.mutex);
-        const uint64_t first = ring.next > gpu::op_ring::kOps ? ring.next - gpu::op_ring::kOps : 0;
+        const uint64_t next = ring.next.load(std::memory_order_acquire);
+        const uint64_t first = next > gpu::op_ring::kOps ? next - gpu::op_ring::kOps : 0;
         for (const uint64_t serial : wanted) {
             if (!serial) continue;
             uint32_t printed = 0, total = 0;
-            for (uint64_t i = first; i < ring.next; ++i) total += ring.ops[i % gpu::op_ring::kOps].batch == serial;
+            for (uint64_t i = first; i < next; ++i) total += ring.ops[i % gpu::op_ring::kOps].batch == serial;
             LOG_ERROR("renderer: batch {} operations ({} recorded, first 400 shown):", serial, total);
-            for (uint64_t i = first; i < ring.next && printed < 400; ++i) {
+            for (uint64_t i = first; i < next && printed < 400; ++i) {
                 const auto& op = ring.ops[i % gpu::op_ring::kOps];
                 if (op.batch != serial) continue;
                 ++printed;
@@ -5696,9 +5697,10 @@ void main()
                 s.occlusionResults.resize(s.occlusionUsed);
                 for (uint32_t first = 0; first < s.occlusionPoolUsed; first += kOcclusionPoolQueries) {
                     auto& pool = *s.occlusionQueries[first / kOcclusionPoolQueries];
-                    pool.queryResults();
-                    std::copy_n(pool.getResults(), std::min(kOcclusionPoolQueries, s.occlusionPoolUsed - first),
-                        s.occlusionResults.begin() + first);
+                    // Only the queries this slot used (turn 57: reading whole 1024-query pools cost ~0.3 ms a frame).
+                    const uint32_t used = std::min(kOcclusionPoolQueries, s.occlusionPoolUsed - first);
+                    pool.queryResultsFirst(used);
+                    std::copy_n(pool.getResults(), used, s.occlusionResults.begin() + first);
                 }
                 if (s.occlusionCountersDirty) {
                     const uint32_t* counters = occlusionCounterWords + size_t(&s - gpuSlots) * kOcclusionQueriesPerSlot;

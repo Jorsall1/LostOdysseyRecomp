@@ -6,6 +6,8 @@
 #include <switch.h>
 
 #include <unistd.h>
+#include <pthread.h>
+#include <iterator>
 
 #include <cstdarg>
 
@@ -40,6 +42,13 @@ namespace
     constexpr uint32_t WAIT_STACK_BYTES = 1024;          // scanned above SP, while the thread is paused
     constexpr uint32_t REPORT_WAIT_LINES_PER_THREAD = 12;
 
+    // Samples inside small shared helpers (mutexLock, memcpy, memcmp, ...) name the helper, not the code that
+    // calls it: turn 57 found mutexLock the hottest line of the command processor (5.3%) with nothing saying whose
+    // locks those are. For them the report adds the sampled line, LR and return addresses from the stack.
+    constexpr uint32_t HELPER_TABLE_SIZE = 1u << 12;
+    constexpr uint32_t HELPER_CALLERS = 6;               // the sampled line, LR, 4 return addresses from the stack
+    constexpr uint32_t REPORT_HELPER_LINES_PER_THREAD = 16;
+
     // LO_CPU_PROFILE_SAMPLES: every sample kept (cpu-samples.bin). A record is 16 bytes plus 4 per guest
     // return address; the buffer holds a report window of the busy threads (about 10 MiB in a battle).
     constexpr uint32_t RAW_BUFFER_BYTES = 24u << 20;
@@ -57,6 +66,7 @@ namespace
         uint32_t samples = 0;       // samples taken while it had run since the previous one
         uint32_t idleSamples = 0;   // samples taken while it had not run
         uint32_t syscallSamples = 0;
+        uint32_t helperSamples = 0; // samples inside a shared helper (HelperAt)
         bool raw = false;           // its samples go to cpu-samples.bin
         // Guest threads (SetCurrentThreadGuestStack): where the PPCContext pointer is, and the guest stack.
         void* const volatile* guestContext = nullptr;
@@ -147,6 +157,13 @@ namespace
         uint32_t callers[WAIT_CALLERS]; // module offsets (0 = none)
     };
 
+    struct HelperBucket
+    {
+        uint32_t slot;
+        uint32_t count;             // 0 = empty
+        uint32_t callers[HELPER_CALLERS]; // the sampled 16-byte line, then return addresses (module offsets, 0 = none)
+    };
+
     ThreadSlot g_slots[MAX_THREADS];
     Mutex g_slotsMutex;
     uint64_t g_usageWindowStart = 0;
@@ -155,6 +172,8 @@ namespace
     uint32_t g_tableDropped = 0;
     WaitBucket g_waitTable[WAIT_TABLE_SIZE];
     uint32_t g_waitDropped = 0;
+    HelperBucket g_helperTable[HELPER_TABLE_SIZE];
+    uint32_t g_helperDropped = 0;
     Thread g_samplerThread;
     bool g_samplerStarted = false;
 
@@ -232,6 +251,47 @@ namespace
             return true;
 
         return pc - g_moduleBase >= 4 && (ReadCode(pc - 4) & 0xFFE0001Fu) == 0xD4000001u;
+    }
+
+    // The shared helpers whose samples get callers (HELPER_CALLERS). The sizes are those of the turn 55 ELF
+    // (aarch64-none-elf-nm -S); a library update that changes them only adds or misses a few samples, since
+    // the report keeps the sampled line and tools/switch/switch-cpu-profile.py names it again.
+    struct HelperRange
+    {
+        uint64_t start;
+        uint64_t size;
+    };
+    HelperRange g_helperRanges[8];
+    uint32_t g_helperRangeCount = 0;
+
+    void FindHelpers()
+    {
+        if (g_helperRangeCount != 0)
+            return;
+        const HelperRange ranges[] = {
+            { reinterpret_cast<uint64_t>(&mutexLock), 0xc8 },
+            { reinterpret_cast<uint64_t>(&mutexUnlock), 0x68 },
+            { reinterpret_cast<uint64_t>(&pthread_mutex_lock), 0x6c },
+            { reinterpret_cast<uint64_t>(&pthread_mutex_unlock), 0x6c },
+            { reinterpret_cast<uint64_t>(&memcpy), 0x240 },
+            { reinterpret_cast<uint64_t>(&memset), 0x104 },
+            { reinterpret_cast<uint64_t>(&memcmp), 0x1c8 },
+        };
+        for (const HelperRange& range : ranges)
+        {
+            if (InModule(range.start) && g_helperRangeCount < std::size(g_helperRanges))
+                g_helperRanges[g_helperRangeCount++] = range;
+        }
+    }
+
+    bool HelperAt(uint64_t pc)
+    {
+        for (uint32_t i = 0; i < g_helperRangeCount; i++)
+        {
+            if (pc - g_helperRanges[i].start < g_helperRanges[i].size)
+                return true;
+        }
+        return false;
     }
 
     bool Readable(uint64_t address, uint64_t size)
@@ -567,6 +627,32 @@ namespace
         g_waitDropped++;
     }
 
+    void AddHelperSample(uint32_t slot, const uint32_t (&callers)[HELPER_CALLERS])
+    {
+        uint32_t hash = slot * 2654435761u;
+        for (uint32_t caller : callers)
+            hash = (hash ^ caller) * 2654435761u;
+
+        for (uint32_t probe = 0; probe < 32; probe++)
+        {
+            HelperBucket& bucket = g_helperTable[(hash + probe) & (HELPER_TABLE_SIZE - 1)];
+            if (bucket.count != 0 && bucket.slot == slot && memcmp(bucket.callers, callers, sizeof(callers)) == 0)
+            {
+                bucket.count++;
+                return;
+            }
+            if (bucket.count == 0)
+            {
+                bucket.slot = slot;
+                bucket.count = 1;
+                memcpy(bucket.callers, callers, sizeof(callers));
+                return;
+            }
+        }
+
+        g_helperDropped++;
+    }
+
     // Report data copied out of the tables under the lock; formatted and written without it.
     struct ReportThread
     {
@@ -575,10 +661,12 @@ namespace
         uint32_t samples;
         uint32_t idleSamples;
         uint32_t syscallSamples;
+        uint32_t helperSamples;
     };
 
     void FormatReport(std::string& report, uint64_t windowTicks, const std::vector<ReportThread>& threads,
-        std::vector<Bucket>& buckets, std::vector<WaitBucket>& waits, uint32_t dropped, uint32_t waitDropped)
+        std::vector<Bucket>& buckets, std::vector<WaitBucket>& waits, std::vector<HelperBucket>& helpers,
+        uint32_t dropped, uint32_t waitDropped, uint32_t helperDropped)
     {
         report.reserve(65536);
 
@@ -597,6 +685,11 @@ namespace
             });
 
         std::sort(waits.begin(), waits.end(), [](const WaitBucket& a, const WaitBucket& b)
+            {
+                return a.slot != b.slot ? a.slot < b.slot : a.count > b.count;
+            });
+
+        std::sort(helpers.begin(), helpers.end(), [](const HelperBucket& a, const HelperBucket& b)
             {
                 return a.slot != b.slot ? a.slot < b.slot : a.count > b.count;
             });
@@ -644,11 +737,40 @@ namespace
                     report += '\n';
                 }
             }
+
+            // Who called the shared helpers (locks, memcpy, memset, memcmp).
+            if (thread.helperSamples >= REPORT_MIN_SAMPLES / 5)
+            {
+                snprintf(line, sizeof(line), "    helpers in %u samples; at (line, return address, then stack):\n",
+                    thread.helperSamples);
+                report += line;
+
+                uint32_t shown = 0;
+                for (const HelperBucket& helper : helpers)
+                {
+                    if (helper.slot != thread.slot || shown++ == REPORT_HELPER_LINES_PER_THREAD)
+                        continue;
+
+                    int length = snprintf(line, sizeof(line), "      %5.1f%%  helper", 100.0 * helper.count / thread.helperSamples);
+                    for (uint32_t caller : helper.callers)
+                    {
+                        if (caller != 0 && length > 0 && size_t(length) < sizeof(line) - 16)
+                            length += snprintf(line + length, sizeof(line) - length, " +0x%07x", caller);
+                    }
+                    report += line;
+                    report += '\n';
+                }
+            }
         }
 
         if (waitDropped != 0)
         {
             snprintf(line, sizeof(line), "  %u system call samples dropped (table full)\n", waitDropped);
+            report += line;
+        }
+        if (helperDropped != 0)
+        {
+            snprintf(line, sizeof(line), "  %u helper samples dropped (table full)\n", helperDropped);
             report += line;
         }
     }
@@ -662,6 +784,7 @@ namespace
         std::vector<ReportThread> reportThreads;
         std::vector<Bucket> reportBuckets;
         std::vector<WaitBucket> reportWaits;
+        std::vector<HelperBucket> reportHelpers;
         static uint8_t stackCopy[WAIT_STACK_BYTES];
 
         while (true)
@@ -693,35 +816,49 @@ namespace
                 ThreadContext context;
                 const Result result = svcGetThreadContext3(&context, thread.handle);
 
-                bool inSystemCall = false;
-                uint32_t callers[WAIT_CALLERS]{};
-                if (R_SUCCEEDED(result) && InSystemCall(context.pc.x))
+                // LR, then the return addresses on the stack above SP (if it is readable memory), into
+                // out[first..max).
+                auto collectCallers = [&](uint32_t* out, uint32_t first, uint32_t max)
                 {
-                    inSystemCall = true;
-                    uint32_t count = 0;
+                    uint32_t count = first;
                     if (IsReturnAddress(context.lr))
-                        callers[count++] = uint32_t(context.lr - g_moduleBase);
+                        out[count++] = uint32_t(context.lr - g_moduleBase);
 
-                    // The stack above SP, if it is readable memory.
                     MemoryInfo info{};
                     u32 pageInfo = 0;
                     const uint64_t sp = context.sp;
-                    if (count < WAIT_CALLERS && R_SUCCEEDED(svcQueryMemory(&info, &pageInfo, sp)) &&
+                    if (count < max && R_SUCCEEDED(svcQueryMemory(&info, &pageInfo, sp)) &&
                         info.type != MemType_Unmapped && (info.perm & Perm_R) != 0)
                     {
                         const uint64_t end = std::min<uint64_t>(info.addr + info.size, sp + WAIT_STACK_BYTES);
                         if (end > sp)
                         {
                             memcpy(stackCopy, reinterpret_cast<const void*>(sp), size_t(end - sp));
-                            for (uint64_t offset = 0; offset + 8 <= end - sp && count < WAIT_CALLERS; offset += 8)
+                            for (uint64_t offset = 0; offset + 8 <= end - sp && count < max; offset += 8)
                             {
                                 uint64_t value;
                                 memcpy(&value, stackCopy + offset, sizeof(value));
-                                if (IsReturnAddress(value) && uint32_t(value - g_moduleBase) != callers[count ? count - 1 : 0])
-                                    callers[count++] = uint32_t(value - g_moduleBase);
+                                if (IsReturnAddress(value) && (count == first || uint32_t(value - g_moduleBase) != out[count - 1]))
+                                    out[count++] = uint32_t(value - g_moduleBase);
                             }
                         }
                     }
+                };
+
+                bool inSystemCall = false;
+                bool inHelper = false;
+                uint32_t callers[WAIT_CALLERS]{};
+                uint32_t helperCallers[HELPER_CALLERS]{};
+                if (R_SUCCEEDED(result) && InSystemCall(context.pc.x))
+                {
+                    inSystemCall = true;
+                    collectCallers(callers, 0, WAIT_CALLERS);
+                }
+                else if (R_SUCCEEDED(result) && HelperAt(context.pc.x))
+                {
+                    inHelper = true;
+                    helperCallers[0] = uint32_t(context.pc.x - g_moduleBase) & ~15u;
+                    collectCallers(helperCallers, 1, HELPER_CALLERS);
                 }
 
                 // The raw record, still while it is paused: the guest stack must not change under the walk.
@@ -791,6 +928,11 @@ namespace
                         AddWaitSample(slot, callers);
                         thread.syscallSamples++;
                     }
+                    else if (inHelper)
+                    {
+                        AddHelperSample(slot, helperCallers);
+                        thread.helperSamples++;
+                    }
                 }
             }
             mutexUnlock(&g_slotsMutex);
@@ -802,6 +944,7 @@ namespace
                 reportThreads.clear();
                 reportBuckets.clear();
                 reportWaits.clear();
+                reportHelpers.clear();
 
                 mutexLock(&g_slotsMutex);
                 for (uint32_t slot = 0; slot < MAX_THREADS; slot++)
@@ -815,12 +958,14 @@ namespace
                         copy.samples = thread.samples;
                         copy.idleSamples = thread.idleSamples;
                         copy.syscallSamples = thread.syscallSamples;
+                        copy.helperSamples = thread.helperSamples;
                         reportThreads.push_back(copy);
                     }
 
                     thread.samples = 0;
                     thread.idleSamples = 0;
                     thread.syscallSamples = 0;
+                    thread.helperSamples = 0;
                 }
 
                 for (Bucket& bucket : g_table)
@@ -832,6 +977,11 @@ namespace
                 {
                     if (wait.count != 0)
                         reportWaits.push_back(wait);
+                }
+                for (HelperBucket& helper : g_helperTable)
+                {
+                    if (helper.count != 0)
+                        reportHelpers.push_back(helper);
                 }
 
                 std::vector<RawName> rawNames;
@@ -850,14 +1000,18 @@ namespace
                 }
                 const uint32_t dropped = g_tableDropped;
                 const uint32_t waitDropped = g_waitDropped;
+                const uint32_t helperDropped = g_helperDropped;
                 memset(g_table, 0, sizeof(g_table));
                 memset(g_waitTable, 0, sizeof(g_waitTable));
+                memset(g_helperTable, 0, sizeof(g_helperTable));
                 g_tableDropped = 0;
                 g_waitDropped = 0;
+                g_helperDropped = 0;
                 mutexUnlock(&g_slotsMutex);
 
                 std::string report;
-                FormatReport(report, now - reportStart, reportThreads, reportBuckets, reportWaits, dropped, waitDropped);
+                FormatReport(report, now - reportStart, reportThreads, reportBuckets, reportWaits, reportHelpers,
+                    dropped, waitDropped, helperDropped);
                 os::switch_cpu_profiler::WriteLog(report);
 
                 if (g_rawEnabled)
@@ -1078,6 +1232,7 @@ void os::switch_cpu_profiler::Start(bool sampler)
 {
     g_usageWindowStart = armGetSystemTick();
     FindModule();
+    FindHelpers();
 
     {
         u64 coreMask = 0;
