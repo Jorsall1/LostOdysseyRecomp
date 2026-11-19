@@ -1,0 +1,10 @@
+================================================================================
+LostOdysseyRecomp - Nintendo Switch 2 port
+Summary - TURN 46: Desktop env.txt trimmed for normal play (no code changes)
+================================================================================
+Desktop env.txt is now only LO_GUEST_AFFINITY=1 (plus a comment).
+Removed: LO_GPU_PASS_TIMING=1 (measurement done in turn 42; it adds GPU
+timestamps to every batch) and the commented A/B lines (LO_SWITCH_BATCH_DRAWS,
+LO_EFFECT_BUDGET, LO_DR_KEEP_FIXED, LO_RESOLVE_BLIT, LO_SKIP_RESTORE), all of
+which only matter when uncommented; defaults are unchanged. They are listed in
+summaries 035-042 if an A/B run is needed later.
