@@ -1,0 +1,66 @@
+================================================================================
+LostOdysseyRecomp - Nintendo Switch 2 port
+Summary - TURN 60: eighth GPU stop (in-game menu closed, no Settings); OunceVK
+refusal path decoded further; transfer constants uploaded before Begin fixed
+================================================================================
+Build: NRO md5 25551c8eb2fa8483e9e858ab0f66c496 (Desktop copy matches).
+kaiHEN fix untouched. Not on HW yet.
+LOG READ: Desktop\lo project\runtime-1795109110454587.log, stderr.log, exit.log
+  Turn 59 NRO, env.txt still the turn 57 profile test (LO_GUEST_AFFINITY=1 +
+  LO_CPU_PROFILE=1), handheld, Uhra map u39_0_scrw, 1408x792.
+  * 72.6 s game menu (23-24 draws per frame, DR held) for ~9 s. No Settings,
+    no size change behind it (last step 62.19 s), no new targets after 62.2 s.
+  * 81.43 s "Vulkan submission stopped raw_vk=-4". Batch 5203 (frame 4971,
+    13 draws, 7 resolves, 6 rect lists: the menu's closing frame, opens with
+    an EDRAM transfer 157 (fmt 0) -> 159 (7e3)) shown "not completed"; batch
+    5204 (frame 4972, first 3D frame: 285 draws, 29 occlusion queries,
+    1555 KiB uploads) REFUSED. stderr: "context failed at
+    nvkmd_nvgpu_native_ctx.c:738", "primary arena is poisoned". Exit clean.
+  * Same shape as turns 45 and 47 (13/7/6 closing frame, then the first 3D
+    batch refused at 738). Settings is not required: a plain menu close is.
+FINDINGS
+  1. "not completed" is not evidence of a hang: the ring marks a batch
+     complete only in RecycleSlot, i.e. when its slot is reused two batches
+     later. The newest accepted batch always reads "not completed". Turns
+     43-51 treated it as a stuck GPU; it was not proven. Text changed to
+     "completion not read yet".
+  2. OunceVK (vulkan.o, disassembled): native_ctx_flush_locked calls
+     native_ctx_prepare_batch -> nvkmd_nvgpu_native_batch_prepare_sources.
+     Result 4 (header allocation failed) is handled by joining the oldest
+     submission and retrying; any other non-zero result is the 738 line.
+     prepare_sources returns
+       1: bad arguments / a command range of size 0, not 4-aligned, over
+          8 MiB, or the last range flagged (NVK no_prefetch), or more than
+          2044 ranges, or wait words not a multiple of 5 / over 40,
+       2: a command range outside the used part of every active span (the
+          primary arena + active owner segments), or the new header block
+          from the primary arena overlaps one of the batch's own ranges,
+       3: total range bytes larger than the primary arena, or overflow,
+       5: semaphore probe encode failed.
+     Driver locking is global (one recursive mutex per native device for
+     memory create/free and flush), so a pipeline-thread race is unlikely;
+     turn 51's serialize lock added nothing. The arena allocator
+     (alloc_reclaimable / recycle_live_record) looks correct. Which result
+     the refused batches got is still unknown: the code is lost before the
+     log line.
+  3. Pattern across the stops: a heavy batch submitted when the previous one
+     has finished (menu close, a new map's first frame). In steady 3D the
+     previous batch is still in flight, which changes prepare_sources' path
+     (w6 = previous point not complete -> extra wait words + header).
+  4. Real bug on the crash path: TransferRegion uploaded its constants
+     before Begin(). When it opens a batch (5203's first operation), Begin()
+     recycles the slot and rewinds its upload ring to 0, so the batch's next
+     uploads overwrote the transfer's constants (classes and scale). Wrong
+     colours at worst; not shown to stop the GPU.
+CHANGES (gpu/renderer.cpp)
+  * TransferRegion: Begin() before Upload(), and again after it (Upload can
+    flush when the ring is full).
+  * LogSubmissionRing: "completion not read yet" instead of "not completed".
+NOT FIXED: the driver refusal itself. No proven app-side cause.
+OPTIONAL A/B (no rebuild): OunceVK reads sdmc:/config/ouncevk/debug-sync.txt
+  (one integer). Bit 1 (value 2) makes every batch carry the L2-invalidate
+  header that steady 3D batches already get; stderr then prints "native debug
+  sync flags: 2". Cost: one cache invalidate per light batch.
+NEXT (user): put back the play env.txt (LO_GUEST_AFFINITY=1 only; the SD copy
+still has LO_CPU_PROFILE=1). Repeat field -> in-game menu -> close a few
+times; optionally with the debug-sync file. Send logs either way.

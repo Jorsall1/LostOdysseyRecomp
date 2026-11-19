@@ -228,7 +228,10 @@ namespace gpu::renderer
                 nowMs >= e.submitMs ? nowMs - e.submitMs : 0, e.draws, e.resolves, e.rectLists, e.occlusionQueries,
                 e.textureUploads, e.uploadBytes >> 10, e.width, e.height, e.scene,
                 e.rejected ? std::string("REFUSED by the queue (this submission stopped the GPU)") :
-                e.completed ? fmt::format("completed, GPU {:.1f} ms", e.gpuUs / 1000.0) : std::string("not completed"));
+                e.completed ? fmt::format("completed, GPU {:.1f} ms", e.gpuUs / 1000.0) :
+                // Completion is read only when the slot is reused (two batches later), so the newest accepted
+                // batch always shows this: it is not evidence that the batch hung.
+                std::string("completion not read yet"));
         }
         // gpu/op_ring.h: what the oldest unfinished batch and the refused one recorded.
         uint64_t wanted[2] = {0, 0};
@@ -3825,6 +3828,10 @@ namespace gpu::renderer
                 RenderPipeline* pipeline = GetTransferPipeline(dst.format);
                 if (!pipeline)
                     return;
+                // Open the batch before the upload: Begin() recycles the slot, which rewinds its upload ring to 0,
+                // so constants uploaded before it were overwritten by the batch's next uploads (the transfer that
+                // opens a batch, e.g. the first operation after an in-game menu closes, read someone else's data).
+                if (!Begin()) return;
                 SharedConstants transferConstants{};
                 transferConstants.transfer[0] = srcClass;
                 transferConstants.transfer[1] = dstClass;
@@ -3833,7 +3840,7 @@ namespace gpu::renderer
                 uint64_t offset = Upload(&transferConstants, sizeof(transferConstants));
                 if (offset == UINT64_MAX)
                     return;
-                if (!Begin()) return;
+                if (!Begin()) return; // Upload may have flushed (ring full) and left no batch open.
                 Transition(src, RenderTextureLayout::SHADER_READ, RenderBarrierStage::GRAPHICS);
                 Transition(dst, RenderTextureLayout::COLOR_WRITE, RenderBarrierStage::GRAPHICS);
                 RenderDescriptorSet* set1 = AcquireSet(1);
