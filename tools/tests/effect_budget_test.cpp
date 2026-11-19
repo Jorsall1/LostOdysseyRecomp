@@ -5,10 +5,11 @@ namespace eb = gpu::effect_budget;
 static int failures = 0;
 #define CHECK(cond) do { if (!(cond)) { std::fprintf(stderr, "FAIL %s:%d %s\n", __FILE__, __LINE__, #cond); ++failures; } } while (0)
 // Runs at 60 FPS for `seconds` with `gpuMs` per frame.
-static void Run(eb::Controller& c, uint64_t& now, uint64_t& busy, double seconds, double gpuMs, bool* sawUnsafe = nullptr)
+static void Run(eb::Controller& c, uint64_t& now, uint64_t& busy, double seconds, double gpuMs, bool* sawUnsafe = nullptr,
+                bool atFloor = true, bool slack = false)
 {
     for (double t = 0; t < seconds; t += 1.0 / 60) {
-        c.Update(now, busy, 14.0);
+        c.Update(now, busy, 14.0, atFloor, slack);
         // The blur may only be skipped while the weight is zero.
         if (sawUnsafe && c.DofBlurSkip() && !c.DofWeightZero()) *sawUnsafe = true;
         busy += uint64_t(gpuMs * 1e6);
@@ -57,6 +58,33 @@ int main()
         CHECK(c.level == level);
         for (int i = 0; i < 600; ++i) { c.Hold(now, busy); busy += 30'000'000ull; now += 16'666'667ull; }
         CHECK(c.level == level);
+    }
+    {
+        // Turn 54: no cut while dynamic resolution still has rows to drop.
+        eb::Controller c;
+        uint64_t now = 1'000'000'000ull, busy = 0;
+        Run(c, now, busy, 5, 35.0, nullptr, false);
+        CHECK(c.level == 0);
+        // At its floor: cuts.
+        Run(c, now, busy, 1.6, 20.0, nullptr, true);
+        CHECK(c.level == 1);
+        // 13 ms (over 70%) with two rungs of slack: restored after the 5 s hold.
+        Run(c, now, busy, 6, 13.0, nullptr, false, true);
+        CHECK(c.level == 0);
+        // Cut again within 30 s: the next restore waits 10 s.
+        Run(c, now, busy, 1.6, 20.0, nullptr, true);
+        CHECK(c.level == 1 && c.restoreHoldNs == 10'000'000'000ull);
+        Run(c, now, busy, 6, 13.0, nullptr, false, true);
+        CHECK(c.level == 1);
+        Run(c, now, busy, 5, 13.0, nullptr, false, true);
+        CHECK(c.level == 0);
+        // Without slack 13 ms holds the level.
+        eb::Controller d;
+        Run(d, now, busy, 3, 20.0);
+        CHECK(d.level >= 1);
+        const uint32_t level = d.level;
+        Run(d, now, busy, 20, 13.0);
+        CHECK(d.level == level);
     }
     CHECK(eb::BudgetMs(1000.0 / 60) > 13.9 && eb::BudgetMs(1000.0 / 60) < 14.1);
     if (failures) return 1;

@@ -1,0 +1,65 @@
+================================================================================
+LostOdysseyRecomp - Nintendo Switch 2 port
+Summary - TURN 54: preparation bar back, driver cache rewritten on Switch 2,
+dynamic resolution / effect budget retuned from the 2026-11-19 logs
+================================================================================
+Build: NRO md5 df0461c96741183b792557ba20664b33 (Desktop copy matches). ELF
+build/turn54_df0461c9.elf. kaiHEN fix untouched. Not run on HW yet.
+Uncommitted leftovers from an unfinished turn 54 attempt (referenced a missing
+PreparationStage::BackgroundPipelines, did not build; UpBelow 0.88) were saved
+to build/turn54_uncommitted_before_turn54.patch and reverted.
+
+LOGS READ (Desktop\lo project, three sessions, docked, turn 53 build)
+  * pipeline_cache_vk.bin loaded at 94280926 bytes in all three sessions: the
+    Switch path never rewrote a loaded cache. Since turn 53 changed the SPIR-V
+    (lean + early-Z twins) every launch recompiled the 3446 startup pipelines
+    (22-53 s) and ~2900 texinfo variants (compile_ms ~60000, done ~110 s in).
+  * Title: DR held at 1440 (light screen) with GPU 18.8-19.4 ms -> 51-53 FPS.
+  * Field entry: 35-40 ms GPU (generic pipelines while variants built) -> DR
+    straight to its floor (720 / 576), then one rung per ~3.5 s (720 -> 972
+    took ~30 s). Effect budget cut at the same spike (motion blur, DoF, then
+    shadows low) and never restored: its restore needs < 9.8 ms, DR climbs to
+    ~14 ms.
+  * Steady field: 60 FPS at 972 rows, 13-14 ms GPU.
+
+CHANGES
+  1. gpu/video.cpp: DrawPreparationBar runs on Switch 2 again (bottom edge,
+     startup pipeline preparation done/total, fades when done). Achievement
+     toast stays off. Log line "video: preparation bar shown (N of M pipelines)"
+     once per preparation to confirm it on HW.
+  2. gpu/renderer.cpp, WriteDriverPipelineCache(atExit): Switch 2 rewrites the
+     driver cache during play once it grew by 25% over the loaded/written size;
+     exit flushes still skip when a file exists (no ~200 MB save while the
+     system waits). Over the 256 MB cap: file removed, next launch rebuilds a
+     fresh one. New save trigger when every queued texinfo variant is built.
+     Switch 1 path unchanged.
+  3. gpu/dynamic_resolution.h:
+     * Switch 2 new base starts at 75% (docked 1440 -> 1080, handheld 1080 ->
+       792); title runs at 1080 (~11 ms predicted).
+     * Down jump sized with fixed share 0.15 (was 0.35; logs showed GPU time
+       following pixels almost fully on those drops). 35 ms at 1440 no longer
+       lands on the floor.
+     * Step up can take several rungs: largest height whose pixel-scaled cost
+       stays under 85% of the frame (720 -> 936 in 8 s in the test model).
+     * UpBelow stays 0.85 (0.88 was the reverted leftover).
+  4. gpu/effect_budget.h + frame_plan.cpp: effects are cut only with DR at its
+     floor; restored under the budget while DR is 2+ rungs above its floor (old
+     70% rule still applies too). A cut within 30 s of a restore doubles the
+     restore wait (5 s up to 80 s) so they cannot cycle.
+
+TESTS: dynamic_resolution_test ok (plain and -D__SWITCH2__, new start/spike/
+step-up cases); effect_budget_test ok (new floor/slack/backoff cases);
+driver_pipeline_cache_test ok; Switch 2 build ok, new strings in the ELF.
+
+NEXT (user)
+  * Launch 1: still compiles (old cache). Play into the field until the
+    texinfo line shows building=0, then quit. Look for no "driver pipeline
+    cache write" warning.
+  * Launch 2: pipeline_cache_vk.bin should load at a larger size and the
+    "background done" time should drop to a few seconds; field entry should
+    not spike to 35 ms. Send the logs.
+  * Bar: thin light bar on the bottom edge during the title/startup
+    preparation; "video: preparation bar shown" in the runtime log.
+  * A/B: LO_EFFECT_BUDGET=0, LO_DYNAMIC_RESOLUTION=0.
+RISK: rewrite copies the whole cache (~100-200 MB) in the host heap during
+play once or twice; a short hitch while NVK serializes it is possible.

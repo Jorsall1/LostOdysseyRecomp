@@ -69,6 +69,23 @@ namespace gpu::dynamic_resolution
         static constexpr double MeaningfulMs = 3.0;
         // The share of a frame's GPU time taken as independent of the scene height when sizing a jump or a step up.
         static constexpr double FixedShare = 0.35;
+        // Down jumps size with a smaller fixed share (turn 54, Switch 2 logs 2026-11-19: 35 ms at 1440 -> 10 ms at
+        // 720, 40 ms at 1080 -> 10 ms at 576, 19.6 ms at 1440 -> 11.6 ms at 1080: GPU time followed the pixels
+        // almost fully). 0.35 sent every one of those straight to the floor.
+        static constexpr double DownFixedShare = 0.15;
+        // Where a new base starts. Switch 2 (turn 54): 75% of the base, so the title (19 ms at 1440, held there as a
+        // light screen at 51 FPS) runs at 1080 and the first scene starts near where it settles (936-1152 rows).
+#ifdef __SWITCH2__
+        static constexpr double StartShare = 0.75;
+#else
+        static constexpr double StartShare = 1.0;
+#endif
+        static constexpr uint32_t StartHeight(uint32_t base, uint32_t minimum, uint32_t step)
+        {
+            // Whole rungs below the base, like every other height it picks.
+            const uint32_t drop = (base - std::min(base, uint32_t(double(base) * StartShare)) + step - 1) / step * step;
+            return drop && base > drop ? std::max(base - drop, minimum) : base;
+        }
 
         uint32_t base = 0, minimum = 0, height = 0, step = Rung;
         uint64_t windowStart = 0, windowBusy = 0, lastChange = 0;
@@ -88,8 +105,9 @@ namespace gpu::dynamic_resolution
                 step = stepRows;
                 requestedMinimum = minimumHeight;
                 minimum = Floor(base, minimumHeight, step);
-                changed = height && height != base;
-                height = base;
+                const uint32_t start = StartHeight(base, minimum, step);
+                changed = height && height != start;
+                height = start;
                 Restart(nowNs, busyTotalNs);
                 lastChange = nowNs;
                 return height;
@@ -113,7 +131,7 @@ namespace gpu::dynamic_resolution
                     // 2026-11-18: nine rebuilds from 1080 to 432 rows, each a hitch).
                     // Part of the cost does not follow the pixels (shadow maps, fixed-size targets, per-draw work:
                     // ~13 of 31 ms in a 1080-row battle, turn 36), so the pixels are scaled by what is left.
-                    const double share = (budgetMs * UpBelow / busyMs - FixedShare) / (1.0 - FixedShare);
+                    const double share = (budgetMs * UpBelow / busyMs - DownFixedShare) / (1.0 - DownFixedShare);
                     const double fit = share > 0 ? double(height) * std::sqrt(share) : 0;
                     const uint32_t target = fit > 0 ? uint32_t(fit) / step * step : 0;
                     const uint32_t steps = std::max(1u, target < height ? (height - target + step - 1) / step : 1u);
@@ -129,7 +147,12 @@ namespace gpu::dynamic_resolution
                 const double up = double(height + step) / height;
                 if (busyMs * (FixedShare + (1.0 - FixedShare) * up * up) < budgetMs * UpBelow) {
                     if (++upStrikes >= 6 && nowNs - lastChange >= UpHoldNs) {
-                        height += step;
+                        // More than one rung when the pixels alone (no fixed share: the cautious estimate) fit
+                        // under the step-up line (turn 54: 720 -> 972 rows took seven steps and 25 s).
+                        const double fit = double(height) * std::sqrt(budgetMs * UpBelow / busyMs);
+                        const uint32_t target = std::min(base, uint32_t(fit) / step * step);
+                        height = std::max(height + step, target);
+                        if (height > base) height = base;
                         Changed(nowNs, changed);
                     }
                 } else {

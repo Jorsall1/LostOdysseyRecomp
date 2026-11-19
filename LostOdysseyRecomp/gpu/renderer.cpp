@@ -7195,7 +7195,7 @@ void main()
                     } catch (const std::exception& e) { LOG_WARNING("renderer: driver pipeline cache write: {}", e.what()); }
                 }
                 try {
-                    driverCacheWrite = std::async(std::launch::async, [this] { return WriteDriverPipelineCache(); });
+                    driverCacheWrite = std::async(std::launch::async, [this, wait] { return WriteDriverPipelineCache(wait); });
                     if (wait)
                         if (const auto error = driverCacheWrite.get(); !error.empty())
                             LOG_WARNING("renderer: driver pipeline cache write: {}", error);
@@ -7203,10 +7203,31 @@ void main()
             }
 
             // Any thread: the backends serialize while pipelines are being created.
-            std::string WriteDriverPipelineCache()
+            // atExit: the shutdown and std::_Exit flushes.
+            std::string WriteDriverPipelineCache(bool atExit = false)
             {
                 namespace dpc = gpu::driver_pipeline_cache;
                 const size_t previous = driverCacheBytes;
+#if LO_PLATFORM_SWITCH2
+                // Switch 2 (turn 54): a loaded file was never rewritten, so after the
+                // turn 53 SPIR-V change (lean, early-Z twins) every launch compiled the
+                // 3446 startup pipelines and ~2900 texinfo variants again (50 s + 60 s
+                // of worker load, GPU 35-40 ms entering the field on generic pipelines;
+                // the 94280926-byte file loaded unchanged in three sessions). Rewrite
+                // during play once it grew by a quarter. Exit stays as on Switch 1
+                // (no ~200 MB save while the system waits for the process to close).
+                if (previous && atExit) return {};
+                const size_t size = device->getPipelineCacheSize();
+                if (size && size < previous + previous / 4) return {};
+                if (size > dpc::kMaxBytes) {
+                    // Mostly stale entries kept from older shaders: start over, the next
+                    // launch builds a cache of only what it uses.
+                    driverCacheBytes = size;
+                    std::error_code ec;
+                    std::filesystem::remove(driverCachePath, ec);
+                    return fmt::format("{} bytes exceed the {} MB cap; file removed, rebuilt next launch", size, dpc::kMaxBytes >> 20);
+                }
+#else
 #if LO_PLATFORM_SWITCH
                 // NVK's cache reaches about 200 MB with every pipeline built. Saving it
                 // again needs two more copies of that from a heap that is nearly full in
@@ -7214,8 +7235,10 @@ void main()
                 // the exit save took 5 s. Once a cache file loaded or was written, keep it.
                 if (previous) return {};
 #endif
+                (void)atExit;
                 const size_t size = device->getPipelineCacheSize();
                 if (size && size <= previous) return {};
+#endif
                 // Exporting allocates a second copy (and backend slack) before
                 // the file cap below can reject it. Skip known oversized caches
                 // before that allocation, especially on memory-limited devices.
@@ -7264,7 +7287,7 @@ void main()
                 }
                 const auto recipes = gpu::pipeline_cache::Write(RecipePath(), snapshot, xenos::cache::Version, kPipelineRecipeVersion, ValidPipelineRecipe);
                 if (!recipes.ok) LOG_WARNING("renderer: exit recipe write failed: {}", recipes.error);
-                std::string driverError = driverCachePath.empty() ? std::string{} : WriteDriverPipelineCache();
+                std::string driverError = driverCachePath.empty() ? std::string{} : WriteDriverPipelineCache(true);
                 if (!driverError.empty()) LOG_WARNING("renderer: exit driver pipeline cache write: {}", driverError);
                 LOG_INFO("renderer: exit flush: {} pipeline recipes, driver cache {} bytes", recipes.written, size_t(driverCacheBytes));
             }
@@ -10493,6 +10516,8 @@ void main()
                         variant.job.reset();
                         variant.seeded = false;
                         ++(variant.pipeline ? specStats.built : specStats.failed);
+                        // Every queued variant done: the driver cache holds them now (turn 54).
+                        if (specStats.queued == specStats.built + specStats.failed) SaveDriverPipelineCache(false);
                         return;
                     }
             }

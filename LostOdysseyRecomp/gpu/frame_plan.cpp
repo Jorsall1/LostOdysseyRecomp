@@ -120,7 +120,8 @@ namespace gpu::frame_plan
         // an upscaler, which sizes its own input.
         // The effect budget (gpu/effect_budget.h) runs beside dynamic resolution, from the same GPU busy time.
         effect_budget::Controller effectBudget;
-        void UpdateEffectBudget(bool enabled, bool loading, uint64_t nowNs, double frameMs)
+        void UpdateEffectBudget(bool enabled, bool loading, uint64_t nowNs, double frameMs, bool atFloor = true,
+            bool resolutionSlack = false)
         {
             static const bool environment = effect_budget::EnvironmentEnabled();
             if (!enabled || !environment) {
@@ -134,7 +135,7 @@ namespace gpu::frame_plan
             const double budgetMs = effect_budget::BudgetMs(frameMs);
             if (loading) {
                 effectBudget.Hold(nowNs, gpu_busy::Total());
-            } else if (effectBudget.Update(nowNs, gpu_busy::Total(), budgetMs)) {
+            } else if (effectBudget.Update(nowNs, gpu_busy::Total(), budgetMs, atFloor, resolutionSlack)) {
                 static constexpr const char* names[] = {"all effects as set", "motion blur and depth of field blur off",
                     "motion blur and depth of field blur off, dynamic shadows low"};
                 LOG_INFO("effect budget: level {} ({}; GPU {:.1f} ms per frame, budget {:.1f} ms)", effectBudget.level,
@@ -194,7 +195,11 @@ namespace gpu::frame_plan
                 drawWindow = drawFrames = 0;
             }
             const bool hold = gpu::loading::inProgress.load(std::memory_order_acquire) || settings::IsOpen() || light;
-            UpdateEffectBudget(true, hold, now, budgetMs);
+            // Resolution goes first: effects are cut only with the scene at its lowest height, and come back while
+            // it has two rungs to give (turn 54).
+            const bool started = controller.base == configured && controller.height;
+            UpdateEffectBudget(true, hold, now, budgetMs, !started || controller.height <= controller.minimum,
+                started && controller.height >= controller.minimum + 2 * controller.step);
             // Loading (the guest loader hooks, gpu/loading_pacing.h): keep the height; a change there rebuilds every
             // scene target for a loading screen, and its new uncleared targets can show for a frame.
             if (hold && controller.base == configured &&

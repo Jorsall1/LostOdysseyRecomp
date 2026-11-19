@@ -5162,7 +5162,10 @@ namespace gpu::video
         const uint32_t total = gpu::pipeline_prepare::Total(progress);
         const uint32_t done = std::min(gpu::pipeline_prepare::Done(progress), total);
         if (!total) { bar = {}; return; }
-        if (bar.total != total) { bar.total = total; bar.finished = {}; bar.hidden = false; }
+        if (bar.total != total) {
+            bar.total = total; bar.finished = {}; bar.hidden = false;
+            LOG_INFO("video: preparation bar shown ({} of {} pipelines)", done, total);
+        }
         if (bar.hidden || !g_presentation) return;
         float opacity = 1.0f;
         if (done == total) {
@@ -5855,10 +5858,10 @@ namespace gpu::video
                     DrawTitleHint(backBuffer);
                     if (settingsOverGame)
                         DrawSettingsOverlay(backBuffer, g_menuPixels, menuWidth, menuHeight, g_menuRevision);
-#if !defined(__SWITCH2__)
-                    // Switch 2 draws nothing over the game the original does not
-                    // (2026-11-18): no shader preparation bar, no achievement toast.
+                    // Switch 2 (turn 54): the preparation bar is back at the user's
+                    // request; the achievement toast stays off (2026-11-18).
                     DrawPreparationBar(backBuffer);
+#if !defined(__SWITCH2__)
                     DrawAchievementToast(backBuffer);
 #endif
                     if (performanceOverlay)

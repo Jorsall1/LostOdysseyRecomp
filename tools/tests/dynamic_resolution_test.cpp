@@ -75,10 +75,32 @@ int main()
         // Light scene afterwards: back up to native 1440.
         const uint32_t up = Run(c, now, busy, 60, 1440, 1152, [](uint32_t) { return 6.0; });
         CHECK(up == 1440);
-        // Undocked: the base changes and it starts over at the full 1080.
+        // Undocked: the base changes and it starts over at 75% of 1080 (turn 54), on a rung of the base.
         bool changed = false;
-        CHECK(c.Update(now, busy, 1080, 576, 1000.0 / 60, changed) == 1080);
+        CHECK(c.Update(now, busy, 1080, 576, 1000.0 / 60, changed) == 792);
         CHECK(c.minimum == 576);
+    }
+    {
+        // Turn 54: a new docked base starts at 1080 (the title at 19 ms in 1440 rows: 60 FPS at 1080).
+        dr::Controller c;
+        bool changed = false;
+        CHECK(c.Update(1, 1, 1440, 720, 1000.0 / 60, changed) == 1080);
+        // A 35 ms entry spike at 1440 that follows the pixels lands well above the 720 floor.
+        dr::Controller d;
+        uint64_t now = 1'000'000'000ull, busy = 1;
+        const auto spike = [](uint32_t h) { return 35.0 * double(h) * h / (1440.0 * 1440.0); };
+        d.Update(now, busy, 1440, 720, 1000.0 / 60, changed);
+        d.height = 1440;
+        uint32_t lowest = 1440;
+        const uint32_t h = Run(d, now, busy, 3, 1440, 720, spike, &lowest);
+        CHECK(h > 720 && h < 1440 && lowest == h);
+        // The field after it (Switch 2 log: 10 ms at 720, 14.2 ms at 972; 5 ms fixed + pixels): several rungs per
+        // step up: 936 within 8 s (one rung at a time: 792), and it fits.
+        const auto field = [](uint32_t r) { return 5.0 + 5.0 * double(r) * r / (720.0 * 720.0); };
+        d.height = 720;
+        const uint32_t up = Run(d, now, busy, 8, 1440, 720, field);
+        std::printf("field: 720 -> %u rows in 8 s (%.1f ms)\n", up, field(up));
+        CHECK(up >= 936 && field(up) < 1000.0 / 60 * 0.92);
     }
 #endif
     {

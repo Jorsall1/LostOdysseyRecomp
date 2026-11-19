@@ -9,7 +9,8 @@
 // higher instead. Levels, each kept for at least a second:
 //   1: motion blur off, depth of field blur off (patches/graphics_effects.cpp, renderer tone-map weight)
 //   2: level 1 + Dynamic shadows Low (patches/shadow_budget.cpp: shadows only for the 8 largest casters on screen)
-// A level is dropped again after 3 s with the GPU under 70% of the budget. Settings that already turn an effect off
+// A level is dropped again after 5 s with the GPU under 70% of the budget (or under the budget with dynamic
+// resolution two rungs above its floor). Settings that already turn an effect off
 // are untouched; the budget never turns one on. LO_EFFECT_BUDGET=0 turns it off, LO_EFFECT_BUDGET_MS=<ms> sets the
 // budget (0 = 84% of the frame time).
 //
@@ -31,13 +32,21 @@ struct Controller
     uint32_t level = 0;
     // CPU frames since the level last crossed 0 <-> 1 (depth of field ordering).
     uint32_t framesSinceDofChange = DofLagFrames;
-    uint64_t windowStart = 0, windowBusy = 0, lastChange = 0;
+    uint64_t windowStart = 0, windowBusy = 0, lastChange = 0, lastRestore = 0;
+    // A cut soon after a restore doubles the wait before the next restore (5 s up to 80 s), so restoring an effect
+    // and cutting it again when it costs more than the rows dynamic resolution can give does not cycle.
+    static constexpr uint64_t RecutNs = 30'000'000'000ull, MaxRestoreHoldNs = 80'000'000'000ull;
+    uint64_t restoreHoldNs = RestoreHoldNs;
     uint32_t windowFrames = 0, cutStrikes = 0, restoreStrikes = 0;
     double lastBusyMs = 0;
     bool started = false;
 
     // Once per CPU frame. Returns true when the level changed.
-    bool Update(uint64_t nowNs, uint64_t busyTotalNs, double budgetMs)
+    // atFloor: dynamic resolution has no lower height left; cuts wait for it (turn 54: both reacted to the same
+    // 35-40 ms spike entering the field, and the effects stayed cut for the session). resolutionSlack: dynamic
+    // resolution sits two or more rungs above its floor, so a restore under the budget (not only under 70% of
+    // it, which a resolution that climbs to ~85% of the frame never allows) costs rows, not frames.
+    bool Update(uint64_t nowNs, uint64_t busyTotalNs, double budgetMs, bool atFloor = true, bool resolutionSlack = false)
     {
         if (framesSinceDofChange < DofLagFrames) ++framesSinceDofChange;
         if (!started) {
@@ -61,15 +70,24 @@ struct Controller
         }
         if (busyMs > budgetMs) {
             restoreStrikes = 0;
+            if (!atFloor) {
+                cutStrikes = 0;
+                return false;
+            }
             if (++cutStrikes >= CutWindows && level < MaxLevel && nowNs - lastChange >= CutHoldNs) {
+                if (lastRestore && nowNs - lastRestore < RecutNs)
+                    restoreHoldNs = std::min(restoreHoldNs * 2, MaxRestoreHoldNs);
+                else if (!lastRestore || nowNs - lastRestore >= 2 * RecutNs)
+                    restoreHoldNs = RestoreHoldNs; // the last restore held for a minute
                 SetLevel(level + 1, nowNs);
                 return true;
             }
             return false;
         }
         cutStrikes = 0;
-        if (busyMs < budgetMs * RestoreShare) {
-            if (++restoreStrikes >= RestoreWindows && level > 0 && nowNs - lastChange >= RestoreHoldNs) {
+        if (busyMs < budgetMs * RestoreShare || resolutionSlack) {
+            if (++restoreStrikes >= RestoreWindows && level > 0 && nowNs - lastChange >= restoreHoldNs) {
+                lastRestore = nowNs;
                 SetLevel(level - 1, nowNs);
                 return true;
             }
