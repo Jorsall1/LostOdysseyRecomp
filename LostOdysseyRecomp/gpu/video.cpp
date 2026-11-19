@@ -4946,14 +4946,16 @@ namespace gpu::video
             }
             if (mapped) {
                 r.upload->unmap();
-                // An even first row keeps the buffer offset 512-byte aligned (D3D12).
-                first &= ~1u;
-                const uint32_t rows = last + 1 - first;
+                (void)first; (void)last;
+                // The whole image from offset 0, as before turn 37: every GPU stop since then followed a Settings
+                // session, and the partial band copy (buffer offset + destination row) was the one new GPU operation
+                // there. The upload buffer holds every row (unchanged rows keep what was written before), so the
+                // copy is exact; it costs one full copy per change, only while the menu moves.
                 g_commandList->barriers(plume::RenderBarrierStage::COPY,
                     plume::RenderTextureBarrier(r.texture.get(), plume::RenderTextureLayout::COPY_DEST));
                 g_commandList->copyTextureRegion(plume::RenderTextureCopyLocation::Subresource(r.texture.get()),
                     plume::RenderTextureCopyLocation::PlacedFootprint(r.upload.get(), plume::RenderFormat::R8G8B8A8_UNORM,
-                        width, rows, 1, rowPitch / 4, uint64_t(first) * rowPitch), 0, first, 0, nullptr);
+                        width, height, 1, rowPitch / 4), 0, 0, 0, nullptr);
             }
         }
         g_presentation->DrawOverlay(g_commandList.get(), g_settingsOverlay.texture.get(), backBuffer, 0, 0,

@@ -1,0 +1,47 @@
+================================================================================
+LostOdysseyRecomp - Nintendo Switch 2 port
+Summary - TURN 48: fifth GPU stop after a Settings session (FSR off, docked);
+Settings overlay back to a whole-image copy; audit notes
+================================================================================
+Build: NRO md5 b17fbf011dd9a458d6f68a9ce503997d (Desktop copy matches).
+ELF: build/overlayfull_turn48_b17fbf01.elf. kaiHEN fix untouched. Not on HW.
+CRASH LOG (lo project/crash, runtime-1795067086482433.log, turn 47 build,
+docked 2560x1440; the two other runtime logs in the folder ended normally)
+  * Settings 37.5-67.3 s: overlay off saved 56.6, FSR off saved 64.5
+    ("Switch upscaler bilinear"), closed 67.3. Back in the field from 70.1 s:
+    627-draw batches at 8.7 ms, steady.
+  * 73.146 "GPU fence wait failed raw_vk=-4", stderr "completion join failed:
+    status 7" (the turn-37 signature: the batch completed, its driver record
+    failed verification). Batch 3798 (identical to the 14 before it) not
+    completed. 73.109 a DR step 720 -> 756 and the effect budget back to 0
+    were requested 37 ms before; the stop is at or before that batch.
+  * No target rebuilt behind a menu, restore skip and blit resolve were off:
+    turn 47's suspects are ruled out for this stop too.
+  * Settings at 2560x1440: present_ms 108-120 ms on every menu change (CPU
+    raster of the menu at output size). Not the stop; a cost to fix later.
+WHAT EVERY STOP SHARES (turns 37, 45, 47, 48; 43 unknown)
+  A Settings session that saved a Graphics change, then a stop 2-6 s after
+  closing. Turn 35's run had Settings open without a stop; the Settings
+  over-game path was rewritten in turn 37, when the stops began. Its one new
+  GPU operation is the partial band copy in DrawSettingsOverlay (upload
+  buffer offset first*rowPitch into texture row `first`). The Vulkan
+  parameters look valid (plume copyTextureRegion: bufferOffset, imageOffset,
+  extent within both), so this is a removal of the newest unproven path, not
+  a proven fix.
+CHANGE (gpu/video.cpp DrawSettingsOverlay)
+  * Still writes only changed rows (cached compare, no uncached reads), but
+    copies the whole image from buffer offset 0 to texture row 0 when any row
+    changed, as before turn 37.
+AUDIT NOTES (from hardware numbers so far; no change made)
+  * Biggest fixed GPU costs at 576-648 rows: scene 5-6 ms, resolves 2.4-2.9,
+    presentation ~3.5 (EASU+RCAS at output size + overlay), gs_rect 0.5-0.8.
+  * Candidates, in order: lean SPIR-V (drop NoContraction/precise; Switch 1
+    gained ~10% GPU), fused EASU+RCAS single pass (keeps sharpening),
+    resolve copy reuse/elision, PGO build, menu raster capped at 1080p
+    docked. All need an A/B on hardware; held until the stops are gone.
+TESTS: settings ctest 11/11; Switch 2 build ok.
+NEXT (user)
+  * Same steps as before (Settings -> change a Graphics row -> save -> close
+    -> play 30 s), handheld and docked. Send logs either way.
+  * If it still stops: one run with Settings never opened for 15+ minutes of
+    play (does it stop without Settings at all?). That splits the problem.
