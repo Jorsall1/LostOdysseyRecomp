@@ -1,0 +1,39 @@
+================================================================================
+LostOdysseyRecomp - Nintendo Switch 2 port
+Summary - TURN 50: sixth GPU stop (Settings -> DR on + FSR on at 1440, docked);
+per-batch operation log added so the next stop names what faulted
+================================================================================
+Build: NRO md5 prefix 440136ac (Desktop copy matches). ELF build/opring_turn50_440136ac.elf.
+kaiHEN fix untouched. Not on HW.
+CRASH LOG (lo project/crash, runtime-1795070207458487.log, turn 49 build, docked)
+  * Started at fixed 1440 (saved), played 4-78 s at 2560x1440 without a stop.
+  * 78.2 Settings opened, 92.15 saved (DR on 720-1440, FSR on; DR starts at
+    1440, so no size change), 96.4 closed, game-menu frames (32 draws,
+    9 resolves, 10 rect lists, ~16 ms GPU each at 1440).
+  * 99.03 "GPU fence wait failed raw_vk=-4"; stderr "completion join failed:
+    status 8" (a channel error = GPU fault). Batch 4022 (frame 3587, 20 draws,
+    9 resolves, 10 rect lists: the game menu's closing frame) not completed
+    52 ms after submit; batch 4023 (471 draws) not completed either.
+  * No "framebuffer colour ... with depth" warning, no size change, no new
+    target: the turn 49 framebuffer clamp did not apply here.
+WHAT IS KNOWN NOW
+  * Ruled out by logs: restore skip, blit resolve (off since 47), targets
+    rebuilt behind menus (45/49 only, not 47/48/50), framebuffer size
+    mismatch (none logged), stale released targets (none logged).
+  * Shared by the stops: a game-menu close (with Settings, or the save
+    screen in turn 43) and a fault within a few frames, often in the menu's
+    last light frame (13-20 draws). The faulting operation is unknown: the
+    batch ring only had counts.
+CHANGE
+  * gpu/op_ring.h (new) + gpu/renderer.cpp: every draw (prim, index count,
+    flags idx/occlusion/depth-only, vs/ps hash low 32 bits, colour and depth
+    serial + physical size, scissor, viewport), clear (target, ops, first
+    rect), resolve (dest/source serial + size, region, operation letter
+    c/b/s/t), and EDRAM transfer (dst/src, classes, size) is recorded with
+    its batch serial (8192 entries). On a GPU stop LogSubmissionRing prints
+    "renderer: batch N operations" for the oldest unfinished batch and the
+    refused one (400 lines max each).
+  * Cost: one uncontended mutex + 64-byte store per op (~1000/frame).
+TESTS: settings ctest 11/11; Switch 2 build ok.
+NEXT (user): play as before; when it stops, send the crash logs. The
+"batch N operations" block is what decides the fix.

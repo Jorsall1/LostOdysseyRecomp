@@ -1,5 +1,6 @@
 #include <source_location>
 #include "effect_budget.h"
+#include "op_ring.h"
 #include "taa_binding_evidence.h"
 #include "scene_aa_provenance.h"
 #include "scene_copy_promotion_policy.h"
@@ -228,6 +229,34 @@ namespace gpu::renderer
                 e.textureUploads, e.uploadBytes >> 10, e.width, e.height, e.scene,
                 e.rejected ? std::string("REFUSED by the queue (this submission stopped the GPU)") :
                 e.completed ? fmt::format("completed, GPU {:.1f} ms", e.gpuUs / 1000.0) : std::string("not completed"));
+        }
+        // gpu/op_ring.h: what the oldest unfinished batch and the refused one recorded.
+        uint64_t wanted[2] = {0, 0};
+        for (size_t i = 0; i < g_submissionRing.Size(); ++i) {
+            const auto& e = g_submissionRing.At(i);
+            if (!e.completed && !e.rejected && !wanted[0]) wanted[0] = e.serial;
+            if (e.rejected) wanted[1] = e.serial;
+        }
+        auto& ring = gpu::op_ring::g_ring;
+        std::lock_guard opLock(ring.mutex);
+        const uint64_t first = ring.next > gpu::op_ring::kOps ? ring.next - gpu::op_ring::kOps : 0;
+        for (const uint64_t serial : wanted) {
+            if (!serial) continue;
+            uint32_t printed = 0, total = 0;
+            for (uint64_t i = first; i < ring.next; ++i) total += ring.ops[i % gpu::op_ring::kOps].batch == serial;
+            LOG_ERROR("renderer: batch {} operations ({} recorded, first 400 shown):", serial, total);
+            for (uint64_t i = first; i < ring.next && printed < 400; ++i) {
+                const auto& op = ring.ops[i % gpu::op_ring::kOps];
+                if (op.batch != serial) continue;
+                ++printed;
+                if (op.kind == gpu::op_ring::Kind::Draw)
+                    LOG_ERROR("renderer:   #{} draw prim={} n={} flags={:#x} vs={:08x} ps={:08x} colour={} {}x{} depth={} {}x{} "
+                        "scissor=({},{})-({},{}) viewport={}x{}", printed, op.prim, op.count, op.flags, op.vs, op.ps,
+                        op.a, op.aw, op.ah, op.b, op.bw, op.bh, op.x0, op.y0, op.x1, op.y1, op.vw, op.vh);
+                else
+                    LOG_ERROR("renderer:   #{} {} count={} a={} {}x{} b={} {}x{} region=({},{})-({},{})", printed,
+                        gpu::op_ring::Name(op.kind), op.count, op.a, op.aw, op.ah, op.b, op.bw, op.bh, op.x0, op.y0, op.x1, op.y1);
+            }
         }
     }
     namespace binding = gpu::taa_collection::binding;
@@ -3809,6 +3838,7 @@ namespace gpu::renderer
                 // A transfer over the whole target (copy blend, all channels)
                 // replaces every pixel, so clears it still owes are dead.
                 if (w == dst.width && h == dst.height) dst.pendingClear.Drop();
+                RecordOp(gpu::op_ring::Kind::Transfer, &dst, &src, (srcClass << 8) | dstClass, 0, 0, int32_t(w), int32_t(h));
                 BindTargets(&dst, nullptr);
                 RenderViewport viewport(0.0f, 0.0f, static_cast<float>(w), static_cast<float>(h));
                 commandList->setViewports(&viewport, 1);
@@ -6432,6 +6462,19 @@ void main()
                 // Saturation permanently makes this allocation unavailable.
                 if (tex.fgWriteGeneration != UINT64_MAX) ++tex.fgWriteGeneration;
             }
+            // gpu/op_ring.h: the batch being recorded is the next one the submission ring numbers.
+            void RecordOp(gpu::op_ring::Kind kind, const HostTexture* a, const HostTexture* b, uint32_t count,
+                int32_t x0 = 0, int32_t y0 = 0, int32_t x1 = 0, int32_t y1 = 0)
+            {
+                gpu::op_ring::Op op;
+                op.batch = nextBatchSerial + 1;
+                op.kind = kind;
+                op.count = count;
+                if (a) { op.a = uint32_t(a->allocationSerial); op.aw = a->width; op.ah = a->height; }
+                if (b) { op.b = uint32_t(b->allocationSerial); op.bw = b->width; op.bh = b->height; }
+                op.x0 = x0; op.y0 = y0; op.x1 = x1; op.y1 = y1;
+                gpu::op_ring::g_ring.Record(op);
+            }
             void Transition(HostTexture& tex, RenderTextureLayout layout, RenderBarrierStages stages)
             {
                 if (tex.graveyard) [[unlikely]] {
@@ -6501,6 +6544,9 @@ void main()
             // is colour attachment 0 or the depth attachment.
             void ReplayClears(const HostTexture& tex, const std::vector<pending_clear::Op>& ops)
             {
+                RecordOp(gpu::op_ring::Kind::Clear, &tex, nullptr, uint32_t(ops.size()), 0, 0,
+                    ops.empty() || ops[0].rects.empty() ? -1 : ops[0].rects[0].right,
+                    ops.empty() || ops[0].rects.empty() ? -1 : ops[0].rects[0].bottom);
                 static const bool traceClearCall = getenv("LO_TRACE_CLEAR_CALL") != nullptr;
                 thread_local std::vector<RenderRect> rects;
                 for (const auto& op : ops) {
@@ -13491,6 +13537,20 @@ void main()
                     Gpu().occlusionPoolUsed = std::max(Gpu().occlusionPoolUsed, occlusionIndex + 1);
                     commandList->beginOcclusionQuery(occlusionPool, occlusionIndex % kOcclusionPoolQueries);
                 }
+                {
+                    gpu::op_ring::Op op;
+                    op.batch = nextBatchSerial + 1;
+                    op.kind = gpu::op_ring::Kind::Draw;
+                    op.prim = uint8_t(key.prim);
+                    op.flags = uint16_t((useIndices ? 1 : 0) | (occlusionIndex != ~0u ? 2 : 0) | (depthOnlyRaster ? 4 : 0));
+                    op.vs = uint32_t(key.vs); op.ps = uint32_t(key.ps);
+                    op.count = uint32_t(indexCount);
+                    if (color) { op.a = uint32_t(color->allocationSerial); op.aw = color->width; op.ah = color->height; }
+                    if (depth) { op.b = uint32_t(depth->allocationSerial); op.bw = depth->width; op.bh = depth->height; }
+                    op.x0 = int32_t(scissor.left); op.y0 = int32_t(scissor.top); op.x1 = int32_t(scissor.right); op.y1 = int32_t(scissor.bottom);
+                    op.vw = uint32_t(viewport.width); op.vh = uint32_t(viewport.height);
+                    gpu::op_ring::g_ring.Record(op);
+                }
                 MarkPass(key.prim == 8 && rectListGs ? gpu::pass_timing::Category::RectList :
                     depth && depth->shadowMap ? gpu::pass_timing::Category::Shadow : gpu::pass_timing::Category::Scene);
                 recordProbe.Enter(record_timing::Phase::Draw);
@@ -15952,6 +16012,8 @@ void main()
                                 frame, destBase, texW, texH, rs.hdrWriteOrdinal);
                     }
                 }
+                RecordOp(gpu::op_ring::Kind::Resolve, rs.tex.get(), &color, resolveOperation[0], int32_t(x0), int32_t(y0),
+                    int32_t(x0 + w), int32_t(y0 + h));
                 WriteP2ResolveEvent("color", color, destBase, rs, resolveOperation);
 #if defined(LO_GPU_PLUME)
                 RecordFsrAlphaBridgeResolve(color, destBase, rs, resolveOperation);
