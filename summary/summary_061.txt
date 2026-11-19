@@ -1,0 +1,25 @@
+================================================================================
+LostOdysseyRecomp - Nintendo Switch 2 port
+Summary - TURN 61: test files on the Desktop; plan for the 738 GPU stop
+================================================================================
+No code changes. NRO on the Desktop is still turn 60 (md5 25551c8e...).
+FILES WRITTEN (Desktop)
+  * env.txt: LO_GUEST_AFFINITY=1 only (profiler off). Goes to
+    sdmc:/switch/LostOdysseyRecomp/env.txt.
+  * debug-sync.txt: "2". Goes to sdmc:/config/ouncevk/debug-sync.txt
+    (create the folders). Optional second test; stderr confirms it with
+    "native debug sync flags: 2".
+PLAN FOR THE STOP (driver refuses a batch at nvkmd_nvgpu_native_ctx.c:738)
+  1. Test A: env.txt only, menu open/close in the field several times.
+  2. Test B: same with debug-sync.txt. If B never stops and A does, the
+     game writes that file itself before Vulkan starts (permanent
+     workaround, no driver change).
+  3. If B also stops: patch the driver archive at build time (we already
+     rewrite it with objcopy in cmake/PrefixOunceVK.cmake) so the 738 line
+     carries prepare_sources' result code (1/2/3/5). That names the failing
+     check; the fix follows from it (split batches, limit ranges, or change
+     what the renderer allocates around menu closes).
+  4. In parallel: report to the OunceVK author with the decoded checks
+     (summary_060) and the log; a driver bug is fixed best there.
+  5. Last resort: recover from the stop (recreate the Vulkan device and all
+     renderer resources) instead of exiting. Large; only if 1-4 fail.
