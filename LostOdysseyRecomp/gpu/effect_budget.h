@@ -10,7 +10,7 @@
 //   1: motion blur off, depth of field blur off (patches/graphics_effects.cpp, renderer tone-map weight)
 //   2: level 1 + Dynamic shadows Low (patches/shadow_budget.cpp: shadows only for the 8 largest casters on screen)
 // A level is dropped again after 5 s with the GPU under 70% of the budget (or under the budget with dynamic
-// resolution two rungs above its floor). Settings that already turn an effect off
+// resolution two rungs above its floor; level 2 only under 70%, and at least 30 s after its cut). Settings that already turn an effect off
 // are untouched; the budget never turns one on. LO_EFFECT_BUDGET=0 turns it off, LO_EFFECT_BUDGET_MS=<ms> sets the
 // budget (0 = 84% of the frame time).
 //
@@ -37,6 +37,11 @@ struct Controller
     // and cutting it again when it costs more than the rows dynamic resolution can give does not cycle.
     static constexpr uint64_t RecutNs = 30'000'000'000ull, MaxRestoreHoldNs = 80'000'000'000ull;
     uint64_t restoreHoldNs = RestoreHoldNs;
+    // Level 2 -> 1 brings every caster's shadow back at once, the most visible change the budget makes. Switch 2
+    // handheld, 2026-11-20 (turn 72): shadows went low and full 16 times in 14 minutes, most restores at 11.7-13.4 ms
+    // through the two-rung slack and cut again 6-25 s later. That level comes back only with the GPU under 70% of
+    // the budget (no slack) and at least ShadowRestoreHoldNs after it was cut.
+    static constexpr uint64_t ShadowRestoreHoldNs = 30'000'000'000ull;
     uint32_t windowFrames = 0, cutStrikes = 0, restoreStrikes = 0;
     double lastBusyMs = 0;
     bool started = false;
@@ -85,8 +90,10 @@ struct Controller
             return false;
         }
         cutStrikes = 0;
-        if (busyMs < budgetMs * RestoreShare || resolutionSlack) {
-            if (++restoreStrikes >= RestoreWindows && level > 0 && nowNs - lastChange >= restoreHoldNs) {
+        const bool shadows = level >= 2;
+        if (busyMs < budgetMs * RestoreShare || (resolutionSlack && !shadows)) {
+            const uint64_t hold = shadows ? std::max(restoreHoldNs, ShadowRestoreHoldNs) : restoreHoldNs;
+            if (++restoreStrikes >= RestoreWindows && level > 0 && nowNs - lastChange >= hold) {
                 lastRestore = nowNs;
                 SetLevel(level - 1, nowNs);
                 return true;

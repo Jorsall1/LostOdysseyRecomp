@@ -216,8 +216,9 @@ namespace gpu::frame_plan
                     controller.minimum, configured, controller.step, budgetMs);
             }
             if (changed)
-                LOG_INFO("dynamic resolution: scene at {} rows (GPU {:.1f} ms per frame, budget {:.1f} ms, {} missed frames)", height,
-                    controller.lastBusyMs, budgetMs, controller.lastLate);
+                LOG_INFO("dynamic resolution: scene at {} rows (GPU {:.1f} ms per frame, frame {:.1f} ms, budget {:.1f} ms, {} missed frames{})",
+                    height, controller.lastBusyMs, controller.lastFrameMs, budgetMs, controller.lastLate,
+                    controller.lastSlow ? ", slow frames" : "");
             return height;
         }
     }

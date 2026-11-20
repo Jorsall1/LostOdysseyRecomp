@@ -1,0 +1,92 @@
+================================================================================
+LostOdysseyRecomp - Nintendo Switch 2 port
+Summary - TURN 72: OunceVK 20261120, one supported player, dynamic resolution
+sees slow frames, shadow budget stops flipping
+================================================================================
+Build: NRO md5 b3baaf7f1d9e485aa154639d7f9678d2 (Desktop copy matches).
+ELF build/ouncevk1120_turn72.elf ("Mesa 26.2.2 (git-f31c0d894e)").
+kaiHEN fix untouched; libounce NOT changed (still d1718bb7076f). Not on HW yet.
+LOG READ (Desktop\lo project, runtime-1795198183445651.log, turn 67 NRO,
+  handheld, env LO_GUEST_AFFINITY=1; 15362 s wall incl. two HOME suspends of
+  774 s and 9531 s, about 1.4 h of play; HOME -> X exit clean)
+  * No GPU stop, no refused batch, no channel error in the whole session.
+  * Slow-frame state: 0-182 s at 864 rows, 55.5 FPS, every frame 18.0 ms
+    (p95 18.4), gpu 13.5 ms, present 9.7 ms, 0 "missed frames". Same at
+    14886-14896 s (756 rows, 18.1-18.3 ms) and 15016-15056 s. Dynamic
+    resolution never stepped down: GPU 13.5 < 15.3 ms step-down line, and a
+    frame counted as late only over 1.4 refreshes (23.3 ms). The frames are
+    not vsync-quantised; the CP thread waits in present for the GPU while
+    the GPU idles during recording (2 GPU slots, frames under 1024 draws
+    are one batch). This is the "FPS drop that sometimes sticks" after
+    menus: the scene resumes at a height that looks fine by GPU time.
+  * Effect budget: dynamic shadows low <-> full 20 times (4260-5090 s,
+    14824-14873 s), most restores at 11.7-13.4 ms through the two-rung
+    slack, cut again 4-25 s later. Every flip changes which characters
+    cast shadows (low = 8 largest casters): the visible shadow pop.
+  * 15231-15255 s: host Settings menu open (game paused, CmdProc 98.8%
+    rastering the menu), "settings saved" 15242 s, max frame 22.3 s. Menu
+    only; the scene after it ran 56-59 FPS.
+  * Controller: mask 0x01 (1 of 8 pads) except 3236-3243 s (mask 0, all 8
+    read while no controller was attached).
+VIDEOS (Desktop\lo project\new, 2 x 30 s, phone camera): Uhra field and a
+  battle. No corrupted targets visible at this resolution; overlay showed
+  60 FPS 16.8 ms FSR ON 684p DYN.
+CHANGES
+  1. OunceVK 20261120 (tag 20261120, commit f31c0d894e, sha256 c0387858...
+     53d5 checked). 5 commits after 2d6a8ae: feature advertising (fragment
+     shading rate, memory budget, mutable descriptors, maintenance 8-10,
+     load/store op none, ...), VK_EXT_memory_budget counted once per
+     process, channel error code logged on a failed completion wait. Only
+     libouncevk.a and libouncevk-gl.a differ from 20261118 (headers same).
+     nm: no new external symbols, 249 vk exports as before. plume enables
+     only load_store_op_none of the new ones, used for read-only depth
+     attachments, which this renderer never creates. Old libs backed up in
+     /opt/devkitpro/portlibs/switch2/ouncevk-20261118-backup/; package
+     copy in /opt/devkitpro/portlibs/switch2/. ounce-devkit-version.txt
+     updated (its "ouncevk" line had still said 114e9298).
+  2. Player count (bug "8 player input"): thirdparty/SDL-switch
+     SDL_sysjoystick.c (new tools/patches/sdl-switch-single-player.patch,
+     added to tools/switch/build-switch.sh's SDL chain and the patches
+     README): padConfigureInput(1, ...) instead of 8, and the controller
+     applet that SDL opens on a pad style change asks for one player
+     (player_count_max 1, single mode). Horizon now assigns any controller
+     to player 1; the applet no longer offers 8 slots. SDL still opens 8
+     joysticks (pads 2-8 never connect). ELF checked: padConfigureInput(1,
+     0x1f).
+  3. gpu/dynamic_resolution.h: the window's average frame time is a third
+     signal. Over 104% of the budget with the GPU busy over 75% of it =
+     over budget (one rung down); over 102% blocks step-ups. A height left
+     for slow frames alone is held off for 90 s (not 20 s), since its GPU
+     time looks fine and it would step back into the same frames. CPU-bound
+     windows (GPU under 75%) are left alone. Log line now has "frame N ms"
+     and ", slow frames" (gpu/frame_plan.cpp).
+  4. gpu/effect_budget.h: level 2 (shadows low) comes back only with the
+     GPU under 70% of the budget (no resolution slack) and at least 30 s
+     after its cut. Level 1 (blurs) unchanged.
+TESTS: dynamic_resolution_test (new slow-frame case: 864 -> 828 in under
+  10 s, held under 864 for 80 s; CPU-bound 20 ms frames at 9 ms GPU: no
+  change), with and without -D__SWITCH2__; effect_budget_test (new case:
+  no slack restore of shadows over 60 s, restore under 70% only after
+  30 s). Switch 2 build ok.
+TOOLS CHECKED (2026-11-20)
+  * OunceVK: 20261120 is the latest release -> installed.
+  * ounce-devkit 20261117 / libounce 20261117.1 (libounce 39406be1, kaiHEN
+    ddbf0200): fsldr works with kaiHEN's loader, libkaihen as a pacman
+    package, toolchain files moved into libounce. Not installed: this game
+    uses no fsldr, and libounce is the layer under the kaiHEN R -> hbmenu
+    fix (summary_016). Worth a separate, tested update later.
+  * kaiHEN 20261117.1 is the console-side HEN; updating it is the user's
+    choice on the SD card, nothing in the NRO depends on it.
+ROLLBACK (driver)
+  cp -a /opt/devkitpro/portlibs/switch2/ouncevk-20261118-backup/. \
+        /opt/devkitpro/portlibs/switch2/lib/ && cmake --build build
+NEXT (user)
+  * Copy the NRO, same env.txt. First launch may rebuild driver shader
+    cache (Mesa version string changed).
+  * Docked with a Pro Controller and handheld: the controller applet (if
+    it opens) should ask for one player; detaching Joy-Cons mid-game.
+  * Play where 55 FPS stuck before (start of a session, after menus): look
+    for "dynamic resolution: ... slow frames" and whether p50 returns to
+    16.7. Watch for shadows popping (should be rare now).
+  * New visual problems with the new driver: send a screenshot and log.
+================================================================================

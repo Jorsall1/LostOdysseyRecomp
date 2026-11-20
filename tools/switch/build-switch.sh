@@ -93,7 +93,7 @@ log "Patches"
 apply_chain tools/XenonRecomp "$P/XenonRecomp-lostodyssey.patch" "$P/XenonRecomp-switch.patch" "$P/XenonRecomp-nonargument-locals.patch"
 apply_chain thirdparty/plume "$P/plume-lostodyssey.patch" "$P/plume-sdl3.patch" "$P/plume-switch.patch" "$P/plume-switch2.patch" "$P/plume-switch-perf.patch"
 apply_chain thirdparty/plume/contrib/volk "$P/volk-switch.patch"
-apply_chain thirdparty/SDL-switch "$P/sdl-switch-no-egl.patch" "$P/sdl-switch-audio-priority.patch"
+apply_chain thirdparty/SDL-switch "$P/sdl-switch-no-egl.patch" "$P/sdl-switch-audio-priority.patch" "$P/sdl-switch-single-player.patch"
 
 # ---------------------------------------------------------------- game inputs
 [ -f "$private/disc1/default.xex" ] || die "copy your Disc 1 default.xex to LostOdysseyRecompLib/private/disc1/ (docs/SWITCH.md)"

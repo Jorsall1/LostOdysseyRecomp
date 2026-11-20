@@ -93,12 +93,23 @@ namespace gpu::dynamic_resolution
         // A height it stepped down from is not tried again for CeilingHoldNs (turn 54, Switch 2 handheld: 576 ->
         // 756 -> 648 -> 576 cycles every few seconds, each a rebuild of the scene targets).
         static constexpr uint64_t CeilingHoldNs = 20'000'000'000ull;
+        // Slow frames (turn 72, Switch 2 handheld log 2026-11-20): 55.5 FPS for minutes at 864 rows, every frame
+        // 18.0 ms, GPU busy 13.5 ms and no frame over 1.4 refreshes. Neither signal above saw it: the GPU was busy
+        // under the step-down line and the frames were late by 8%, not by a refresh. So the window's average frame
+        // time counts too: over SlowFrameShare of the budget, with the GPU busy over SlowMinBusyShare of it (a
+        // CPU-bound window, where a lower height would not help, has the GPU idle), is over budget; over
+        // SlowUpShare blocks a step up. A height left for slow frames is held off for SlowCeilingHoldNs: its GPU
+        // time looks fine there, so after the normal 20 s it would step up into the same slow frames again.
+        static constexpr double SlowFrameShare = 1.04, SlowUpShare = 1.02, SlowMinBusyShare = 0.75;
+        static constexpr uint64_t SlowCeilingHoldNs = 90'000'000'000ull;
         uint32_t base = 0, minimum = 0, height = 0, step = Rung, ceiling = 0;
         uint64_t windowStart = 0, windowBusy = 0, lastChange = 0, windowLate = 0, ceilingSince = 0;
+        uint64_t ceilingHold = CeilingHoldNs;
         uint64_t lateTotal = 0;
         uint32_t lastLate = 0;
         uint32_t windowFrames = 0, downStrikes = 0, upStrikes = 0, requestedMinimum = 0;
-        double lastBusyMs = 0;
+        double lastBusyMs = 0, lastFrameMs = 0;
+        bool lastSlow = false; // the last change was a step down for slow frames alone (for the log)
 
         // Once per CPU frame. busyTotalNs: gpu_busy's running total. Returns the height to render at, and whether it
         // changed this frame (for the log).
@@ -116,6 +127,8 @@ namespace gpu::dynamic_resolution
                 requestedMinimum = minimumHeight;
                 minimum = Floor(base, minimumHeight, step);
                 ceiling = 0;
+                ceilingHold = CeilingHoldNs;
+                lastSlow = false;
                 const uint32_t start = StartHeight(base, minimum, step);
                 changed = height && height != start;
                 height = start;
@@ -129,15 +142,18 @@ namespace gpu::dynamic_resolution
             const uint64_t busy = busyTotalNs - windowBusy;
             const uint32_t frames = windowFrames;
             const uint64_t late = lateFrames >= windowLate ? lateFrames - windowLate : 0;
+            const double frameMs = double(nowNs - windowStart) / 1e6 / frames;
             Restart(nowNs, busyTotalNs);
             if (!busy || !frames)
                 return height; // no timestamps (yet): keep the height
             const double busyMs = double(busy) / 1e6 / frames;
             lastBusyMs = busyMs;
+            lastFrameMs = frameMs;
             lastLate = uint32_t(late);
-            if (ceiling && nowNs - ceilingSince >= CeilingHoldNs) ceiling = 0;
+            if (ceiling && nowNs - ceilingSince >= ceilingHold) ceiling = 0;
             const bool missing = double(late) > LateDownShare * frames && busyMs > budgetMs * LateMinBusyShare;
-            if (busyMs > budgetMs * DownAt || missing) {
+            const bool slow = frameMs > budgetMs * SlowFrameShare && busyMs > budgetMs * SlowMinBusyShare;
+            if (busyMs > budgetMs * DownAt || missing || slow) {
                 upStrikes = 0;
                 if (++downStrikes >= 2 && height > minimum && nowNs - lastChange >= DownHoldNs) {
                     // Straight to the height whose pixels fit the budget (GPU time follows the pixel count, the
@@ -152,6 +168,8 @@ namespace gpu::dynamic_resolution
                     const uint32_t steps = std::max(1u, target < height ? (height - target + step - 1) / step : 1u);
                     ceiling = height;
                     ceilingSince = nowNs;
+                    lastSlow = slow && !missing && busyMs <= budgetMs * DownAt;
+                    ceilingHold = lastSlow ? SlowCeilingHoldNs : CeilingHoldNs;
                     height = height - std::min(steps * step, height - minimum);
                     Changed(nowNs, changed);
                 }
@@ -163,7 +181,7 @@ namespace gpu::dynamic_resolution
             } else if (height < base) {
                 const double up = double(height + step) / height;
                 const uint32_t top = ceiling ? std::min(base, ceiling - step) : base;
-                if (height + step > top || double(late) > LateUpShare * frames) {
+                if (height + step > top || double(late) > LateUpShare * frames || frameMs > budgetMs * SlowUpShare) {
                     upStrikes = 0;
                 } else if (busyMs * (FixedShare + (1.0 - FixedShare) * up * up) < budgetMs * UpBelow) {
                     if (++upStrikes >= 6 && nowNs - lastChange >= UpHoldNs) {
@@ -172,6 +190,7 @@ namespace gpu::dynamic_resolution
                         const double fit = double(height) * std::sqrt(budgetMs * UpBelow / busyMs);
                         const uint32_t target = std::min(top, uint32_t(fit) / step * step);
                         height = std::min(top, std::max(height + step, target));
+                        lastSlow = false;
                         Changed(nowNs, changed);
                     }
                 } else {

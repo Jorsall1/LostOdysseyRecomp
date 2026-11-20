@@ -36,8 +36,9 @@ int main()
         // In the band between 70% and 100%: holds.
         Run(c, now, busy, 20, 12.0, &unsafe);
         CHECK(c.level == 2);
-        // Light scene: steps back down, one level per >= 5 s.
+        // Light scene: steps back down; shadows (level 2) only 30 s after their cut, then one level per >= 5 s.
         Run(c, now, busy, 5.5, 8.0, &unsafe);
+        Run(c, now, busy, 4.0, 8.0, &unsafe);
         CHECK(c.level == 1);
         Run(c, now, busy, 5.5, 8.0, &unsafe);
         CHECK(c.level == 0 && !c.MotionBlurOff());
@@ -85,6 +86,25 @@ int main()
         const uint32_t level = d.level;
         Run(d, now, busy, 20, 13.0);
         CHECK(d.level == level);
+    }
+    {
+        // Turn 72: shadows low are not restored through the slack (13 ms), only under 70% and 30 s after the cut.
+        eb::Controller c;
+        uint64_t now = 1'000'000'000ull, busy = 0;
+        Run(c, now, busy, 4, 20.0);
+        CHECK(c.level == 2);
+        Run(c, now, busy, 60, 13.0, nullptr, false, true);
+        CHECK(c.level == 2);
+        eb::Controller d;
+        Run(d, now, busy, 4, 20.0);
+        CHECK(d.level == 2);
+        Run(d, now, busy, 20, 8.0);
+        CHECK(d.level == 2);                 // under 70%, but only 20 s after the cut
+        Run(d, now, busy, 11, 8.0);
+        CHECK(d.level == 1);
+        // Level 1 still comes back through the slack after its 5 s.
+        Run(d, now, busy, 6, 13.0, nullptr, false, true);
+        CHECK(d.level == 0);
     }
     CHECK(eb::BudgetMs(1000.0 / 60) > 13.9 && eb::BudgetMs(1000.0 / 60) < 14.1);
     if (failures) return 1;

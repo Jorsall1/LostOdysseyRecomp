@@ -169,6 +169,44 @@ int main()
         }
         CHECK(h == 612);
     }
+    {
+        // Turn 72 (Switch 2 handheld, 2026-11-20): 18.0 ms frames at 864 rows with the GPU busy 13.5 ms, no frame
+        // late by a refresh. Model: the frame takes the GPU time plus 4 ms (17.5 ms at 864), never less than a refresh.
+        const auto gpu = [](uint32_t h) { return 13.5 * (0.15 + 0.85 * double(h) * h / (864.0 * 864.0)); };
+        const auto frame = [&](uint32_t h) { return std::max(1000.0 / 60, gpu(h) + 4.0); };
+        dr::Controller c;
+        uint64_t now = 1'000'000'000ull, busy = 1;
+        bool changed = false;
+        c.Update(now, busy, 1080, 576, 1000.0 / 60, changed);
+        c.height = 864;
+        uint32_t h = 864, highest = 0;
+        for (double t = 0; t < 10; t += frame(h) / 1000) {
+            h = c.Update(now, busy, 1080, 576, 1000.0 / 60, changed);
+            busy += uint64_t(gpu(h) * 1e6);
+            now += uint64_t(frame(h) * 1e6);
+        }
+        CHECK(h < 864 && h >= 792);      // one rung or two, not a jump to the floor
+        CHECK(frame(h) <= 1000.0 / 60 + 0.01);
+        CHECK(c.lastSlow);
+        for (double t = 0; t < 80; t += frame(h) / 1000) {
+            h = c.Update(now, busy, 1080, 576, 1000.0 / 60, changed);
+            highest = std::max(highest, h);
+            busy += uint64_t(gpu(h) * 1e6);
+            now += uint64_t(frame(h) * 1e6);
+        }
+        CHECK(highest < 864);            // held off the slow height (the normal 20 s ceiling would have retried it)
+        // CPU-bound: 20 ms frames with the GPU busy 9 ms. A lower height would not help: no change.
+        dr::Controller d;
+        now = 1'000'000'000ull; busy = 1;
+        d.Update(now, busy, 1080, 576, 1000.0 / 60, changed);
+        d.height = 864;
+        for (int f = 0; f < 50 * 20; ++f) {
+            h = d.Update(now, busy, 1080, 576, 1000.0 / 60, changed);
+            busy += 9'000'000ull;
+            now += 20'000'000ull;
+        }
+        CHECK(h == 864);                 // and no step up into a slow window either
+    }
     if (failures) return EXIT_FAILURE;
     std::puts("dynamic_resolution_test: ok");
     return 0;

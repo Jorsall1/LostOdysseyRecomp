@@ -1,0 +1,36 @@
+diff --git a/src/joystick/switch/SDL_sysjoystick.c b/src/joystick/switch/SDL_sysjoystick.c
+index 5c104be4bb..fc588f679e 100644
+--- a/src/joystick/switch/SDL_sysjoystick.c
++++ b/src/joystick/switch/SDL_sysjoystick.c
+@@ -27,6 +27,11 @@
+ #include <switch.h>
+ 
+ #define JOYSTICK_COUNT 8
++// Lost Odyssey is one player. Horizon is told one player (npad No1) plus the
++// handheld npad, so a controller that connects becomes player 1 and the
++// controller applet asks for one controller instead of offering eight player
++// slots. SDL still opens 8 joysticks; pads 2-8 simply never connect.
++#define SUPPORTED_PLAYERS 1
+ 
+ typedef struct SWITCHJoystickState
+ {
+@@ -93,7 +98,9 @@ static void SWITCH_UpdateControllerSupport(Uint64 timestamp, bool handheld)
+         HidLaControllerSupportResultInfo info;
+         HidLaControllerSupportArg args;
+         hidLaCreateControllerSupportArg(&args);
+-        args.hdr.player_count_max = JOYSTICK_COUNT;
++        args.hdr.player_count_min = 1;
++        args.hdr.player_count_max = SUPPORTED_PLAYERS;
++        args.hdr.enable_single_mode = 1;
+         hidLaShowControllerSupportForSystem(&info, &args, false);
+     }
+ 
+@@ -136,7 +143,7 @@ static void SWITCH_UpdateControllerSupport(Uint64 timestamp, bool handheld)
+  */
+ static bool SWITCH_JoystickInit(void)
+ {
+-    padConfigureInput(JOYSTICK_COUNT, HidNpadStyleSet_NpadStandard);
++    padConfigureInput(SUPPORTED_PLAYERS, HidNpadStyleSet_NpadStandard);
+ 
+     // initialize first pad to defaults
+     padInitializeDefault(&state[0].pad);
