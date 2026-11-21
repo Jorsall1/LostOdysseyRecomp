@@ -1,0 +1,29 @@
+================================================================================
+LostOdysseyRecomp - Nintendo Switch 2 port
+Summary - TURN 79: "artifacting shortly after load" log read; no code change
+================================================================================
+LOG (Desktop\lo project\runtime-1795226713455346.log, 21:05, 260 s)
+  * Build dfa28b481d86 (turn 77 revert = turn 73 code), env
+    LO_GUEST_AFFINITY=1 LO_SHADOW_RESOLUTION=2. Handheld.
+  * No error, GPU stop, fault or stall dump. Clean HOME -> X exit.
+  * Maps: Artists' Salon (save load, ready 16.3 s), Main Street, nb8, nba.
+    Playing windows 53.6-60.0 FPS.
+  * No screenshot from this session (pictures\ is from 18:20).
+WHAT CHANGED RIGHT AFTER THE LOAD (Artists' Salon)
+  16.3 scene ready | 17.9 dynamic shadows on | 18.07 2x shadow atlas
+  created (1760x1792) | 18.13 202 ms frame, 18.19 33 ms frame (GPU 24.2) |
+  19.21 DR 792 -> 576 rows in one step (GPU 22.6 ms, 5 missed frames),
+  every scene target rebuilt at 19.28 | 20.2 effect level 1 (DoF off) |
+  21.2 level 2 (shadows low). Three host-side render changes in 3 s.
+  Later loads: DR moves one 36-row step at a time, no effect cuts.
+WOULD THE TURN 75 RULES (b462d9fc) HAVE CHANGED THIS?
+  * Stall guard: no. The 19.21 window was GPU-bound (22.6 ms GPU of 22.7 ms
+    frame), which the guard still lets step down.
+  * 3 s post-load effect hold: no. Cuts came 3.9 s and 4.9 s after ready.
+  * Cutscene rules: not a cutscene.
+OPTIONS GIVEN TO USER (none applied, waiting for answer + description)
+  1. A/B without LO_SHADOW_RESOLUTION=2 at the same load.
+  2. Post-load settle window (~6-8 s): no DR change, no effect cut.
+  3. Cap DR step-down to a few steps per window instead of 792 -> 576.
+  4. Re-apply turn 75 rules for the cutscene flicker (separate issue).
+================================================================================
