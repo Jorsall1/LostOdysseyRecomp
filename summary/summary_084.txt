@@ -1,0 +1,42 @@
+================================================================================
+LostOdysseyRecomp - Nintendo Switch 2 port
+Summary - TURN 84: "update 0.2.0 logs" 61 min session read, comparison with
+earlier builds, release recommendation; no code change
+================================================================================
+LOG: Desktop\lo project\update 0.2.0 logs\runtime-1795271186454356.log,
+  2026-11-21 09:26, 3651 s, revision ffacaad7cb59-dirty, env
+  LO_GUEST_AFFINITY=1 LO_SHADOW_RESOLUTION=2. Clean HOME -> X exit.
+BUILD IDENTITY (important)
+  * Same revision string as the turn 82 log = turn 81 code (commit f5a6701a,
+    NRO b66fb571). NOT the turn 83 NRO (6ab6e7b1, revision 9807c1f51607-dirty,
+    on the Desktop): the turn 83 build always logs "command processor: GPU
+    CmdProc on cores ..." on Switch 2, and that line is absent.
+  * Turn 83 changes (CmdProc cores 3-5, DR CPU-bound guard, 10 s shadow
+    restore) are still untested on hardware.
+NUMBERS (10 s perf windows, loads and the two system freezes excluded)
+  log                     min   FPS   at 60  <55   p50>17ms  p99   effect/min
+  turn 73 code (old log)   4.3  58.2   35%   8.7%   4.3%    19.5   0.46
+  turn 73 code (new log)   5.4  56.1   43%   8.7%   4.3%    21.0   0.37
+  turn 81 code (turn 82)  37.0  58.4   72%  11.0%   7.8%    19.6   0.59
+  turn 81 code (this)     60.9  58.5   66%   9.7%   5.4%    20.4   0.36
+  v0.1.0 era (summary 078, raw logs gone): 59.0 FPS with sticky 18 ms in 9%
+  of windows; 1.4 h run 55.5 FPS stuck at 864 rows, shadows low/full 20x
+  in 14 min (1.4/min).
+  This run, handheld 58.1 / 624 rows, docked 58.4 / 1026 rows. Canal Street
+  56.9 handheld (turn 82: 51.2), 55.2 docked (55.4). New areas: Ghost Town,
+  Uhra, Castle of Uhra 59.4 docked. Weakest: Cooke and Mack's House handheld
+  55.1 (44-49 FPS for ~6 min at 2072-2412 s, 576 rows, GPU 14-18 ms).
+FREEZES (not game bugs as far as the log shows)
+  * 1830.9-1850.4 s: npad mask 0x00 (no controller) -> 19.3 s frame; system
+    controller prompt, same as turn 82 at 1635 s.
+  * ~3528-3541.9 s: dock -> handheld, render fence wait 13.5 s in exec
+    0x8270b500, applet handheld event only at 3538.6 s. The 437 s undock took
+    0.3 s. One-off; cause unknown (system display switch).
+VERDICT
+  Average FPS is not noticeably higher than v0.1.0 (~58.5 either way, content
+  dependent). The gains are consistency: no stuck low-resolution state, about
+  4x fewer shadow/effect flips, fewer sticky slow windows, one-player
+  controller fix, 2x shadow option. 61 min with no crash or GPU error.
+  OK to release. Either tag f5a6701a (tested code) or test the turn 83 NRO
+  first (one Canal Street run, check the CmdProc log line) and release HEAD.
+================================================================================
