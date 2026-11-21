@@ -1,0 +1,38 @@
+================================================================================
+LostOdysseyRecomp - Nintendo Switch 2 port
+Summary - TURN 82: turn 81 build, 37 min handheld + docked session read; no
+code change
+================================================================================
+LOG: Desktop\lo project\new update log\runtime-1795229038454984.log, 21:43,
+  2220 s, revision ffacaad7-dirty (= turn 81 code, NRO b66fb571), env
+  LO_GUEST_AFFINITY=1 LO_SHADOW_RESOLUTION=2. Docked 1626-1744 s and
+  1903-2220 s. No error, GPU stop or crash. Clean HOME -> X exit.
+NUMBERS (playing windows, 10 s)
+  handheld 160 windows 58.6 FPS, 78% at 60, rows avg 722 (576-1080).
+  docked    40 windows 58.1 FPS, 78% at 60, rows avg 1141 (756-1404).
+  Per map (handheld): Thelran's Inn 60.0/952 rows, Nalia's 59.9/786, Ninn's
+  59.7/821, Main Street 58.9/607, White Square 58.8/580, Canal Street
+  51.2/595. Docked: Katyla House 59.8/1366, Canal Street 55.4/956.
+  Main Street/White Square match turn 76 (59.1/576, 59.6/605).
+SHADOWS LOW (new Selector)
+  120 stat lines: 9.8 casters on screen, 7.7 shadows/frame avg, max 15.1
+  (cap 16 respected). No measurable FPS cost. Effect level changes 22 in
+  37 min (0.6/min; turn 75 log 1.2/min); shadows low<->full 12 times, and
+  now restores happen (level 0 four times). One poor cycle: 338.1 s restore
+  on a light screen (26-85 draws, GPU 5.2 ms), re-cut 341.1 s.
+WEAK SPOTS
+  * Canal Street 1690-1875 s: 32-53 FPS. GPU CmdProc thread 85-93% (CPU),
+    2000-3000 draws. Docked GPU only 54-64% busy (11.8 ms) yet DR stepped
+    1188 -> 828 rows on "slow frames": resolution lost, FPS unchanged (45.8
+    at 828). Handheld at the 576 floor, GPU 15-19.5 ms and CmdProc bound.
+  * Docked CPU clock 998 MHz vs 1101 handheld (perf line cpu_mhz).
+  * 1635.7 s: 3.8 s frame while no controller was connected (npad mask 0
+    1626-1639 s, Joy-Cons moved at docking): system controller prompt, not
+    the game.
+  * 501.9 s: 48 FPS, Guest Main 47 ms frames after a load (known, game-side).
+PROPOSED (not applied)
+  1. DR: no step down when the window is CPU-bound (GPU busy under ~60% of
+     the frame time). Keeps docked Canal Street near 1188 rows; no FPS cost.
+  2. Effect budget: no restore on DR "light screen" windows (338 s pop).
+  3. Canal Street FPS itself needs command-processor CPU work (bigger job).
+================================================================================
