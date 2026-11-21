@@ -106,6 +106,29 @@ int main()
         Run(d, now, busy, 6, 13.0, nullptr, false, true);
         CHECK(d.level == 0);
     }
+    {
+        // Turn 75: in a cutscene a cut needs the whole frame time (16.7 ms), and a restore never takes the slack.
+        eb::Controller c;
+        uint64_t now = 1'000'000'000ull, busy = 0;
+        const auto cut = [&](double seconds, double gpuMs, bool slack = false) {
+            for (double t = 0; t < seconds; t += 1.0 / 60) {
+                c.Update(now, busy, 14.0, true, slack, 1000.0 / 60, true);
+                busy += uint64_t(gpuMs * 1e6);
+                now += 16'666'667ull;
+            }
+        };
+        cut(10, 15.4);
+        CHECK(c.level == 0);                 // over 14 ms, frames on time: effects stay
+        cut(3, 18.0);
+        CHECK(c.level >= 1);                 // frames missed: cut as before
+        cut(40, 7.0);
+        CHECK(c.level == 0);                 // under 70%: back
+        cut(3, 18.0);
+        CHECK(c.level >= 1);
+        const uint32_t held = c.level;
+        cut(30, 13.0, true);
+        CHECK(c.level == held);              // under the budget with slack: no restore in a cutscene
+    }
     CHECK(eb::BudgetMs(1000.0 / 60) > 13.9 && eb::BudgetMs(1000.0 / 60) < 14.1);
     if (failures) return 1;
     std::puts("effect_budget_test: ok");

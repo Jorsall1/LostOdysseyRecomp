@@ -51,8 +51,15 @@ struct Controller
     // 35-40 ms spike entering the field, and the effects stayed cut for the session). resolutionSlack: dynamic
     // resolution sits two or more rungs above its floor, so a restore under the budget (not only under 70% of
     // it, which a resolution that climbs to ~85% of the frame never allows) costs rows, not frames.
-    bool Update(uint64_t nowNs, uint64_t busyTotalNs, double budgetMs, bool atFloor = true, bool resolutionSlack = false)
+    // cutBudgetMs (0: budgetMs): the line a cut needs. In a cutscene the caller passes the whole frame time
+    // (turn 75, Switch 2 handheld log 2026-11-20, 2x shadows: depth of field went off/on and shadows low/full
+    // 10 times inside cutscenes, at 14.1-15.4 ms GPU, all frames still on time; each one a visible pop in a
+    // close-up). With cutscene set a restore also needs the GPU under 70% of the budget, never the resolution
+    // slack, so a restored effect is not cut again a few seconds later.
+    bool Update(uint64_t nowNs, uint64_t busyTotalNs, double budgetMs, bool atFloor = true, bool resolutionSlack = false,
+                double cutBudgetMs = 0, bool cutscene = false)
     {
+        if (cutBudgetMs < budgetMs) cutBudgetMs = budgetMs;
         if (framesSinceDofChange < DofLagFrames) ++framesSinceDofChange;
         if (!started) {
             started = true;
@@ -73,7 +80,7 @@ struct Controller
             cutStrikes = restoreStrikes = 0;
             return false;
         }
-        if (busyMs > budgetMs) {
+        if (busyMs > cutBudgetMs) {
             restoreStrikes = 0;
             if (!atFloor) {
                 cutStrikes = 0;
@@ -91,7 +98,7 @@ struct Controller
         }
         cutStrikes = 0;
         const bool shadows = level >= 2;
-        if (busyMs < budgetMs * RestoreShare || (resolutionSlack && !shadows)) {
+        if (busyMs < budgetMs * RestoreShare || (resolutionSlack && !shadows && !cutscene && busyMs <= budgetMs)) {
             const uint64_t hold = shadows ? std::max(restoreHoldNs, ShadowRestoreHoldNs) : restoreHoldNs;
             if (++restoreStrikes >= RestoreWindows && level > 0 && nowNs - lastChange >= hold) {
                 lastRestore = nowNs;

@@ -10,6 +10,7 @@
 #include "gpu/gpu_busy.h"
 #include "gpu/loading_pacing.h"
 #include <debug/perf_stats.h>
+#include <debug/map_info.h>
 #include <chrono>
 #include <cstdlib>
 #include <string_view>
@@ -120,8 +121,12 @@ namespace gpu::frame_plan
         // an upscaler, which sizes its own input.
         // The effect budget (gpu/effect_budget.h) runs beside dynamic resolution, from the same GPU busy time.
         effect_budget::Controller effectBudget;
+        // The first seconds of a new map or battle (turn 75, 2026-11-20): the game thread builds the scene and the
+        // GPU time includes its uploads. Cuts taken there (1254.6/1255.6 s on a battle start at 17.1 ms, 1323.2/
+        // 1324.2 s after a map load) kept depth of field and full shadows off for the next 45-50 s, through a cutscene.
+        constexpr uint64_t SceneSettleMs = 3000;
         void UpdateEffectBudget(bool enabled, bool loading, uint64_t nowNs, double frameMs, bool atFloor = true,
-            bool resolutionSlack = false)
+            bool resolutionSlack = false, bool cutscene = false)
         {
             static const bool environment = effect_budget::EnvironmentEnabled();
             if (!enabled || !environment) {
@@ -133,9 +138,11 @@ namespace gpu::frame_plan
                 return;
             }
             const double budgetMs = effect_budget::BudgetMs(frameMs);
-            if (loading) {
+            // In a cutscene a cut needs the whole frame time: frames still on time keep the effects (see Update).
+            const double cutBudgetMs = cutscene ? std::max(budgetMs, frameMs) : budgetMs;
+            if (loading || debug_menu::LoadInProgress() || debug_menu::MsSinceSceneReady() < SceneSettleMs) {
                 effectBudget.Hold(nowNs, gpu_busy::Total());
-            } else if (effectBudget.Update(nowNs, gpu_busy::Total(), budgetMs, atFloor, resolutionSlack)) {
+            } else if (effectBudget.Update(nowNs, gpu_busy::Total(), budgetMs, atFloor, resolutionSlack, cutBudgetMs, cutscene)) {
                 static constexpr const char* names[] = {"all effects as set", "motion blur and depth of field blur off",
                     "motion blur and depth of field blur off, dynamic shadows low"};
                 LOG_INFO("effect budget: level {} ({}; GPU {:.1f} ms per frame, budget {:.1f} ms)", effectBudget.level,
@@ -198,8 +205,9 @@ namespace gpu::frame_plan
             // Resolution goes first: effects are cut only with the scene at its lowest height, and come back while
             // it has two rungs to give (turn 54).
             const bool started = controller.base == configured && controller.height;
+            const bool cutscene = cinematic_bars::CutsceneActive();
             UpdateEffectBudget(true, hold, now, budgetMs, !started || controller.height <= controller.minimum,
-                started && controller.height >= controller.minimum + 2 * controller.step);
+                started && controller.height >= controller.minimum + 2 * controller.step, cutscene);
             // Loading (the guest loader hooks, gpu/loading_pacing.h): keep the height; a change there rebuilds every
             // scene target for a loading screen, and its new uncleared targets can show for a frame.
             if (hold && controller.base == configured &&
@@ -208,7 +216,8 @@ namespace gpu::frame_plan
                 return controller.height;
             }
             const uint32_t height = controller.Update(now, gpu_busy::Total(), configured, minimum, budgetMs, changed, step,
-                perf_stats::LateGpuFrames());
+                perf_stats::LateGpuFrames(),
+                cutscene ? dynamic_resolution::Controller::CutsceneUpHoldNs : dynamic_resolution::Controller::UpHoldNs);
             if (controller.minimum != announcedMinimum || configured != announcedBase) {
                 announcedMinimum = controller.minimum;
                 announcedBase = configured;
