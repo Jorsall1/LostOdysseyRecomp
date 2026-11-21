@@ -1,0 +1,23 @@
+================================================================================
+LostOdysseyRecomp - Nintendo Switch 2 port
+Summary - TURN 90: GitHub release v0.2.0 published
+================================================================================
+RELEASE: https://github.com/Jorsall1/LostOdysseyRecomp/releases/tag/v0.2.0
+  (Latest). Tag v0.2.0 -> 02bfed9b (code = f5a6701a; README env.txt change).
+  Branch switch2-ouncevk pushed (b31a498e..02bfed9b).
+ZIP LostOdysseyRecomp-Switch2-v0.2.0.zip, 182628838 bytes, sha256 700cdedd...
+  switch/LostOdysseyRecomp/LostOdysseyRecomp.nro   md5 b66fb571 (backup7,
+    revision ffacaad7cb59-dirty, the 132 min tested build)
+  switch/LostOdysseyRecomp/env.txt                 LO_GUEST_AFFINITY=1,
+    LO_SHADOW_RESOLUTION=2, with # comments (env_file.cpp skips '#')
+  switch/LostOdysseyRecomp/shaders/portable_vk.lospv  md5 c42d00b0 (= v0.1.0;
+    147970990 bytes, the size the tested log reports)
+  switch/LostOdysseyRecomp/shaders/pipelines_corpus.bin md5 10a05ebe (= v0.1.0)
+  No disc files. Downloaded back from GitHub: sha256 and file md5s match.
+README: env.txt section now lists LO_SHADOW_RESOLUTION=2.
+NOTES: fix bullets (DR slow frames, no shadow popping, fewer effect flips,
+  one player controller, 2x shadows, OunceVK 20261120, 132 min tested),
+  install steps, update-from-v0.1.0 note, credits as v0.1.0.
+NOT VERIFIED ON HARDWARE: the ZIP itself. Its NRO and shaders are byte-equal
+  to what ran; env.txt adds only comment lines to the tested settings.
+================================================================================
