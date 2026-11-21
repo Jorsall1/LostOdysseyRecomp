@@ -1,0 +1,24 @@
+================================================================================
+LostOdysseyRecomp - Nintendo Switch 2 port
+Summary - TURN 80: salon artifact = translucent polygons, gone on re-entry;
+recommendation; no code change
+================================================================================
+USER REPORT: translucent polygons, Artists' Salon only, first visit after the
+  save load (16.3 s). Left and re-entered (95.9 s): gone.
+LOG COMPARISON (runtime-1795226713455346.log)
+  First visit: DR 792 -> 576 in one jump (19.2 s), then DoF off (20.2 s) and
+    shadows low (21.2 s) while in the room.
+  Re-entry: DR 684 -> 612 -> 576 (97.8/98.8 s), every scene target rebuilt
+    twice, no artifact. Effects already at level 2 before the load, so no
+    effect switch inside the room.
+  => A resolution rebuild alone does not cause it. Prime suspect: the effect
+    switch mid-scene (DoF off / shadow casters dropped at 2x shadows), or
+    the 6-step jump. A map reload resets the game-side state, so it clears.
+  Also: effects stayed at level 2 (DoF off, shadows low) for the rest of the
+    260 s session; no restore line after 21.2 s.
+RECOMMENDATION (not applied, waiting for user go-ahead)
+  Re-apply turn 75 (b462d9fc), extend its post-load effect hold from 3 s to
+  ~8 s, cap DR step-down to 3 steps per window. Average FPS expected the
+  same; first seconds after a heavy load may sit at 45-55 FPS instead of
+  cutting effects. Test: load the same save into the salon 2-3 times.
+================================================================================
