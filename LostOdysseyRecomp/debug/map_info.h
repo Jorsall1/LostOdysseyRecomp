@@ -27,8 +27,6 @@ uint32_t CurrentSceneTag();
 bool CurrentLoad(std::string& what, uint64_t& startMs);
 // The same without the name: no lock, no copy. Any thread.
 bool LoadInProgress();
-// Milliseconds since the last map or battle load finished (scene ready); ~0 before the first. Any thread.
-uint64_t MsSinceSceneReady();
 // Switch-only opt-in slow-load thread dumps (LO_LOAD_PROFILE=1).
 bool LoadProfileEnabled();
 // Called on the game thread when a map or battle starts loading.

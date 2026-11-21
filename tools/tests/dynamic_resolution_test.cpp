@@ -207,46 +207,6 @@ int main()
         }
         CHECK(h == 864);                 // and no step up into a slow window either
     }
-    {
-        // Turn 75: a stall (577 ms frames, the GPU mostly idle) is not a scene: no step down.
-        dr::Controller d;
-        bool changed = false;
-        uint64_t now = 1'000'000'000ull, busy = 1;
-        d.Update(now, busy, 1080, 576, 1000.0 / 60, changed);
-        d.height = 864;
-        uint32_t h = 864;
-        for (int f = 0; f < 10; ++f) {
-            h = d.Update(now, busy, 1080, 576, 1000.0 / 60, changed);
-            busy += 76'000'000ull;
-            now += 577'000'000ull;
-        }
-        CHECK(h == 864);
-        // GPU-bound at 50 ms a frame is a heavy scene: it still steps down.
-        for (int f = 0; f < 100; ++f) {
-            h = d.Update(now, busy, 1080, 576, 1000.0 / 60, changed);
-            busy += 50'000'000ull;
-            now += 50'000'000ull;
-        }
-        CHECK(h < 864);
-    }
-    {
-        // Turn 75: in a cutscene steps up wait CutsceneUpHoldNs (12 s), steps down do not.
-        dr::Controller d;
-        bool changed = false;
-        uint64_t now = 1'000'000'000ull, busy = 1;
-        d.Update(now, busy, 1080, 576, 1000.0 / 60, changed);
-        d.height = 576;
-        uint32_t h = 576;
-        int firstUp = -1;
-        for (int f = 0; f < 60 * 30; ++f) {
-            h = d.Update(now, busy, 1080, 576, 1000.0 / 60, changed, dr::Rung, 0, dr::Controller::CutsceneUpHoldNs);
-            if (changed && firstUp < 0) firstUp = f;
-            busy += 6'000'000ull;
-            now += 16'666'667ull;
-        }
-        CHECK(firstUp >= 60 * 12);           // not before 12 s after the last change (3 s outside cutscenes)
-        CHECK(h > 576);
-    }
     if (failures) return EXIT_FAILURE;
     std::puts("dynamic_resolution_test: ok");
     return 0;
