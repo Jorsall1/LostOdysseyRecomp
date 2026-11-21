@@ -1,0 +1,23 @@
+================================================================================
+LostOdysseyRecomp - Nintendo Switch 2 port
+Summary - TURN 85: re-check of which NRO produced the "update 0.2.0" log; no
+code change
+================================================================================
+User says the new NRO was sent over FTP. The log still came from the turn 81
+build. Evidence:
+  1. Log header: revision=ffacaad7cb59-dirty. The turn 83 NRO (Desktop and
+     build/, md5 6ab6e7b1) contains only the string 9807c1f51607-dirty.
+  2. The turn 83 NRO always logs "command processor: GPU CmdProc on cores
+     ..." at startup on Switch 2 (both branches log). Present in the NRO
+     binary, absent from the log.
+  3. Behaviour: 184.4 s docked, DR stepped 900 -> 864 -> 828 -> 792 rows with
+     GPU 13.4-13.9 ms of a 25-26 ms frame (about 53%). The turn 83 CpuBoundShare
+     0.70 guard blocks exactly that step down.
+Launched path: sdmc:/switch/LostOdysseyRecomp/LostOdysseyRecomp.nro.
+Likely causes: the FTP upload went to another path or name, failed or was cut
+short without overwriting, or it ran before the 22:47 rebuild (Desktop NRO
+timestamp 2026-11-20 22:47:47).
+Check: after the next launch the log's build line must read
+revision=9807c1f51607-dirty and include the "command processor" line. The
+expected file size is 89010609 bytes.
+================================================================================
