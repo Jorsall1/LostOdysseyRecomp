@@ -1,0 +1,25 @@
+================================================================================
+LostOdysseyRecomp - Nintendo Switch 2 port
+Summary - TURN 78: current build vs release v0.1.0; no code change
+================================================================================
+IDENTITY
+  * 25-min run (runtime-1795223203456646, 20:06): revision c3aece7e-dirty,
+    LO_SHADOW_RESOLUTION=2 = turn 73 build. Current NRO (1702f310, commit
+    dfa28b48) has the same code (75f41f1d/e91c15d4) and the same OunceVK
+    (Mesa 26.2.2 git-f31c0d894e). md5 differs only by the revision string.
+  * v0.1.0 = tag 7f04f541, NRO ce75f6cc (turn 68 code).
+CODE SINCE v0.1.0 (gameplay-relevant): turn 72 (OunceVK 20261120, SDL
+  one-player pad config, DR slow-frame signal + 90 s hold, shadows-low
+  restore only under 70% and 30 s after cut), turn 73 (LO_SHADOW_RESOLUTION
+  2/4 env switch). Rest is README/summaries.
+MEASURED (logs read in turns 72-76; raw logs no longer on the Desktop)
+  v0.1.0-era builds: 30 min (65d6b70): 59.0 FPS avg, sticky 18 ms frames in
+  9% of windows; 1.4 h (turn 67): 55.5 FPS stuck at 864 rows for minutes,
+  shadows low/full 20 times in 14 min.
+  Current code: 50 min 1x 58.3 FPS, sticky 2%, 2 shadow flips; 23 min 1x
+  59.2; 31 min 2x 58.5 (sticky 3%, Queen's Room cutscene at 44 FPS); 25 min
+  2x 59.1, 90% windows full 60, sticky 0%, 8 shadows-low in 25 min.
+  Average FPS about the same (content-dependent). Improvements: the stuck
+  55 FPS state, shadow popping, 1-player controller, 2x shadows option at
+  <= 0.4 ms GPU (turn 76 pass timing).
+================================================================================
