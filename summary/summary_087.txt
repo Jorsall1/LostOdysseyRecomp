@@ -1,0 +1,24 @@
+================================================================================
+LostOdysseyRecomp - Nintendo Switch 2 port
+Summary - TURN 87: back to the turn 81 build (user request, Continue hang on
+turn 83)
+================================================================================
+BACKUP CHECK: Desktop\backup7\LostOdysseyRecomp.nro md5 b66fb571 (89010609
+  bytes), revision string ffacaad7cb59-dirty = the turn 81 NRO. Same revision
+  as the 37 min (turn 82) and 61 min ("update 0.2.0") logs. env.txt matches
+  the one in use (LO_GUEST_AFFINITY=1, LO_SHADOW_RESOLUTION=2).
+DONE
+  * Desktop\LostOdysseyRecomp.nro replaced by the backup7 copy (md5 b66fb571).
+  * Code: commit 2db2d022 restores command_processor.cpp,
+    dynamic_resolution.h, effect_budget.h, docs/SWITCH.md and the two tests
+    from f5a6701a. git diff f5a6701a HEAD outside summary/ is empty.
+    Summaries 083-086 kept as history.
+  * Turn 83 NRO kept at build/archive/turn83_6ab6e7b1.nro.
+  * Rebuilt build/ from the reverted code: builds, no CmdProc cores line.
+    Its md5 differs from b66fb571 only by the revision string; the release
+    NRO should be the backup7 file itself.
+NOTE: the Continue hang has not been proven to be turn 83's. It was seen once
+  in 3 Continues, never in the 98 min of turn 81 play (which had more than
+  one Continue? unknown). Watch for it on turn 81 too.
+RELEASE: tag f5a6701a (or 2db2d022, same code) and attach backup7's NRO.
+================================================================================
