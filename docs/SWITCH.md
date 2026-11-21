@@ -316,7 +316,6 @@ Switch-specific options and diagnostics:
 | `LO_SKIP_RESTORE` | on | `0` draws the game's EDRAM restores instead of skipping them (deko3d) |
 | `LO_MAIN_CORE` | `-1` | core Guest Main stays on, `-1` leaves it free to move. Pinning gains 2% in battle but can stall the game: see `SWITCH-BENCHMARKS.md`, Milestone 4 |
 | `LO_RT32` | off | Set to `1` to use 32-bit formats for the two 10-bit render-target classes; on Switch the 7e3 class uses `R11G11B10_FLOAT`, so its 2-bit alpha is read as 1 |
-| `LO_CMDPROC_CORES` | `1` | Switch 2: `GPU CmdProc` runs on cores 3-5 at priority 0x2B, off the guest threads' cores 0-2, when the process may use them (log: `command processor: GPU CmdProc on cores 3-5`). `0` keeps it on cores 0-2 |
 | `LO_GUEST_AFFINITY` | off | Set to `1` to map Xbox guest thread affinity onto the Switch's three cores |
 | `LO_THREAD_PLACEMENT` | off | Set to `1` to log every 30 s (`switch: placement`) each core's idle share and, per thread above 1% CPU, its priority, ideal core, allowed mask, and the cores it was seen on |
 | `LO_THREAD_CORES` | off | With `LO_THREAD_PLACEMENT=1`: `name=core:hexmask,...` sets the ideal core and allowed mask of a thread of that name once a report finds it above 50% CPU, for placement experiments |

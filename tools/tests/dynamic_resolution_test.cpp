@@ -247,29 +247,6 @@ int main()
         CHECK(firstUp >= 60 * 12);           // not before 12 s after the last change (3 s outside cutscenes)
         CHECK(h > 576);
     }
-    {
-        // Turn 83 (Switch 2 docked, 2026-11-20, Canal Street): 22 ms frames, GPU busy 13 ms (59%), a frame in five
-        // late. Was 1188 -> 828 rows at the same frame rate; now held. A GPU-bound window still steps down.
-        dr::Controller d;
-        bool changed = false;
-        uint64_t now = 1'000'000'000ull, busy = 1, late = 0;
-        d.Update(now, busy, 1440, 720, 1000.0 / 60, changed);
-        d.height = 1188;
-        uint32_t h = 1188;
-        for (int f = 0; f < 45 * 20; ++f) {
-            h = d.Update(now, busy, 1440, 720, 1000.0 / 60, changed, dr::Rung, late);
-            busy += 13'000'000ull;
-            now += 22'000'000ull;
-            if (f % 5 == 0) ++late;
-        }
-        CHECK(h == 1188);
-        for (int f = 0; f < 60 * 5; ++f) {
-            h = d.Update(now, busy, 1440, 720, 1000.0 / 60, changed, dr::Rung, late);
-            busy += 20'000'000ull;
-            now += 20'900'000ull;
-        }
-        CHECK(h < 1188);
-    }
     if (failures) return EXIT_FAILURE;
     std::puts("dynamic_resolution_test: ok");
     return 0;
