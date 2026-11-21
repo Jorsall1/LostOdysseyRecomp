@@ -8,7 +8,7 @@
 // time per frame stays above a budget (default 14 ms at 60 FPS: 84% of the frame), so the scene height can stay
 // higher instead. Levels, each kept for at least a second:
 //   1: motion blur off, depth of field blur off (patches/graphics_effects.cpp, renderer tone-map weight)
-//   2: level 1 + Dynamic shadows Low (patches/shadow_budget.cpp: shadows only for the 8 largest casters on screen)
+//   2: level 1 + Dynamic shadows Low (patches/shadow_budget.cpp, gpu/shadow_low.h: shadows only for the 12 largest casters on screen)
 // A level is dropped again after 5 s with the GPU under 70% of the budget (or under the budget with dynamic
 // resolution two rungs above its floor; level 2 only under 70%, and at least 30 s after its cut). Settings that already turn an effect off
 // are untouched; the budget never turns one on. LO_EFFECT_BUDGET=0 turns it off, LO_EFFECT_BUDGET_MS=<ms> sets the
@@ -51,8 +51,15 @@ struct Controller
     // 35-40 ms spike entering the field, and the effects stayed cut for the session). resolutionSlack: dynamic
     // resolution sits two or more rungs above its floor, so a restore under the budget (not only under 70% of
     // it, which a resolution that climbs to ~85% of the frame never allows) costs rows, not frames.
-    bool Update(uint64_t nowNs, uint64_t busyTotalNs, double budgetMs, bool atFloor = true, bool resolutionSlack = false)
+    // cutBudgetMs (0: budgetMs): the line a cut needs. In a cutscene the caller passes the whole frame time
+    // (turn 75, Switch 2 handheld log 2026-11-20, 2x shadows: depth of field went off/on and shadows low/full
+    // 10 times inside cutscenes, at 14.1-15.4 ms GPU, all frames still on time; each one a visible pop in a
+    // close-up). With cutscene set a restore also needs the GPU under 70% of the budget, never the resolution
+    // slack, so a restored effect is not cut again a few seconds later.
+    bool Update(uint64_t nowNs, uint64_t busyTotalNs, double budgetMs, bool atFloor = true, bool resolutionSlack = false,
+                double cutBudgetMs = 0, bool cutscene = false)
     {
+        if (cutBudgetMs < budgetMs) cutBudgetMs = budgetMs;
         if (framesSinceDofChange < DofLagFrames) ++framesSinceDofChange;
         if (!started) {
             started = true;
@@ -73,7 +80,7 @@ struct Controller
             cutStrikes = restoreStrikes = 0;
             return false;
         }
-        if (busyMs > budgetMs) {
+        if (busyMs > cutBudgetMs) {
             restoreStrikes = 0;
             if (!atFloor) {
                 cutStrikes = 0;
@@ -91,7 +98,7 @@ struct Controller
         }
         cutStrikes = 0;
         const bool shadows = level >= 2;
-        if (busyMs < budgetMs * RestoreShare || (resolutionSlack && !shadows)) {
+        if (busyMs < budgetMs * RestoreShare || (resolutionSlack && !shadows && !cutscene && busyMs <= budgetMs)) {
             const uint64_t hold = shadows ? std::max(restoreHoldNs, ShadowRestoreHoldNs) : restoreHoldNs;
             if (++restoreStrikes >= RestoreWindows && level > 0 && nowNs - lastChange >= hold) {
                 lastRestore = nowNs;

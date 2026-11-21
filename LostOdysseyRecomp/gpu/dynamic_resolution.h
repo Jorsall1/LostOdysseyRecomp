@@ -63,6 +63,12 @@ namespace gpu::dynamic_resolution
         // must stay under (its cost scaled by its pixel count) before stepping up.
         static constexpr double DownAt = 0.92, UpBelow = 0.85; // UpBelow 0.80 -> 0.85 (turn 53): one more rung in battle (576 -> 612 at 12.5 ms)
         static constexpr uint64_t WindowNs = 500'000'000ull, DownHoldNs = 1'000'000'000ull, UpHoldNs = 3'000'000'000ull;
+        // Step-up spacing in cutscenes (the caller passes it as upHoldNs). Turn 75, 2026-11-20 1400-1446 s: eight
+        // height changes in 46 s of one cutscene (576 -> 684 -> 792 -> 828 -> 756 ...), each a rebuild of the scene
+        // targets and a visible change of sharpness in a close-up. Steps down are not slowed.
+        static constexpr uint64_t CutsceneUpHoldNs = 12'000'000'000ull;
+        // A window whose frames average over this many budgets is a stall, not a scene (see Update).
+        static constexpr double StallShare = 3.0;
         // A frame that costs less than this says nothing about the scene: a loading screen, a fade or a movie (Switch 2,
         // 2026-11-18: 576 -> 612 rows on the loading screen at 0.3 ms before mv_01v, a rebuild of every scene target
         // there and again when the battle started). It never steps up.
@@ -115,7 +121,7 @@ namespace gpu::dynamic_resolution
         // changed this frame (for the log).
         // lateFrames: perf_stats::LateGpuFrames' running total (0 when unknown).
         uint32_t Update(uint64_t nowNs, uint64_t busyTotalNs, uint32_t baseHeight, uint32_t minimumHeight, double budgetMs,
-                        bool& changed, uint32_t stepRows = Rung, uint64_t lateFrames = 0)
+                        bool& changed, uint32_t stepRows = Rung, uint64_t lateFrames = 0, uint64_t upHoldNs = UpHoldNs)
         {
             changed = false;
             lateTotal = lateFrames;
@@ -150,6 +156,14 @@ namespace gpu::dynamic_resolution
             lastBusyMs = busyMs;
             lastFrameMs = frameMs;
             lastLate = uint32_t(late);
+            // A stall (frames over StallShare budgets on average): the game thread is building a scene and the GPU
+            // time is its uploads, not the scene's cost (turn 75, 2026-11-20 392.6 s: 577 ms frames at 75.9 ms GPU
+            // right after a map load sent the scene to its floor and rebuilt every target there). No change.
+            // A GPU-bound window (busy near the frame time) is a heavy scene and still steps down.
+            if (frameMs > budgetMs * StallShare && busyMs < frameMs * 0.5) {
+                downStrikes = upStrikes = 0;
+                return height;
+            }
             if (ceiling && nowNs - ceilingSince >= ceilingHold) ceiling = 0;
             const bool missing = double(late) > LateDownShare * frames && busyMs > budgetMs * LateMinBusyShare;
             const bool slow = frameMs > budgetMs * SlowFrameShare && busyMs > budgetMs * SlowMinBusyShare;
@@ -184,7 +198,7 @@ namespace gpu::dynamic_resolution
                 if (height + step > top || double(late) > LateUpShare * frames || frameMs > budgetMs * SlowUpShare) {
                     upStrikes = 0;
                 } else if (busyMs * (FixedShare + (1.0 - FixedShare) * up * up) < budgetMs * UpBelow) {
-                    if (++upStrikes >= 6 && nowNs - lastChange >= UpHoldNs) {
+                    if (++upStrikes >= 6 && nowNs - lastChange >= std::max(upHoldNs, UpHoldNs)) {
                         // More than one rung when the pixels alone (no fixed share: the cautious estimate) fit
                         // under the step-up line (turn 54: 720 -> 972 rows took seven steps and 25 s).
                         const double fit = double(height) * std::sqrt(budgetMs * UpBelow / busyMs);

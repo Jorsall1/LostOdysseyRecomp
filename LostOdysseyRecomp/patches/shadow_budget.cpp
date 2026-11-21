@@ -9,9 +9,10 @@
 #include <os/logger.h>
 #include "settings/config.h"
 #include "gpu/effect_budget.h"
+#include "gpu/shadow_low.h"
 
 // Dynamic shadows Low: per-object shadows only for objects on screen, and for
-// at most the LowCount largest of them. Each shadow costs a depth pass, its
+// at most the 12 largest of them. Each shadow costs a depth pass, its
 // projection passes and their draws on the GPU and the render threads. In
 // Uhra's main street the game makes about 60 a frame, 52 of them for people
 // and objects that are not on screen; at 10 W they take a third of the GPU
@@ -24,35 +25,20 @@
 //   max(view+0x24 * view+0x80, view+0x28 * view+0x94) * radius / max(depth, 1)
 // (about the object's height in 720p pixels), then creates it unless the
 // light's fade is zero; when it creates nothing it changes nothing. Low skips
-// the interaction before that.
+// the interaction before that. Which casters keep a shadow: gpu/shadow_low.h
+// (turn 81: 12 largest, hysteresis and a 0.5 s dwell, so shadows stop
+// switching on and off as the player walks).
 extern "C" PPC_FUNC(__imp__sub_823BE570);
 extern "C" PPC_FUNC(__imp__sub_823BE9D0);
 
 namespace
 {
-constexpr size_t LowCount = 8;
-// A shadow already shown stays down to this fraction of the threshold, so
-// objects of about the same size do not trade it every frame.
-constexpr float KeepFraction = 0.8f;
-// A caster that left the screen keeps its shadow this many frames, so
-// visibility that changes from frame to frame does not make it flicker.
-constexpr uint32_t OffScreenFrames = 15;
-
-struct Caster
-{
-    uint32_t lastOnScreen = 0; // frame
-    bool shadow = false;       // had a shadow in the frame before
-};
-
-// Render thread only.
+// Render thread only. Selection rules: gpu/shadow_low.h.
 bool low = false;
-uint32_t frame = 1;
-float threshold = 0.0f;              // the LowCount-th largest size of the previous frame
-std::vector<float> sizes, lastSizes; // sizes of the on-screen casters this frame / the previous frame
+gpu::shadow_low::Selector selector;
 // Keyed by primitive scene info. A primitive lit by two lights has two
 // interactions; both see the same size, so they decide alike.
-std::unordered_map<uint32_t, Caster> casters;
-
+std::unordered_map<uint32_t, gpu::shadow_low::Caster> casters;
 uint32_t LoadU32(uint32_t address)
 {
     return __builtin_bswap32(*static_cast<const uint32_t*>(g_memory.Translate(address)));
@@ -118,14 +104,14 @@ PPC_FUNC(sub_823BE570)
     if (lowNow != low)
         LOG_INFO("graphics effects: dynamic shadows {}", lowNow ? "low" : "full");
     low = lowNow;
-    ++frame;
-    std::swap(sizes, lastSizes);
-    sizes.clear();
-    threshold = 0.0f;
-    if (low && lastSizes.size() > LowCount)
+    selector.BeginFrame();
+    if (selector.statFrames >= 600)
     {
-        std::nth_element(lastSizes.begin(), lastSizes.begin() + (LowCount - 1), lastSizes.end(), std::greater<float>());
-        threshold = lastSizes[LowCount - 1];
+        if (low)
+            LOG_INFO("dynamic shadows low: {:.1f} casters on screen, {:.1f} shadows per frame (last {} frames)",
+                double(selector.statCasters) / double(selector.statFrames),
+                double(selector.statShown) / double(selector.statFrames), selector.statFrames);
+        selector.statFrames = selector.statCasters = selector.statShown = 0;
     }
     if (!low || casters.size() > 4096)
         casters.clear();
@@ -142,17 +128,9 @@ PPC_FUNC(sub_823BE9D0)
         __imp__sub_823BE9D0(ctx, base);
         return;
     }
-    Caster& caster = casters[primitive];
-    if (OnScreen(ctx.r3.u32, primitive))
-        caster.lastOnScreen = frame;
-    if (frame - caster.lastOnScreen > OffScreenFrames)
-    {
-        caster.shadow = false;
+    gpu::shadow_low::Caster& caster = casters[primitive];
+    if (!selector.Visible(caster, OnScreen(ctx.r3.u32, primitive)))
         return;
-    }
-    const float size = ScreenSize(ctx.r3.u32, primitive);
-    sizes.push_back(size);
-    caster.shadow = size >= threshold * (caster.shadow ? KeepFraction : 1.0f);
-    if (caster.shadow)
+    if (selector.Decide(caster, ScreenSize(ctx.r3.u32, primitive)))
         __imp__sub_823BE9D0(ctx, base);
 }

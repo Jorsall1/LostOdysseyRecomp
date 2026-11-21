@@ -1,0 +1,42 @@
+================================================================================
+LostOdysseyRecomp - Nintendo Switch 2 port
+Summary - TURN 81: shadow popping (salon pot) fixed in Dynamic shadows Low;
+turn 75 rules back without the cutscene step-up hold
+================================================================================
+REPORT: pictures 20:17:57/20:18:00, Artists' Salon: the pot's shadow turns on
+  and off as the player moves; other areas too.
+CAUSE
+  Effect level 2 = Dynamic shadows Low (patches/shadow_budget.cpp): only the
+  8 largest on-screen casters keep a shadow, ranked every frame, keep line
+  0.8 of the 8th size. Walking changes the ranks (a nearer NPC grows past the
+  pot): its shadow pops. Level 2 is reached at the DR floor and returns only
+  under 70% GPU after 30 s, which DR (filling the GPU to ~85%) never allows:
+  new log (runtime-1795227378451003, 21:16, 326 s) cut at 40.4 s and stayed
+  low for the session, through two salon visits; old log the same at 21.2 s.
+  So Low is the normal state in Numara, and its popping is visible all game.
+CHANGES
+  * gpu/shadow_low.h (new): Selector. 12 largest enter (was 8), kept while in
+    the 16 largest (rank hysteresis, was size 0.8), each caster's shadow
+    changes at most once per 30 frames, casters under 12 px get none,
+    off-screen grace 30 frames (was 15), one rank entry per caster (two
+    lights no longer count twice). First Low frame has no ranking: shows,
+    decides next frame. Log every 600 frames in Low: "dynamic shadows low:
+    N casters on screen, M shadows per frame".
+  * patches/shadow_budget.cpp: uses the Selector.
+  * Turn 75 (b462d9fc) re-applied: cutscene cut line = frame time (effects
+    stay while frames are on time), 3 s post-load effect hold, DR stall guard.
+    NOT the 12 s cutscene step-up hold (frame_plan.cpp passes UpHoldNs): user
+    wants max resolution.
+  * tools/tests/shadow_low_test.cpp (new): pot vs moving NPC <= 1 change in
+    10 s, oscillating size limited by dwell, two lights, off-screen grace,
+    tiny casters, cap 12-16. effect_budget_test, dynamic_resolution_test ok
+    (with and without -D__SWITCH2__).
+COST
+  Up to 16 shadows on screen in Low instead of 8 (off-screen casters, the
+  bulk, still skipped). 2x shadow depth pass measured <= 0.4 ms (turn 76);
+  projection cost per shadow unknown. DR absorbs it in rows if any.
+BUILD: NRO md5 b66fb57185e800e278314e2b8fce6ba8 (Desktop copy matches).
+  env.txt unchanged (LO_GUEST_AFFINITY=1, LO_SHADOW_RESOLUTION=2).
+NEXT (user): salon + Main Street + a cutscene, 15 min. Read "dynamic shadows
+  low:" lines (shadows per frame) and DR rows vs turn 80 logs.
+================================================================================

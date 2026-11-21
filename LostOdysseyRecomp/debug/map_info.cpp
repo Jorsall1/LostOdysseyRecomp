@@ -29,6 +29,8 @@ std::atomic<uint32_t> pendingScene{0}, battleScene{0};
 std::atomic<uint32_t> currentMapScene{0};
 // The unfinished load for the load watch (main.cpp): start in steady-clock ms.
 std::atomic<uint64_t> loadStartMs{0};
+// When the last load finished (steady-clock ms; 0: none yet), for MsSinceSceneReady.
+std::atomic<uint64_t> sceneReadyMs{0};
 std::string loadWhat; // under mutex
 uint64_t NowMs() {
     return uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -44,6 +46,7 @@ void BeginLoad(std::string what) {
 void EndLoad() {
     const uint64_t start = loadStartMs.exchange(0);
     if (!start) return;
+    sceneReadyMs = NowMs();
     std::string what;
     {
         std::lock_guard lock(mutex);
@@ -325,6 +328,13 @@ bool debug_menu::CurrentLoad(std::string& what, uint64_t& startMs) {
 
 bool debug_menu::LoadInProgress() {
     return loadStartMs.load(std::memory_order_relaxed) != 0;
+}
+
+uint64_t debug_menu::MsSinceSceneReady() {
+    const uint64_t ready = sceneReadyMs.load(std::memory_order_relaxed);
+    if (!ready) return ~0ull;
+    const uint64_t now = NowMs();
+    return now > ready ? now - ready : 0;
 }
 
 bool debug_menu::LoadProfileEnabled() {
