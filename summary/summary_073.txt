@@ -1,0 +1,53 @@
+================================================================================
+LostOdysseyRecomp - Nintendo Switch 2 port
+Summary - TURN 73: turn 72 NRO on HW (good), blocky cutscene self-shadows are
+the retail shadow map; LO_SHADOW_RESOLUTION=2/4 test switch
+================================================================================
+Build: NRO md5 6c85fe0c418030f0e70a75a8f331e642 (Desktop copy matches).
+OunceVK 20261120 as in turn 72. kaiHEN fix untouched. 2x shadows not on HW.
+LOGS READ (Desktop\lo project, handheld, env LO_GUEST_AFFINITY=1)
+  * runtime-1795214011446305.log: old NRO (65d6b70), 17:33, ~30 min.
+  * runtime-1795216111440410.log: turn 72 NRO (b31a498-dirty), 18:08,
+    ~50 min (2980 s): White Boa (Brig, Engine Area), Gongora's Mansion. HOME -> X.
+  * No GPU stop, refused batch or channel error. One "call to unrecompiled
+    guest function ctr=0x0 lr=0x82f86788" at 1150.8 s (White Boa, field);
+    the game went on. One-off, not chased.
+  * Playing windows (10 s, fps > 5, not loading): old 177, avg 59.0 FPS,
+    p50 over 17 ms in 16 (9%); new 292, avg 58.3 FPS, p50 over 17 ms in 6
+    (2%). The averages are different maps; the sticky 18 ms state is the
+    comparable part, and it mostly went.
+  * Slow-frame signal: 154 DR changes in 2980 s, 57 of them "slow frames"
+    drops, each one rung (e.g. 1044 -> 1008 at GPU 14.7 ms, frame 17.9 ms),
+    followed by 60.0 FPS windows. 1044/1008 retried every ~90 s (the slow
+    ceiling). Only 2 of the 57 had a hitch line within 1 s (34, 41 ms);
+    other DR changes: 13 of 97.
+  * Remaining sub-60 windows in the Engine Area (1740-2600 s): 2000-2300
+    draws a frame, GPU 10.7-12.4 ms, GPU_CmdProc 82-86% of a core, pace
+    0.3-1 ms: the command processor thread (CPU) is the limit there. DR
+    correctly leaves it alone (GPU under 75% of the budget).
+  * Effect budget: shadows low/full twice in 50 min (was 20 times in the
+    turn 67 session). The turn 72 restore rule works.
+  * Controller: mask 0x01 (one pad read), 0x00 for 7 s at 157 s (no
+    controller attached), then 0x01.
+SCREENSHOTS (Desktop\lo project\pictures, 3 cutscene close-ups, White Boa)
+  Lighting, faces, hair and backgrounds normal. Kakanas' coat (18:21:32):
+  square blocks about 9 screen pixels wide with stepped shading on the
+  self-shadow: the character's tile in the 864-texel retail shadow atlas
+  (880x896 depth target, 422x422 tiles) stretched over a close-up at 1080p.
+  The Switch build pins shadow resolution at 1x (settings/config.cpp).
+CHANGE
+  settings/config.cpp: Switch 2 reads LO_SHADOW_RESOLUTION=2 or 4 from
+  env.txt (anything else: 1x, unchanged default). It feeds the existing
+  shadow multiplier from the PC build (render_resolution.h, depth-only
+  shadow raster; tested there at 2x/4x on Vulkan PC and Adreno). The
+  settings line at start shows shadow_resolution=N.
+  Desktop\lo project\env_shadow2x.txt: LO_GUEST_AFFINITY=1 +
+  LO_SHADOW_RESOLUTION=2.
+NEXT (user)
+  * Run once with env_shadow2x.txt (renamed to env.txt): the same cutscene
+    close-up (screenshot) and normal play. Check the log for
+    "shadow_resolution=2", "shadow raster ... scale=2x2" and the GPU/FPS of
+    the perf lines against this log.
+  * If shadows break (missing, cut off at a quarter, black): go back to
+    the normal env.txt and send the log.
+================================================================================

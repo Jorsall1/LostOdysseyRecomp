@@ -67,6 +67,24 @@ uint32_t RenderHeightOverride()
     return 0;
 #endif
 }
+#if defined(__SWITCH2__)
+namespace
+{
+// LO_SHADOW_RESOLUTION=2 or 4 (env.txt, Switch 2 only; turn 73): the shadow map multiplier the PC Graphics menu
+// offers (gpu/render_resolution.h, depth-only shadow raster). The Switch keeps the retail 864-texel atlas by
+// default; in cutscene close-ups each of its texels covers about 9 screen pixels at 1080p (blocky self-shadows on
+// coats and faces). 2x is four times the shadow texels, 4x sixteen. Off until measured on the console.
+uint32_t ShadowResolutionOverride()
+{
+    static const uint32_t multiplier = [] {
+        const char *text = std::getenv("LO_SHADOW_RESOLUTION");
+        const uint32_t value = text && *text ? uint32_t(std::strtoul(text, nullptr, 10)) : 1u;
+        return value == 2 || value == 4 ? value : 1u;
+    }();
+    return multiplier;
+}
+}
+#endif
 uint32_t SwitchMaximumHeight(const Config &config, bool docked)
 {
     const uint32_t height = config.maximumHeight[docked ? 1 : 0];
@@ -234,7 +252,11 @@ Config Validate(Config value)
 
     if (const uint32_t rows = RenderHeightOverride()) value.internalResolution = int(rows);
     else value.internalResolution = int(SwitchMaximumHeight(value, Docked()));
+#if defined(__SWITCH2__)
+    value.shadowResolution = ShadowResolutionOverride();
+#else
     value.shadowResolution = 1;
+#endif
     value.antialiasing = 0;
     value.fxaa = false;
     value.ambientOcclusion = 0;
