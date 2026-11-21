@@ -1,0 +1,24 @@
+================================================================================
+LostOdysseyRecomp - Nintendo Switch 2 port
+Summary - TURN 89: v0.2.0 backup-log error / shader / artifact scan; no code
+change
+================================================================================
+LOG: backup logs\runtime-1795277172454118.log (34 min, v0.2.0 NRO b66fb571).
+LEVELS: 6053 info, 701 note, 14 warn, 0 error, 0 fatal.
+WARNINGS (all benign or known)
+  9x native presentation: immediate mode unavailable (at loads, vsync note)
+  2x gpu API resize: output negotiation at startup
+  1x unknown root 'shaderdumpxe' (game's own debug path, ignored)
+  1x loading screen begin (startup marker)
+  1x audio output is not draining, queue cleared (709.7 s, short audio skip;
+     once per session on this build)
+SHADERS: pipeline libraries 4804/4804, 0 failed; background 3889 recipes,
+  0 failed, 0 missing shaders; texinfo variants 3921 built, 0 failed; DXC
+  rejections 0. 18 pipelines built at draw time (9 miss lines, 0.06-0.5 ms).
+  Shader jsonl: 2 lines (session header, startup clip), no shader events.
+OTHER: xma decode failures 0 (61 min log had 17). stderr: no MESA warnings,
+  no driver errors. No GPU stall, no device lost.
+ARTIFACTS: the log cannot show visual artifacts; it shows none of their usual
+  causes (failed pipelines, missing shaders, render target fallbacks, GPU
+  errors). User to report anything seen on screen.
+================================================================================
