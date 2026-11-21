@@ -1,0 +1,32 @@
+================================================================================
+LostOdysseyRecomp - Nintendo Switch 2 port
+Summary - TURN 74: second turn-72 session read; shadow behaviour explained;
+no code change
+================================================================================
+No code changes. Current NRO still 6c85fe0c... (turn 73), not run yet: the
+Desktop\lo project\logs session is the turn 72 NRO (b31a498-dirty),
+shadow_resolution=1, env LO_GUEST_AFFINITY=1. (env.txt in that folder is
+the 2x test file, prepared for the next run.)
+LOG READ (logs\runtime-1795219597435521.log, 19:06, ~23 min, handheld)
+  White Boa: Guest Area, Queen's Room, Engine Room, two battles.
+  * No error lines, no GPU stop. Exit clean (HOME -> X).
+  * 100 playing windows: avg 59.0 FPS, 71 at >= 59.5, p50 over 17 ms in 2.
+  * DR: 102 changes, 10 "slow frames".
+  * Sub-55 windows: Queen's Room (551, 561, 1118 s) at 2000-2170 draws,
+    scene at the 576-row floor, GPU 12.5-15.4 ms, pace 0.8-2.9 ms: CPU
+    (command processor) plus GPU near budget; and loading/battle entries.
+  * Occlusion (History policy) culls there: ~33% of reads zero in the
+    Queen's Room (526-546 s), still ~2000 draws a frame.
+  * Effect budget: shadows low 5 times (224-322, 488-566, 1115-1153,
+    1283-1319, 1322-1408 s: battles and the Queen's Room). One restore
+    re-cut after 3 s (1319 -> 1322). Turn 67 session: 20 flips.
+SHADOWS (for the user)
+  Default 1x = retail 864-texel atlas, unchanged fidelity. "Dynamic
+  shadows low" keeps resolution but drops all casters except the 8 largest
+  on screen. LO_SHADOW_RESOLUTION=2/4 (turn 73) = 2x/4x per axis, same
+  filtering.
+OPTIMISATION CANDIDATES (not done)
+  * Command processor per-draw cost at 2000+ draws (Queen's Room, Engine
+    Area): needs a profile first: env LO_RENDER_TIMING=1 (renderer CPU
+    sections) or LO_CPU_PROFILE=1, standing in the Queen's Room ~60 s.
+================================================================================
