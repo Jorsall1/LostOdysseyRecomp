@@ -1,0 +1,27 @@
+================================================================================
+LostOdysseyRecomp - Nintendo Switch 2 port
+Summary - TURN 88: backup7 (turn 81) build re-tested, 34 min; tagged v0.2.0
+================================================================================
+LOG: Desktop\lo project\backup logs\runtime-1795277172454118.log, 11:06,
+  2046 s, handheld only. revision=ffacaad7cb59-dirty, no "command processor:
+  GPU CmdProc on cores" line, env LO_GUEST_AFFINITY=1 LO_SHADOW_RESOLUTION=2.
+  Same build as the 61 min "update 0.2.0" and 37 min turn 82 logs (NRO
+  b66fb571). Clean HOME -> X exit.
+NUMBERS (10 s windows, loads excluded)
+  log            min   FPS   at 60  <55   p50>17ms  p95   p99   effect/min
+  turn 82 log    37.0  58.4   72%  11.0%   7.8%    18.2  19.6   0.59
+  0.2.0 log      60.9  58.5   66%   9.7%   5.4%    18.4  20.4   0.36
+  this log       34.1  59.1   60%   3.0%   3.0%    17.6  18.8   0.32
+  Funeral Beach 59.0 (153 windows), City of Ruins 59.9, Cooke and Mack's
+  58.3. Lowest window 46.7 (Funeral Beach 1442 s). Different areas from the
+  earlier runs (no Canal Street), so the better numbers are content.
+EVENTS: Continue at 19.2 s -> scene load 19.5 s (no hang). 8 map loads. Two
+  saves written in full (user06 324.9 s, user01 1992.1 s, status 0x0). No GPU
+  stall, no error. One "audio output is not draining; queue cleared" at
+  709.7 s (queue at 18432 frames, drain wait 9.4 s): a short audio skip; the
+  37 and 61 min logs each have one too. Known, not new.
+GIT: code at 2db2d022 = f5a6701a outside summary/ (git diff empty). Tag
+  v0.2.0 on this commit (local, not pushed). Release NRO = backup7 /
+  Desktop file md5 b66fb571.
+TOTAL ON THIS BUILD: 132 min across three sessions, no crash, no GPU error.
+================================================================================
