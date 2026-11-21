@@ -128,9 +128,10 @@ On the title screen, **Y** opens **Settings**. In-game, Settings is in the game'
 
 ```
 LO_GUEST_AFFINITY=1
+LO_SHADOW_RESOLUTION=2
 ```
 
-It places the game's threads on the cores the Xbox 360 version asks for. Every speed option is already on by default, and the debug options cost speed, so leave the rest out.
+`LO_GUEST_AFFINITY=1` places the game's threads on the cores the Xbox 360 version asks for. `LO_SHADOW_RESOLUTION=2` renders shadows at twice the retail resolution, which makes them sharper in close-ups; delete the line for the retail shadows. Every speed option is already on by default, and the debug options cost speed, so leave the rest out.
 
 ## Reporting a problem
 
