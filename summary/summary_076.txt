@@ -1,0 +1,44 @@
+================================================================================
+LostOdysseyRecomp - Nintendo Switch 2 port
+Summary - TURN 76: old vs new build compared; 2x shadow pass measured; no code
+change
+================================================================================
+LOGS (Desktop\lo project\logs)
+  * "during old run": runtime-1795223203456646.log, 20:06, 1513 s, build
+    c3aece7-dirty (turn 72/73), env LO_GUEST_AFFINITY=1 LO_SHADOW_RESOLUTION=2.
+    Numara (Queen's Chamber, Thelran's Inn, White Square, Facade, Salon).
+  * "new run": runtime-1795225024444334.log, 20:37, 280 s, build
+    e91c15d4-dirty = turn 75 code (NRO 4be058b9), env + LO_GPU_PASS_TIMING=1.
+    Artists' Salon, Main Street, Ninn's Boutique, White Square, Facade, Port.
+  * No errors or GPU stops in either.
+NUMBERS (playing windows, 10 s each)
+  old: 115 windows, 59.1 FPS avg, 90% at >= 59.5, 2 under 55, rows avg 824
+       (17% at the 576 floor), GPU 12.8 ms, DR 2.5 changes/min, effects
+       0.4/min.
+  new: 18 windows, 58.2 FPS avg, 44% at >= 59.5, 1 under 55, rows avg 600
+       (89% at floor), GPU 11.2 ms, DR 2.8/min, effects 0.9/min.
+  Same maps: Artists' Salon old 59.8 FPS / 596 rows / 886 draws, new 57.2 /
+  576 / 1106 draws (GPU 14.5 ms); White Square old 59.6 / 605 / 1286, new
+  56.0 / 648 / 846 (3 windows, load windows inside). Main Street new 59.1 at
+  576 rows, 540-1768 draws, GPU 14.3-15.1 ms at the floor: no headroom to step up
+  (step-up line 14.2 ms).
+  New run's floor share: 75 s cutscene was a light screen (31 draws, DR held
+  at 576 since 94.9 s) plus heavy spots. Outside cutscenes the turn 75 rules
+  only block changes (stall guard: no step down; settle: no effect cut), so
+  they cannot lower the height there. In cutscenes step-ups wait 12 s: the
+  one real cost.
+  Hitches: both runs show the Guest Main 47 ms frames (cp_idle 35-45 ms)
+  after loads: old 40, new 36 (one White Square stretch at 248-251 s).
+  Game-side, both builds.
+PASS TIMING (new run, ms per frame)
+  shadow 0.00-0.37 (2x atlas) | scene 2-6.9 | resolve 1.5-3.7 | gs_rect
+  0.4-1.2. 2x shadows cost under 0.4 ms a frame: not a performance factor.
+  The FPS gap between 1x and 2x sessions was content.
+VERDICT
+  New run too short (4.6 min) and in different, heavier spots, with the
+  timing switch on (timestamps, unknown small cost): not a clean A/B.
+  Recommendation: turn 75 build + 2x shadows, after one 15-20 min run with
+  env.txt = LO_GUEST_AFFINITY=1 + LO_SHADOW_RESOLUTION=2 (no pass timing),
+  including a cutscene and Artists' Salon/White Square.
+  Possible follow-up: 2x shadows as the Switch 2 default (cost <= 0.4 ms).
+================================================================================
