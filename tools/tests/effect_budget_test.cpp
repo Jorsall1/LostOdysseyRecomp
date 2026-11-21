@@ -36,9 +36,12 @@ int main()
         // In the band between 70% and 100%: holds.
         Run(c, now, busy, 20, 12.0, &unsafe);
         CHECK(c.level == 2);
-        // Light scene: steps back down; shadows (level 2) only 30 s after their cut, then one level per >= 5 s.
+        // Light scene: steps back down; shadows (level 2) only 30 s after their cut and after 10 s under 70%
+        // (turn 83: not 3 s), then one level per >= 5 s.
         Run(c, now, busy, 5.5, 8.0, &unsafe);
         Run(c, now, busy, 4.0, 8.0, &unsafe);
+        CHECK(c.level == 2); // 9.5 s under 70%: not yet
+        Run(c, now, busy, 1.0, 8.0, &unsafe);
         CHECK(c.level == 1);
         Run(c, now, busy, 5.5, 8.0, &unsafe);
         CHECK(c.level == 0 && !c.MotionBlurOff());
@@ -130,6 +133,18 @@ int main()
         CHECK(c.level == held);              // under the budget with slack: no restore in a cutscene
     }
     CHECK(eb::BudgetMs(1000.0 / 60) > 13.9 && eb::BudgetMs(1000.0 / 60) < 14.1);
+    {
+        // Turn 83 (338.1 s): 3 s of a light view 30+ s after the shadow cut does not bring shadows back.
+        eb::Controller c;
+        uint64_t now = 1'000'000'000ull, busy = 0;
+        Run(c, now, busy, 5, 16.0);
+        CHECK(c.level == 2);
+        Run(c, now, busy, 40, 12.0); // between 70% and 100%: held
+        Run(c, now, busy, 3.5, 5.2);
+        CHECK(c.level == 2);
+        Run(c, now, busy, 7.0, 5.2);  // 10.5 s under 70% in all: back
+        CHECK(c.level == 1);
+    }
     if (failures) return 1;
     std::puts("effect_budget_test: ok");
     return 0;

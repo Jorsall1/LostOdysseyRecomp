@@ -1,0 +1,40 @@
+================================================================================
+LostOdysseyRecomp - Nintendo Switch 2 port
+Summary - TURN 83: GPU CmdProc off the guest cores, DR keeps resolution when
+CPU-bound, shadows restore only after 10 s of headroom
+================================================================================
+Build: NRO md5 6ab6e7b1aa48b01766784e98de8ce44f (Desktop copy matches).
+kaiHEN fix untouched. Not on HW yet. env.txt unchanged.
+CHANGES
+  1. gpu/command_processor.cpp WorkerMain (__SWITCH2__): GPU CmdProc moves to
+     cores 3-5 (RestrictCurrentThreadToCores(kWorkerCores), the call the
+     pipeline workers already use: "yes" in every Switch 2 log) and priority
+     0x2B (above the workers' 0x2C; Horizon does not time-slice equal
+     priorities). Log "command processor: GPU CmdProc on cores 3-5 at priority
+     0x2B: yes|refused". LO_CMDPROC_CORES=0 = old placement (docs/SWITCH.md).
+     Why: turn 82 Canal Street, CmdProc 85-93% of a core sharing cores 0-2
+     with Guest Main and Guest 82beca90 (230% of 300%), 32-53 FPS with the GPU
+     idle part of each frame. Expected: less contention for both the game
+     threads and CmdProc. Unmeasured.
+  2. gpu/dynamic_resolution.h: CpuBoundShare 0.70. With GPU busy under 70%
+     of the window's frame time, missed/slow frames do not step down (DownAt
+     still does). Turn 82 docked Canal Street went 1188 -> 828 at 53-64%
+     with no FPS gain; would have held ~1116-1188. Turn 72 slow case (13.5 of
+     18 ms = 75%) unchanged.
+  3. gpu/effect_budget.h: ShadowRestoreWindows 20 (10 s under 70%) before
+     level 2 -> 1 (was 6 windows, 3 s). Turn 82 338.1 s restore after 3 s of
+     a light view, re-cut 3 s later.
+TESTS: dynamic_resolution_test (new docked CPU-bound case, fails with the
+  guard off), effect_budget_test (restore after 10 s; new 338 s case),
+  shadow_low_test: ok, with and without -D__SWITCH2__.
+NOT DONE
+  * Docked CPU clock (998 vs 1101 MHz): apm configuration requests did
+    nothing on Switch 2 (turn 36: 561 -> 561); unknown Switch 2 config IDs,
+    thermal risk. Left alone.
+  * CmdProc's own cost: last profile (turn 57/58) was flat (locks/syscalls
+    27%, CP 21%, renderer 20%, NVK 17%); no single hot spot. Needs a Canal
+    Street profile (LO_CPU_PROFILE=1) to pick the next target.
+NEXT (user): play incl. Canal Street handheld + docked. Check the log line
+  for cores 3-5, FPS/rows in Canal Street vs turn 82 (51.2/595 handheld,
+  55.4/956 docked). Optional second run with LO_CPU_PROFILE=1 there.
+================================================================================

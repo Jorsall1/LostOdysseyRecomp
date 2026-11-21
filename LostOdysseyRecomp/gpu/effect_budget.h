@@ -42,6 +42,10 @@ struct Controller
     // through the two-rung slack and cut again 6-25 s later. That level comes back only with the GPU under 70% of
     // the budget (no slack) and at least ShadowRestoreHoldNs after it was cut.
     static constexpr uint64_t ShadowRestoreHoldNs = 30'000'000'000ull;
+    // And only after ShadowRestoreWindows windows (10 s) in a row under 70% (turn 83, 2026-11-20 338.1 s: full
+    // shadows came back after 3 s of a light view (85 draws, 5.2 ms) and went low again 3 s later in the
+    // street behind it: one visible pop each way).
+    static constexpr uint32_t ShadowRestoreWindows = 20;
     uint32_t windowFrames = 0, cutStrikes = 0, restoreStrikes = 0;
     double lastBusyMs = 0;
     bool started = false;
@@ -100,7 +104,7 @@ struct Controller
         const bool shadows = level >= 2;
         if (busyMs < budgetMs * RestoreShare || (resolutionSlack && !shadows && !cutscene && busyMs <= budgetMs)) {
             const uint64_t hold = shadows ? std::max(restoreHoldNs, ShadowRestoreHoldNs) : restoreHoldNs;
-            if (++restoreStrikes >= RestoreWindows && level > 0 && nowNs - lastChange >= hold) {
+            if (++restoreStrikes >= (shadows ? ShadowRestoreWindows : RestoreWindows) && level > 0 && nowNs - lastChange >= hold) {
                 lastRestore = nowNs;
                 SetLevel(level - 1, nowNs);
                 return true;

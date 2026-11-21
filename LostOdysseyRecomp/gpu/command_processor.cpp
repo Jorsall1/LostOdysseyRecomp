@@ -13,6 +13,7 @@
 #include "register_snapshot.h"
 #include "render_timing.h"
 #include "shader_identity.h"
+#include "host_cores.h"
 #include <debug/frame_timing.h>
 #include <debug/perf_stats.h>
 #include <cpu/guest_thread.h>
@@ -839,6 +840,26 @@ namespace gpu
     {
         os::SetCurrentThreadName("GPU CmdProc");
         os::scheduling::PreferPerformanceCores();
+#if defined(__SWITCH2__)
+        // Turn 83: off the guest's cores. Switch 2 log 2026-11-20, Canal Street: GPU CmdProc 85-93% of a core
+        // beside Guest Main and the game's render thread (82beca90) on cores 0-2 (230% of 300% busy), 32-53 FPS
+        // with the GPU idle part of each frame. Cores 3-5 hold only the pipeline workers, idle in play. At 0x2B,
+        // above those workers (0x2C): Horizon does not time-slice equal priorities, so a compile burst on all
+        // three cores would otherwise hold this thread off. LO_CMDPROC_CORES=0 keeps it on cores 0-2 as before.
+        {
+            const char* value = getenv("LO_CMDPROC_CORES");
+            const uint64_t mask = os::switch_platform::ProcessCoreMask();
+            if ((!value || value[0] != '0') && gpu::host_cores::WorkersOffGuestCores(mask)) {
+                const bool moved = os::switch_platform::RestrictCurrentThreadToCores(gpu::host_cores::kWorkerCores);
+                if (moved) os::switch_platform::SetCurrentThreadPriority(0x2B);
+                LOG_NOTICE("command processor: GPU CmdProc on cores 3-5 at priority 0x2B: {}",
+                    moved ? "yes" : "refused, staying on 0-2");
+            } else {
+                LOG_NOTICE("command processor: GPU CmdProc on cores 0-2 (process cores {:#x}{})", mask,
+                    value && value[0] == '0' ? ", LO_CMDPROC_CORES=0" : "");
+            }
+        }
+#endif
         const bool timingEnabled = frame_timing::Enabled();
         auto idleStart = std::chrono::steady_clock::time_point{};
         bool timingIdle = false;

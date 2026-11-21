@@ -108,6 +108,8 @@ namespace gpu::dynamic_resolution
         // time looks fine there, so after the normal 20 s it would step up into the same slow frames again.
         static constexpr double SlowFrameShare = 1.04, SlowUpShare = 1.02, SlowMinBusyShare = 0.75;
         static constexpr uint64_t SlowCeilingHoldNs = 90'000'000'000ull;
+        // GPU busy under this share of the window's frame time: the frames wait for the CPU (see Update).
+        static constexpr double CpuBoundShare = 0.70;
         uint32_t base = 0, minimum = 0, height = 0, step = Rung, ceiling = 0;
         uint64_t windowStart = 0, windowBusy = 0, lastChange = 0, windowLate = 0, ceilingSince = 0;
         uint64_t ceilingHold = CeilingHoldNs;
@@ -165,8 +167,14 @@ namespace gpu::dynamic_resolution
                 return height;
             }
             if (ceiling && nowNs - ceilingSince >= ceilingHold) ceiling = 0;
-            const bool missing = double(late) > LateDownShare * frames && busyMs > budgetMs * LateMinBusyShare;
-            const bool slow = frameMs > budgetMs * SlowFrameShare && busyMs > budgetMs * SlowMinBusyShare;
+            // CPU-bound (turn 83, Switch 2 docked log 2026-11-20, Canal Street 1686-1731 s): frames of 20.6-24.2 ms
+            // with the GPU busy 12.8-14.5 ms of them, GPU CmdProc at 77-93% of a core. Missed and slow frames sent
+            // the scene 1188 -> 828 rows and the frame rate stayed at 46-53 FPS: the GPU was idle a third of each
+            // frame. With the GPU busy under CpuBoundShare of the frame time, late and slow frames do not step down
+            // (a GPU over the DownAt line still does).
+            const bool cpuBound = busyMs < frameMs * CpuBoundShare;
+            const bool missing = !cpuBound && double(late) > LateDownShare * frames && busyMs > budgetMs * LateMinBusyShare;
+            const bool slow = !cpuBound && frameMs > budgetMs * SlowFrameShare && busyMs > budgetMs * SlowMinBusyShare;
             if (busyMs > budgetMs * DownAt || missing || slow) {
                 upStrikes = 0;
                 if (++downStrikes >= 2 && height > minimum && nowNs - lastChange >= DownHoldNs) {
