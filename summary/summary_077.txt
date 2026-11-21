@@ -1,0 +1,17 @@
+================================================================================
+LostOdysseyRecomp - Nintendo Switch 2 port
+Summary - TURN 77: reverted to the old (turn 73) build at user request
+================================================================================
+* Commit dfa28b48 restores map_info.{h,cpp}, dynamic_resolution.h,
+  effect_budget.h, frame_plan.cpp and their two tests to e91c15d4 (= turn 73
+  code; turn 74 was summary only). Turn 75 rules (cutscene cut line, 12 s
+  cutscene step-up hold, 3 s post-load effect hold, DR stall guard) are gone;
+  still in history at b462d9fc.
+* NRO rebuilt: md5 1702f310155c75f4c4a7087df72b3b76 (Desktop copy matches).
+  It differs from turn 73's 6c85fe0c only by the embedded revision string.
+* Desktop\env.txt (copy to the SD card's LostOdysseyRecomp folder), same as
+  the "old run" session:
+    LO_GUEST_AFFINITY=1
+    LO_SHADOW_RESOLUTION=2
+  No LO_GPU_PASS_TIMING.
+================================================================================
