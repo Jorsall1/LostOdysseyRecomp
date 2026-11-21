@@ -1,0 +1,36 @@
+================================================================================
+LostOdysseyRecomp - Nintendo Switch 2 port
+Summary - TURN 86: "updated logs" (turn 83 NRO confirmed), Continue hang
+diagnosis; no code change
+================================================================================
+LOGS: Desktop\lo project\updated logs, 3 sessions 2026-11-21 10:38-10:40,
+  all revision 9807c1f51607-dirty, all "GPU CmdProc on cores 3-5 at priority
+  0x2B: yes". The turn 83 build is now on the SD card.
+  * runtime-1795275498452971 (10:38, 52 s): THE HANG.
+  * runtime-1795275555447742 (10:39, 39 s): Continue ok, Funeral Beach, a
+    save made (mode=2 create at 28.5 s; user05 appears in the next session).
+  * runtime-1795275598453068 (10:39, 33 s): Continue ok, Funeral Beach.
+CONTINUE, GOOD RUNS: main thread "content create 'save' mode=3" (11.59 s /
+  11.27 s), game I/O thread opens save/user01|05/save.bin, "scene load: map
+  nbv_1_scrw" about 1.0 s later, "scene ready ... after 4.5 s".
+CONTINUE, HUNG RUN: save list at 29.2 s (user00-04, after ~25 s on the
+  title), main thread content create at 32.605 s, I/O thread t2c0f opens
+  user01/save.bin at 32.626 s. Then no scene load for 19.6 s until HOME -> X
+  at 52.3 s. The menu kept rendering at 60 FPS, 23 draws. CPU nearly idle:
+  GPU CmdProc 8-12%, Guest Main 6-7%, the rest under 5%. So a guest thread
+  is waiting on something that never arrives (lost wakeup / deadlock), not a
+  slow load. No GPU error, no warning.
+WHAT THE LOG CANNOT SHOW: which wait. Save reads and XamContentClose are not
+  logged, and the guest thread-state dump only runs on a GPU progress stall
+  (frames kept flowing here, so it never fired).
+NOT KNOWN: whether this is new with turn 83 (CmdProc on cores 3-5 at 0x2B)
+  or older and rare. No earlier summary reports a Continue hang. 1 of 3
+  Continues hung here. The save file was only read, not written: no risk.
+PROPOSED (not applied, waiting for the user)
+  1. Dump guest thread states (the existing "guest thread states" block) on
+     HOME -> X exit and when no scene load follows a save open within 10 s.
+  2. Log save reads (bytes/status) and XamContentClose completion.
+  With either, the next hang shows the exact wait.
+  If it repeats on turn 83 but never with LO_CMDPROC_CORES=0 in env.txt,
+  turn 83 is the cause.
+================================================================================
